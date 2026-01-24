@@ -18,9 +18,7 @@ repository = "https://github.com/0x4res/yard"
 
 [workspace.dependencies]
 # RDP Protocol
-# Note: Using 0.5 for now due to dependency conflicts in newer versions
-# Full IronRDP connector will be integrated when dependencies stabilize
-ironrdp = "0.5"
+ironrdp = "0.14"
 
 # Wayland
 smithay-client-toolkit = "0.20"
