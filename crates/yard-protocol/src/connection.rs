@@ -3,10 +3,9 @@
 //! This module provides the async connection logic that runs in a dedicated
 //! Tokio thread, communicating with the main thread via message channels.
 
-use std::net::ToSocketAddrs;
 use std::time::Duration;
 
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -27,14 +26,17 @@ const CONNECTION_TIMEOUT_SECS: u64 = 10;
 pub fn spawn_network_thread(from_network_tx: mpsc::Sender<FromNetwork>) -> mpsc::Sender<ToNetwork> {
     let (to_network_tx, to_network_rx) = mpsc::channel::<ToNetwork>(32);
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create Tokio runtime");
+    std::thread::Builder::new()
+        .name("yard-network".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
 
-        rt.block_on(network_loop(to_network_rx, from_network_tx));
-    });
+            rt.block_on(network_loop(to_network_rx, from_network_tx));
+        })
+        .expect("Failed to spawn network thread");
 
     to_network_tx
 }
@@ -85,9 +87,9 @@ async fn handle_connect(config: ConnectionConfig, tx: &mpsc::Sender<FromNetwork>
 async fn attempt_connection(config: &ConnectionConfig) -> Result<TcpStream, ConnectionError> {
     let address = config.address();
 
-    // Resolve DNS
-    let socket_addr = address
-        .to_socket_addrs()
+    // Resolve DNS asynchronously (non-blocking)
+    let socket_addr = lookup_host(&address)
+        .await
         .map_err(|e| ConnectionError::DnsResolution(e.to_string()))?
         .next()
         .ok_or_else(|| ConnectionError::DnsResolution("No addresses found".to_string()))?;

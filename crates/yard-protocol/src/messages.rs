@@ -123,3 +123,114 @@ impl fmt::Display for ConnectionError {
 }
 
 impl std::error::Error for ConnectionError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_connection_config_new() {
+        let config = ConnectionConfig::new("example.com", 3389);
+        assert_eq!(config.host, "example.com");
+        assert_eq!(config.port, 3389);
+        assert!(config.username.is_none());
+        assert!(config.domain.is_none());
+    }
+
+    #[test]
+    fn test_connection_config_with_username() {
+        let config = ConnectionConfig::new("example.com", 3389).with_username("admin");
+        assert_eq!(config.username, Some("admin".to_string()));
+    }
+
+    #[test]
+    fn test_connection_config_with_domain() {
+        let config = ConnectionConfig::new("example.com", 3389).with_domain("CORP");
+        assert_eq!(config.domain, Some("CORP".to_string()));
+    }
+
+    #[test]
+    fn test_connection_config_address() {
+        let config = ConnectionConfig::new("server.local", 3390);
+        assert_eq!(config.address(), "server.local:3390");
+    }
+
+    #[test]
+    fn test_connection_config_builder_chain() {
+        let config = ConnectionConfig::new("host", 3389)
+            .with_username("user")
+            .with_domain("domain");
+        assert_eq!(config.host, "host");
+        assert_eq!(config.username, Some("user".to_string()));
+        assert_eq!(config.domain, Some("domain".to_string()));
+    }
+
+    #[test]
+    fn test_connection_error_display_dns() {
+        let err = ConnectionError::DnsResolution("no such host".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Cannot resolve hostname"));
+        assert!(msg.contains("no such host"));
+    }
+
+    #[test]
+    fn test_connection_error_display_refused() {
+        let err = ConnectionError::ConnectionRefused("connection refused".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Connection refused"));
+        assert!(msg.contains("Server may not be running"));
+    }
+
+    #[test]
+    fn test_connection_error_display_timeout() {
+        let err = ConnectionError::Timeout("after 10s".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Connection timeout"));
+        assert!(msg.contains("after 10s"));
+    }
+
+    #[test]
+    fn test_connection_error_display_tls() {
+        let err = ConnectionError::TlsError("certificate expired".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("TLS error"));
+        assert!(msg.contains("certificate"));
+    }
+
+    #[test]
+    fn test_connection_error_display_auth() {
+        let err = ConnectionError::AuthenticationFailed("bad password".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Authentication failed"));
+        assert!(msg.contains("credentials"));
+    }
+
+    #[test]
+    fn test_connection_error_display_protocol() {
+        let err = ConnectionError::Protocol("invalid packet".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Protocol error"));
+    }
+
+    #[test]
+    fn test_connection_error_display_io() {
+        let err = ConnectionError::Io("broken pipe".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("I/O error"));
+        assert!(msg.contains("broken pipe"));
+    }
+
+    #[test]
+    fn test_to_network_debug() {
+        let msg = ToNetwork::Connect(ConnectionConfig::new("test", 3389));
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("Connect"));
+    }
+
+    #[test]
+    fn test_from_network_debug() {
+        let msg = FromNetwork::Connecting;
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("Connecting"));
+    }
+}
