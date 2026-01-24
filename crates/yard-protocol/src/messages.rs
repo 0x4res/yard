@@ -123,7 +123,7 @@ impl ConnectionConfig {
 }
 
 /// Information about a server certificate for user verification.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CertificateInfo {
     /// SHA-256 fingerprint of the certificate (hex encoded with colons).
     pub fingerprint: String,
@@ -173,7 +173,14 @@ impl CertificateInfo {
     pub fn display(&self) -> String {
         let mut lines = Vec::new();
 
-        lines.push(format!("Fingerprint: {}", self.fingerprint));
+        // Truncate fingerprint if too long (SHA-256 = 95 chars with colons)
+        // Keep prefix "SHA256:" and first ~40 chars of hash for UI fit
+        let fp_display = if self.fingerprint.len() > 50 {
+            format!("{}...", &self.fingerprint[..47])
+        } else {
+            self.fingerprint.clone()
+        };
+        lines.push(format!("Fingerprint: {}", fp_display));
 
         if let Some(ref cn) = self.common_name {
             lines.push(format!("Subject:     CN={}", cn));
@@ -545,5 +552,28 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Certificate rejected"));
         assert!(msg.contains("user declined"));
+    }
+
+    #[test]
+    fn test_certificate_info_display_long_fingerprint() {
+        // SHA-256 fingerprint with colons = 95 characters
+        let long_fp = "SHA256:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78:90:AB:CD:EF:12:34:56:78";
+        let cert = CertificateInfo::new(long_fp, "CA", "2024", "2025");
+        let display = cert.display();
+        // Should be truncated with "..."
+        assert!(display.contains("..."));
+        // Should not contain the full fingerprint
+        assert!(!display.contains(long_fp));
+        // Should contain the beginning
+        assert!(display.contains("SHA256:AB:CD:EF"));
+    }
+
+    #[test]
+    fn test_certificate_info_partial_eq() {
+        let cert1 = CertificateInfo::new("FP1", "Issuer", "2024", "2025");
+        let cert2 = CertificateInfo::new("FP1", "Issuer", "2024", "2025");
+        let cert3 = CertificateInfo::new("FP2", "Issuer", "2024", "2025");
+        assert_eq!(cert1, cert2);
+        assert_ne!(cert1, cert3);
     }
 }

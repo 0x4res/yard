@@ -272,3 +272,35 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
 
     Ok(exit_code)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_string_short() {
+        assert_eq!(truncate_string("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_string_exact() {
+        assert_eq!(truncate_string("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_string_long() {
+        assert_eq!(truncate_string("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_string_very_short_max() {
+        // When max_len <= 3, just truncate without ellipsis
+        assert_eq!(truncate_string("hello", 3), "hel");
+        assert_eq!(truncate_string("hello", 2), "he");
+    }
+
+    #[test]
+    fn test_truncate_string_empty() {
+        assert_eq!(truncate_string("", 10), "");
+    }
+}
