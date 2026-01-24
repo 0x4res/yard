@@ -11,7 +11,7 @@ use clap_complete::{Shell, generate};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use yard_protocol::{ConnectionConfig, FromNetwork, ToNetwork, spawn_network_thread};
+use yard_protocol::{CertificateInfo, ConnectionConfig, FromNetwork, ToNetwork, spawn_network_thread};
 
 /// Exit codes for YARD.
 mod exit_codes {
@@ -159,6 +159,53 @@ fn prompt_password(config: &ConnectionConfig) -> Result<String> {
     Ok(password)
 }
 
+/// Prompts the user to accept or reject a server certificate.
+///
+/// Displays certificate details and asks for confirmation.
+/// Returns true if accepted, false if rejected.
+fn prompt_certificate_verification(server: &str, cert_info: &CertificateInfo) -> bool {
+    eprintln!();
+    eprintln!("┌─────────────────────────────────────────────────────────────────┐");
+    eprintln!(
+        "│ Unknown certificate from {:<38} │",
+        truncate_string(server, 38)
+    );
+    eprintln!("├─────────────────────────────────────────────────────────────────┤");
+
+    // Display certificate details
+    for line in cert_info.display().lines() {
+        eprintln!("│ {:<63} │", line);
+    }
+
+    eprintln!("├─────────────────────────────────────────────────────────────────┤");
+    eprintln!("│ Accept this certificate? [y/N]                                  │");
+    eprintln!("└─────────────────────────────────────────────────────────────────┘");
+    eprint!("  > ");
+
+    if io::stderr().flush().is_err() {
+        return false;
+    }
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    let input = input.trim().to_lowercase();
+    matches!(input.as_str(), "y" | "yes")
+}
+
+/// Truncates a string to max_len, adding "..." if truncated.
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len > 3 {
+        format!("{}...", &s[..max_len - 3])
+    } else {
+        s[..max_len].to_string()
+    }
+}
+
 /// Runs the RDP connection.
 fn run_connection(config: ConnectionConfig) -> Result<u8> {
     info!("Connecting to {}...", config.address());
@@ -195,6 +242,16 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
             Some(FromNetwork::Disconnected) => {
                 info!("Disconnected.");
                 break exit_codes::SUCCESS;
+            }
+            Some(FromNetwork::CertificateVerify { server, cert_info }) => {
+                let accepted = prompt_certificate_verification(&server, &cert_info);
+                if to_network_tx
+                    .blocking_send(ToNetwork::CertificateDecision(accepted))
+                    .is_err()
+                {
+                    error!("Failed to send certificate decision");
+                    break exit_codes::CONNECTION_ERROR;
+                }
             }
             Some(FromNetwork::Error(err)) => {
                 error!("{}", err);

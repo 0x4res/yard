@@ -7,5 +7,5 @@ pub mod connection;
 pub mod messages;
 
 pub use connection::spawn_network_thread;
-pub use messages::{ConnectionConfig, ConnectionError, FromNetwork, ToNetwork};
+pub use messages::{CertificateInfo, ConnectionConfig, ConnectionError, FromNetwork, ToNetwork};
 pub use yard_core::prelude::*;

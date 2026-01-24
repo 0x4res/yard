@@ -122,6 +122,73 @@ impl ConnectionConfig {
     }
 }
 
+/// Information about a server certificate for user verification.
+#[derive(Debug, Clone)]
+pub struct CertificateInfo {
+    /// SHA-256 fingerprint of the certificate (hex encoded with colons).
+    pub fingerprint: String,
+    /// Common Name (CN) from the certificate subject.
+    pub common_name: Option<String>,
+    /// Organization from the certificate subject.
+    pub organization: Option<String>,
+    /// Certificate issuer (CN or organization).
+    pub issuer: String,
+    /// Certificate validity start date (ISO 8601 format).
+    pub not_before: String,
+    /// Certificate validity end date (ISO 8601 format).
+    pub not_after: String,
+}
+
+impl CertificateInfo {
+    /// Creates a new CertificateInfo with the given details.
+    pub fn new(
+        fingerprint: impl Into<String>,
+        issuer: impl Into<String>,
+        not_before: impl Into<String>,
+        not_after: impl Into<String>,
+    ) -> Self {
+        Self {
+            fingerprint: fingerprint.into(),
+            common_name: None,
+            organization: None,
+            issuer: issuer.into(),
+            not_before: not_before.into(),
+            not_after: not_after.into(),
+        }
+    }
+
+    /// Sets the Common Name (CN) from the certificate subject.
+    pub fn with_common_name(mut self, cn: impl Into<String>) -> Self {
+        self.common_name = Some(cn.into());
+        self
+    }
+
+    /// Sets the Organization from the certificate subject.
+    pub fn with_organization(mut self, org: impl Into<String>) -> Self {
+        self.organization = Some(org.into());
+        self
+    }
+
+    /// Returns a formatted display of the certificate for user prompts.
+    pub fn display(&self) -> String {
+        let mut lines = Vec::new();
+
+        lines.push(format!("Fingerprint: {}", self.fingerprint));
+
+        if let Some(ref cn) = self.common_name {
+            lines.push(format!("Subject:     CN={}", cn));
+        }
+        if let Some(ref org) = self.organization {
+            lines.push(format!("Org:         {}", org));
+        }
+
+        lines.push(format!("Issuer:      {}", self.issuer));
+        lines.push(format!("Valid:       {} to {}", self.not_before, self.not_after));
+
+        lines.join("\n")
+    }
+}
+
 /// Messages sent from the main thread to the network thread.
 #[derive(Debug)]
 pub enum ToNetwork {
@@ -129,6 +196,8 @@ pub enum ToNetwork {
     Connect(ConnectionConfig),
     /// Request to disconnect gracefully.
     Disconnect,
+    /// Response to a certificate verification request.
+    CertificateDecision(bool),
 }
 
 /// Messages sent from the network thread to the main thread.
@@ -142,6 +211,15 @@ pub enum FromNetwork {
     Disconnected,
     /// An error occurred.
     Error(ConnectionError),
+    /// Server certificate needs user verification.
+    /// The main thread should display the certificate info and send back
+    /// a CertificateDecision via ToNetwork.
+    CertificateVerify {
+        /// The server hostname being connected to.
+        server: String,
+        /// Certificate information to display to the user.
+        cert_info: CertificateInfo,
+    },
 }
 
 /// Error types for connection failures.
@@ -155,6 +233,8 @@ pub enum ConnectionError {
     Timeout(String),
     /// TLS handshake failed.
     TlsError(String),
+    /// Server certificate was rejected by user.
+    CertificateRejected(String),
     /// Authentication failed.
     AuthenticationFailed(String),
     /// Protocol error.
@@ -183,6 +263,9 @@ impl fmt::Display for ConnectionError {
             }
             Self::TlsError(msg) => {
                 write!(f, "TLS error: {msg}. Server certificate may be invalid.")
+            }
+            Self::CertificateRejected(msg) => {
+                write!(f, "Certificate rejected: {msg}. Connection aborted.")
             }
             Self::AuthenticationFailed(msg) => {
                 write!(f, "Authentication failed: {msg}. Check your credentials.")
@@ -419,5 +502,48 @@ mod tests {
         let (user, domain) = ConnectionConfig::parse_username("DOMAIN\\user@email.com");
         assert_eq!(domain, Some("DOMAIN".to_string()));
         assert_eq!(user, "user@email.com");
+    }
+
+    #[test]
+    fn test_certificate_info_new() {
+        let cert = CertificateInfo::new(
+            "SHA256:AB:CD:EF",
+            "Self-signed",
+            "2024-01-01",
+            "2025-01-01",
+        );
+        assert_eq!(cert.fingerprint, "SHA256:AB:CD:EF");
+        assert_eq!(cert.issuer, "Self-signed");
+        assert!(cert.common_name.is_none());
+        assert!(cert.organization.is_none());
+    }
+
+    #[test]
+    fn test_certificate_info_builder() {
+        let cert = CertificateInfo::new("FP", "Issuer", "2024", "2025")
+            .with_common_name("server.example.com")
+            .with_organization("Example Corp");
+        assert_eq!(cert.common_name, Some("server.example.com".to_string()));
+        assert_eq!(cert.organization, Some("Example Corp".to_string()));
+    }
+
+    #[test]
+    fn test_certificate_info_display() {
+        let cert = CertificateInfo::new("SHA256:AB:CD", "CA", "2024-01-01", "2025-12-31")
+            .with_common_name("example.com");
+        let display = cert.display();
+        assert!(display.contains("SHA256:AB:CD"));
+        assert!(display.contains("CN=example.com"));
+        assert!(display.contains("CA"));
+        assert!(display.contains("2024-01-01"));
+        assert!(display.contains("2025-12-31"));
+    }
+
+    #[test]
+    fn test_connection_error_display_certificate_rejected() {
+        let err = ConnectionError::CertificateRejected("user declined".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Certificate rejected"));
+        assert!(msg.contains("user declined"));
     }
 }

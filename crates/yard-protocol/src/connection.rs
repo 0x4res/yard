@@ -55,6 +55,11 @@ async fn network_loop(
                 let _ = from_network_tx.send(FromNetwork::Disconnected).await;
                 break;
             }
+            ToNetwork::CertificateDecision(_accepted) => {
+                // Certificate decisions are handled during TLS handshake
+                // This message is received asynchronously after CertificateVerify is sent
+                // TODO: Integrate with actual TLS handshake when IronRDP is available
+            }
         }
     }
 }
