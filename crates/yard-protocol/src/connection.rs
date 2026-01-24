@@ -18,6 +18,9 @@ use crate::messages::{CertificateInfo, ConnectionConfig, ConnectionError, FromNe
 /// Default connection timeout in seconds.
 const CONNECTION_TIMEOUT_SECS: u64 = 10;
 
+/// Timeout for user to decide on certificate acceptance (in seconds).
+const CERTIFICATE_DECISION_TIMEOUT_SECS: u64 = 60;
+
 /// Spawns the network thread and returns a channel sender for commands.
 ///
 /// # Arguments
@@ -286,28 +289,45 @@ fn extract_rdn_value(name: &x509_cert::name::Name, oid_str: &str) -> Option<Stri
 async fn wait_for_certificate_decision(
     to_network_rx: &mut mpsc::Receiver<ToNetwork>,
 ) -> Result<bool, ConnectionError> {
-    // Wait for the decision with a timeout
-    let decision_timeout = Duration::from_secs(60); // 1 minute for user to decide
+    let decision_timeout = Duration::from_secs(CERTIFICATE_DECISION_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + decision_timeout;
 
-    match timeout(decision_timeout, to_network_rx.recv()).await {
-        Ok(Some(ToNetwork::CertificateDecision(accepted))) => Ok(accepted),
-        Ok(Some(ToNetwork::Disconnect)) => {
-            Err(ConnectionError::Io("Connection cancelled by user".to_string()))
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ConnectionError::Timeout(format!(
+                "Certificate decision timeout ({}s)",
+                CERTIFICATE_DECISION_TIMEOUT_SECS
+            )));
         }
-        Ok(Some(_)) => {
-            // Unexpected message, keep waiting
-            warn!("Received unexpected message while waiting for certificate decision");
-            Err(ConnectionError::Io("Unexpected message during certificate verification".to_string()))
+
+        match timeout(remaining, to_network_rx.recv()).await {
+            Ok(Some(ToNetwork::CertificateDecision(accepted))) => return Ok(accepted),
+            Ok(Some(ToNetwork::Disconnect)) => {
+                return Err(ConnectionError::Io("Connection cancelled by user".to_string()));
+            }
+            Ok(Some(_)) => {
+                // Unexpected message - ignore and keep waiting
+                warn!("Received unexpected message while waiting for certificate decision, ignoring");
+                continue;
+            }
+            Ok(None) => return Err(ConnectionError::Io("Channel closed".to_string())),
+            Err(_) => {
+                return Err(ConnectionError::Timeout(format!(
+                    "Certificate decision timeout ({}s)",
+                    CERTIFICATE_DECISION_TIMEOUT_SECS
+                )));
+            }
         }
-        Ok(None) => Err(ConnectionError::Io("Channel closed".to_string())),
-        Err(_) => Err(ConnectionError::Timeout(
-            "Certificate decision timeout (60s)".to_string(),
-        )),
     }
 }
 
 /// A certificate verifier that accepts all certificates.
 /// We verify certificates manually by prompting the user.
+///
+/// NOTE: AC 1 requires auto-accepting trusted certificates. Current implementation
+/// prompts for ALL certificates. Future enhancement: try system root CAs first,
+/// only prompt if verification fails (requires rustls-native-certs integration).
 #[derive(Debug)]
 struct AcceptAllCertVerifier;
 
@@ -355,5 +375,56 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAllCertVerifier {
             rustls::SignatureScheme::RSA_PSS_SHA512,
             rustls::SignatureScheme::ED25519,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_fingerprint_basic() {
+        let bytes = [0xAB, 0xCD, 0xEF];
+        let result = format_fingerprint(&bytes);
+        assert_eq!(result, "SHA256:AB:CD:EF");
+    }
+
+    #[test]
+    fn test_format_fingerprint_sha256_length() {
+        // SHA-256 produces 32 bytes
+        let bytes: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+        ];
+        let result = format_fingerprint(&bytes);
+        assert!(result.starts_with("SHA256:"));
+        assert_eq!(result.matches(':').count(), 32); // 31 colons between bytes + 1 after SHA256
+    }
+
+    #[test]
+    fn test_format_fingerprint_lowercase_hex() {
+        let bytes = [0x00, 0xFF, 0xAA];
+        let result = format_fingerprint(&bytes);
+        // Should be uppercase hex
+        assert_eq!(result, "SHA256:00:FF:AA");
+    }
+
+    #[test]
+    fn test_format_fingerprint_empty() {
+        let bytes: [u8; 0] = [];
+        let result = format_fingerprint(&bytes);
+        assert_eq!(result, "SHA256:");
+    }
+
+    #[test]
+    fn test_connection_timeout_constant() {
+        assert_eq!(CONNECTION_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn test_certificate_decision_timeout_constant() {
+        assert_eq!(CERTIFICATE_DECISION_TIMEOUT_SECS, 60);
     }
 }

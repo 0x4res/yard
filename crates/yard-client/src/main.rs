@@ -195,14 +195,17 @@ fn prompt_certificate_verification(server: &str, cert_info: &CertificateInfo) ->
     matches!(input.as_str(), "y" | "yes")
 }
 
-/// Truncates a string to max_len, adding "..." if truncated.
+/// Truncates a string to max_len characters, adding "..." if truncated.
+/// Safe for multi-byte UTF-8 characters.
 fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
     } else if max_len > 3 {
-        format!("{}...", &s[..max_len - 3])
+        let truncated: String = s.chars().take(max_len - 3).collect();
+        format!("{}...", truncated)
     } else {
-        s[..max_len].to_string()
+        s.chars().take(max_len).collect()
     }
 }
 
@@ -302,5 +305,13 @@ mod tests {
     #[test]
     fn test_truncate_string_empty() {
         assert_eq!(truncate_string("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_string_multibyte_safe() {
+        // UTF-8 multi-byte characters should not panic
+        assert_eq!(truncate_string("héllo", 4), "h...");
+        assert_eq!(truncate_string("日本語テスト", 5), "日本...");
+        assert_eq!(truncate_string("émoji🎉test", 6), "émo...");
     }
 }
