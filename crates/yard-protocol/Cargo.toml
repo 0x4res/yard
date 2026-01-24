@@ -9,4 +9,11 @@ license.workspace = true
 yard-core = { path = "../yard-core" }
 
 ironrdp.workspace = true
+ironrdp-tls.workspace = true
+ironrdp-tokio.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+x509-cert.workspace = true
+sha2.workspace = true
+tracing.workspace = true
