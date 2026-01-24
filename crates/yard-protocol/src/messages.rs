@@ -6,7 +6,8 @@
 use std::fmt;
 
 /// Configuration for establishing an RDP connection.
-#[derive(Debug, Clone)]
+///
+/// Note: Password is intentionally excluded from Debug to prevent credential leakage in logs.
 pub struct ConnectionConfig {
     /// Target hostname or IP address.
     pub host: String,
@@ -16,6 +17,35 @@ pub struct ConnectionConfig {
     pub username: Option<String>,
     /// Domain for authentication.
     pub domain: Option<String>,
+    /// Password for authentication.
+    /// SECURITY: Never log this field.
+    pub password: Option<String>,
+}
+
+// Manual Debug implementation to exclude password from logs (NFR-S2)
+impl std::fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("domain", &self.domain)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// Manual Clone to handle password securely
+impl Clone for ConnectionConfig {
+    fn clone(&self) -> Self {
+        Self {
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone(),
+            domain: self.domain.clone(),
+            password: self.password.clone(),
+        }
+    }
 }
 
 impl ConnectionConfig {
@@ -26,6 +56,7 @@ impl ConnectionConfig {
             port,
             username: None,
             domain: None,
+            password: None,
         }
     }
 
@@ -41,9 +72,22 @@ impl ConnectionConfig {
         self
     }
 
+    /// Sets the password for authentication.
+    ///
+    /// SECURITY: The password is never logged or included in Debug output.
+    pub fn with_password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
     /// Returns the full address as "host:port".
     pub fn address(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// Returns true if credentials are complete (username and password provided).
+    pub fn has_credentials(&self) -> bool {
+        self.username.is_some() && self.password.is_some()
     }
 }
 
@@ -135,6 +179,7 @@ mod tests {
         assert_eq!(config.port, 3389);
         assert!(config.username.is_none());
         assert!(config.domain.is_none());
+        assert!(config.password.is_none());
     }
 
     #[test]
@@ -163,6 +208,34 @@ mod tests {
         assert_eq!(config.host, "host");
         assert_eq!(config.username, Some("user".to_string()));
         assert_eq!(config.domain, Some("domain".to_string()));
+    }
+
+    #[test]
+    fn test_connection_config_with_password() {
+        let config = ConnectionConfig::new("host", 3389).with_password("secret123");
+        assert_eq!(config.password, Some("secret123".to_string()));
+    }
+
+    #[test]
+    fn test_connection_config_has_credentials() {
+        let config = ConnectionConfig::new("host", 3389);
+        assert!(!config.has_credentials());
+
+        let config = config.with_username("user");
+        assert!(!config.has_credentials());
+
+        let config = config.with_password("pass");
+        assert!(config.has_credentials());
+    }
+
+    #[test]
+    fn test_connection_config_debug_redacts_password() {
+        let config = ConnectionConfig::new("host", 3389)
+            .with_username("user")
+            .with_password("supersecret");
+        let debug_output = format!("{:?}", config);
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("supersecret"));
     }
 
     #[test]

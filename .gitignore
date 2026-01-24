@@ -22,3 +22,4 @@ Thumbs.db
 
 # Cargo lock for libraries (keep for binaries)
 # Cargo.lock  # Uncomment if this becomes a library-only workspace
+.grepai/

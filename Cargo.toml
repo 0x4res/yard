@@ -18,6 +18,8 @@ repository = "https://github.com/0x4res/yard"
 
 [workspace.dependencies]
 # RDP Protocol
+# Note: Using 0.5 for now due to dependency conflicts in newer versions
+# Full IronRDP connector will be integrated when dependencies stabilize
 ironrdp = "0.5"
 
 # Wayland
@@ -47,3 +49,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 anyhow = "1"
 thiserror = "2"
+
+# Password input
+rpassword = "7"

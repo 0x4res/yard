@@ -2,10 +2,10 @@
 //!
 //! A native Wayland RDP client for Linux with multi-monitor fullscreen support.
 
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tokio::sync::mpsc;
@@ -107,6 +107,12 @@ fn run(cli: Cli) -> Result<u8> {
                 config = config.with_domain(dom);
             }
 
+            // Prompt for password if username is provided (secure, no echo)
+            if config.username.is_some() {
+                let password = prompt_password(&config)?;
+                config = config.with_password(password);
+            }
+
             run_connection(config)
         }
 
@@ -121,6 +127,31 @@ fn run(cli: Cli) -> Result<u8> {
             Ok(exit_codes::SUCCESS)
         }
     }
+}
+
+/// Prompts for password securely (no echo).
+///
+/// SECURITY: The password is never logged (NFR-S2) and never appears in
+/// command-line history (NFR-S4) since it's read from stdin, not CLI args.
+fn prompt_password(config: &ConnectionConfig) -> Result<String> {
+    // Show prompt with username context
+    if let Some(ref user) = config.username {
+        eprint!("Password for {}: ", user);
+    } else {
+        eprint!("Password: ");
+    }
+    io::stderr().flush().context("Failed to flush stderr")?;
+
+    // Use rpassword for secure input (no echo)
+    let password =
+        rpassword::read_password().context("Failed to read password (is stdin a terminal?)")?;
+
+    // Validate password is not empty
+    if password.is_empty() {
+        anyhow::bail!("Password cannot be empty");
+    }
+
+    Ok(password)
 }
 
 /// Runs the RDP connection.
