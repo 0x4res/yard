@@ -99,10 +99,15 @@ fn run(cli: Cli) -> Result<u8> {
         }) => {
             info!("YARD v{}", env!("CARGO_PKG_VERSION"));
 
-            let mut config = ConnectionConfig::new(&host, port);
-            if let Some(user) = username {
-                config = config.with_username(user);
-            }
+            // Build config, parsing domain from username if present
+            // Supports: DOMAIN\user, user@domain.com, or plain username
+            let mut config = if let Some(ref user) = username {
+                ConnectionConfig::from_username(&host, port, user)
+            } else {
+                ConnectionConfig::new(&host, port)
+            };
+
+            // Explicit -d/--domain flag overrides parsed domain
             if let Some(dom) = domain {
                 config = config.with_domain(dom);
             }

@@ -77,6 +77,49 @@ impl ConnectionConfig {
     pub fn has_credentials(&self) -> bool {
         self.username.is_some() && self.password.is_some()
     }
+
+    /// Parses a username string and extracts domain if present.
+    ///
+    /// Supports two formats:
+    /// - NT-style: `DOMAIN\username` or `.\username` (local)
+    /// - UPN-style: `user@domain.com`
+    ///
+    /// Returns (username, Option<domain>).
+    pub fn parse_username(input: &str) -> (String, Option<String>) {
+        // Check for NT-style: DOMAIN\username
+        if let Some((domain, user)) = input.split_once('\\') {
+            let domain = if domain == "." {
+                None // Local machine, no domain
+            } else {
+                Some(domain.to_string())
+            };
+            return (user.to_string(), domain);
+        }
+
+        // Check for UPN-style: user@domain.com
+        // Only treat as UPN if domain part contains a dot (looks like FQDN)
+        if let Some((user, domain)) = input.rsplit_once('@') {
+            if domain.contains('.') {
+                return (user.to_string(), Some(domain.to_string()));
+            }
+        }
+
+        // Plain username, no domain
+        (input.to_string(), None)
+    }
+
+    /// Creates a ConnectionConfig from a username string, parsing domain if present.
+    ///
+    /// This handles both NT-style (`DOMAIN\user`) and UPN-style (`user@domain.com`)
+    /// username formats automatically.
+    pub fn from_username(host: impl Into<String>, port: u16, username: &str) -> Self {
+        let (user, domain) = Self::parse_username(username);
+        let mut config = Self::new(host, port).with_username(user);
+        if let Some(dom) = domain {
+            config = config.with_domain(dom);
+        }
+        config
+    }
 }
 
 /// Messages sent from the main thread to the network thread.
@@ -293,5 +336,63 @@ mod tests {
         let msg = FromNetwork::Connecting;
         let debug = format!("{:?}", msg);
         assert!(debug.contains("Connecting"));
+    }
+
+    #[test]
+    fn test_parse_username_plain() {
+        let (user, domain) = ConnectionConfig::parse_username("john");
+        assert_eq!(user, "john");
+        assert!(domain.is_none());
+    }
+
+    #[test]
+    fn test_parse_username_nt_style() {
+        let (user, domain) = ConnectionConfig::parse_username("CORP\\john");
+        assert_eq!(user, "john");
+        assert_eq!(domain, Some("CORP".to_string()));
+    }
+
+    #[test]
+    fn test_parse_username_nt_style_local() {
+        let (user, domain) = ConnectionConfig::parse_username(".\\admin");
+        assert_eq!(user, "admin");
+        assert!(domain.is_none()); // Local machine, no domain
+    }
+
+    #[test]
+    fn test_parse_username_upn_style() {
+        let (user, domain) = ConnectionConfig::parse_username("john@corp.example.com");
+        assert_eq!(user, "john");
+        assert_eq!(domain, Some("corp.example.com".to_string()));
+    }
+
+    #[test]
+    fn test_parse_username_email_not_upn() {
+        // Email-like but without dots in domain part - not treated as UPN
+        let (user, domain) = ConnectionConfig::parse_username("john@localhost");
+        assert_eq!(user, "john@localhost");
+        assert!(domain.is_none());
+    }
+
+    #[test]
+    fn test_from_username_nt_style() {
+        let config = ConnectionConfig::from_username("server", 3389, "DOMAIN\\user");
+        assert_eq!(config.username, Some("user".to_string()));
+        assert_eq!(config.domain, Some("DOMAIN".to_string()));
+        assert_eq!(config.host, "server");
+    }
+
+    #[test]
+    fn test_from_username_upn_style() {
+        let config = ConnectionConfig::from_username("server", 3389, "user@domain.com");
+        assert_eq!(config.username, Some("user".to_string()));
+        assert_eq!(config.domain, Some("domain.com".to_string()));
+    }
+
+    #[test]
+    fn test_from_username_plain() {
+        let config = ConnectionConfig::from_username("server", 3389, "admin");
+        assert_eq!(config.username, Some("admin".to_string()));
+        assert!(config.domain.is_none());
     }
 }
