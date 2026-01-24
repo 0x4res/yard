@@ -8,6 +8,7 @@ use std::fmt;
 /// Configuration for establishing an RDP connection.
 ///
 /// Note: Password is intentionally excluded from Debug to prevent credential leakage in logs.
+#[derive(Clone)]
 pub struct ConnectionConfig {
     /// Target hostname or IP address.
     pub host: String,
@@ -32,19 +33,6 @@ impl std::fmt::Debug for ConnectionConfig {
             .field("domain", &self.domain)
             .field("password", &"[REDACTED]")
             .finish()
-    }
-}
-
-// Manual Clone to handle password securely
-impl Clone for ConnectionConfig {
-    fn clone(&self) -> Self {
-        Self {
-            host: self.host.clone(),
-            port: self.port,
-            username: self.username.clone(),
-            domain: self.domain.clone(),
-            password: self.password.clone(),
-        }
     }
 }
 
