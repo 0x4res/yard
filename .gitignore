@@ -1,0 +1,24 @@
+# Build artifacts
+/target/
+
+# BMAD workflow files (local planning/implementation tracking)
+/_bmad-output/
+/_bmad/
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock  # Uncomment if this becomes a library-only workspace

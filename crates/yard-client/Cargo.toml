@@ -1,0 +1,22 @@
+[package]
+name = "yard-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yard"
+path = "src/main.rs"
+
+[dependencies]
+yard-core = { path = "../yard-core" }
+yard-protocol = { path = "../yard-protocol" }
+yard-wayland = { path = "../yard-wayland" }
+yard-video = { path = "../yard-video" }
+yard-audio = { path = "../yard-audio" }
+
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

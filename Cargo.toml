@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yard-core",
+    "crates/yard-protocol",
+    "crates/yard-wayland",
+    "crates/yard-video",
+    "crates/yard-audio",
+    "crates/yard-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/0x4res/yard"
+
+[workspace.dependencies]
+# RDP Protocol
+ironrdp = "0.5"
+
+# Wayland
+smithay-client-toolkit = "0.20"
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Audio
+pipewire = "0.9"
+
+# Video
+ffmpeg-next = "7"
+
+# CLI & Config
+clap = { version = "4.5", features = ["derive"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"

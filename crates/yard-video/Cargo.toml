@@ -1,0 +1,12 @@
+[package]
+name = "yard-video"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yard-core = { path = "../yard-core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ffmpeg-next.workspace = true

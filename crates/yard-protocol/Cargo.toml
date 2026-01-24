@@ -1,0 +1,12 @@
+[package]
+name = "yard-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yard-core = { path = "../yard-core" }
+
+ironrdp.workspace = true
+tokio.workspace = true

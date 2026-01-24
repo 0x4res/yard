@@ -1,0 +1,14 @@
+[package]
+name = "yard-wayland"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yard-core = { path = "../yard-core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay-client-toolkit.workspace = true
+calloop.workspace = true
+calloop-wayland-source.workspace = true
