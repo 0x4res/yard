@@ -36,6 +36,7 @@ ffmpeg-next = "7"
 
 # CLI & Config
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 

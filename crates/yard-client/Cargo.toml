@@ -17,6 +17,7 @@ yard-video = { path = "../yard-video" }
 yard-audio = { path = "../yard-audio" }
 
 clap.workspace = true
+clap_complete.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
