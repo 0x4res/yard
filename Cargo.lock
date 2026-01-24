@@ -1760,6 +1760,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "yard-audio",

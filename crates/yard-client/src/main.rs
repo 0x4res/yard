@@ -3,12 +3,27 @@
 //! A native Wayland RDP client for Linux with multi-monitor fullscreen support.
 
 use std::io;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use yard_protocol::{ConnectionConfig, FromNetwork, ToNetwork, spawn_network_thread};
+
+/// Exit codes for YARD.
+mod exit_codes {
+    /// Successful execution.
+    pub const SUCCESS: u8 = 0;
+    /// Connection error.
+    pub const CONNECTION_ERROR: u8 = 1;
+    /// Authentication error.
+    pub const AUTH_ERROR: u8 = 2;
+    /// Protocol error.
+    pub const PROTOCOL_ERROR: u8 = 3;
+}
 
 /// YARD - Yet Another Rust Desktop client.
 ///
@@ -53,7 +68,7 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -65,6 +80,16 @@ fn main() -> Result<()> {
 
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    match run(cli) {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            error!("{:#}", e);
+            ExitCode::from(exit_codes::CONNECTION_ERROR)
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<u8> {
     match cli.command {
         Some(Commands::Connect {
             host,
@@ -73,30 +98,84 @@ fn main() -> Result<()> {
             domain,
         }) => {
             info!("YARD v{}", env!("CARGO_PKG_VERSION"));
-            info!("Connecting to {}:{}", host, port);
 
-            if let Some(ref user) = username {
-                if let Some(ref dom) = domain {
-                    info!("User: {}\\{}", dom, user);
-                } else {
-                    info!("User: {}", user);
-                }
+            let mut config = ConnectionConfig::new(&host, port);
+            if let Some(user) = username {
+                config = config.with_username(user);
+            }
+            if let Some(dom) = domain {
+                config = config.with_domain(dom);
             }
 
-            // TODO: Implement actual RDP connection in Story 1.4
-            info!("Connection not yet implemented. See Story 1.4.");
+            run_connection(config)
         }
 
         Some(Commands::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "yard", &mut io::stdout());
+            Ok(exit_codes::SUCCESS)
         }
 
         None => {
-            // No subcommand provided, show help
             Cli::command().print_help()?;
             println!();
+            Ok(exit_codes::SUCCESS)
+        }
+    }
+}
+
+/// Runs the RDP connection.
+fn run_connection(config: ConnectionConfig) -> Result<u8> {
+    info!("Connecting to {}...", config.address());
+
+    if let Some(ref user) = config.username {
+        if let Some(ref dom) = config.domain {
+            info!("User: {}\\{}", dom, user);
+        } else {
+            info!("User: {}", user);
         }
     }
 
-    Ok(())
+    // Create channel for receiving messages from network thread
+    let (from_network_tx, mut from_network_rx) = mpsc::channel::<FromNetwork>(32);
+
+    // Spawn network thread
+    let to_network_tx = spawn_network_thread(from_network_tx);
+
+    // Send connect command
+    to_network_tx
+        .blocking_send(ToNetwork::Connect(config))
+        .map_err(|_| anyhow::anyhow!("Failed to send connect command"))?;
+
+    // Simple blocking loop to receive messages
+    // TODO: Replace with calloop event loop in Story 1.8
+    let exit_code = loop {
+        match from_network_rx.blocking_recv() {
+            Some(FromNetwork::Connecting) => {
+                info!("Establishing connection...");
+            }
+            Some(FromNetwork::Connected) => {
+                info!("Connected successfully!");
+            }
+            Some(FromNetwork::Disconnected) => {
+                info!("Disconnected.");
+                break exit_codes::SUCCESS;
+            }
+            Some(FromNetwork::Error(err)) => {
+                error!("{}", err);
+                break match err {
+                    yard_protocol::ConnectionError::AuthenticationFailed(_) => {
+                        exit_codes::AUTH_ERROR
+                    }
+                    yard_protocol::ConnectionError::Protocol(_) => exit_codes::PROTOCOL_ERROR,
+                    _ => exit_codes::CONNECTION_ERROR,
+                };
+            }
+            None => {
+                error!("Network thread terminated unexpectedly");
+                break exit_codes::CONNECTION_ERROR;
+            }
+        }
+    };
+
+    Ok(exit_code)
 }
