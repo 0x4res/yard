@@ -139,11 +139,11 @@ fn run(cli: Cli) -> Result<u8> {
 /// SECURITY: The password is never logged (NFR-S2) and never appears in
 /// command-line history (NFR-S4) since it's read from stdin, not CLI args.
 fn prompt_password(config: &ConnectionConfig) -> Result<String> {
-    // Show prompt with username context
-    if let Some(ref user) = config.username {
-        eprint!("Password for {}: ", user);
-    } else {
-        eprint!("Password: ");
+    // Show prompt with username and domain context
+    match (&config.username, &config.domain) {
+        (Some(user), Some(domain)) => eprint!("Password for {}\\{}: ", domain, user),
+        (Some(user), None) => eprint!("Password for {}: ", user),
+        _ => eprint!("Password: "),
     }
     io::stderr().flush().context("Failed to flush stderr")?;
 

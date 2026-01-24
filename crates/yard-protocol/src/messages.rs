@@ -395,4 +395,29 @@ mod tests {
         assert_eq!(config.username, Some("admin".to_string()));
         assert!(config.domain.is_none());
     }
+
+    #[test]
+    fn test_parse_username_empty() {
+        let (user, domain) = ConnectionConfig::parse_username("");
+        assert_eq!(user, "");
+        assert!(domain.is_none());
+    }
+
+    #[test]
+    fn test_parse_username_double_backslash() {
+        // Double backslash edge case - split_once takes first backslash only
+        // This results in domain="DOMAIN", user="\\user" which is technically
+        // what the user typed after the first backslash
+        let (user, domain) = ConnectionConfig::parse_username("DOMAIN\\\\user");
+        assert_eq!(domain, Some("DOMAIN".to_string()));
+        assert_eq!(user, "\\user"); // Preserves the second backslash
+    }
+
+    #[test]
+    fn test_parse_username_at_in_nt_style() {
+        // NT-style takes precedence over UPN - backslash checked first
+        let (user, domain) = ConnectionConfig::parse_username("DOMAIN\\user@email.com");
+        assert_eq!(domain, Some("DOMAIN".to_string()));
+        assert_eq!(user, "user@email.com");
+    }
 }
