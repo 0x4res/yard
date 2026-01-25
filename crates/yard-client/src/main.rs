@@ -253,6 +253,15 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
     Ok(exit_code)
 }
 
+/// Event loop dispatch timeout (~60fps).
+/// This determines how often we poll for events when idle.
+#[cfg(target_os = "linux")]
+const EVENT_LOOP_TIMEOUT_MS: u64 = 16;
+
+/// Placeholder color (dark gray) shown before real frames arrive.
+#[cfg(target_os = "linux")]
+const PLACEHOLDER_COLOR: (u8, u8, u8) = (40, 40, 40);
+
 /// Runs the main event loop.
 ///
 /// On Linux with Wayland, this creates a window and uses calloop.
@@ -312,28 +321,15 @@ fn run_event_loop(
         }
     };
 
-    // Insert network channel into event loop
-    let _channel_token = event_loop
-        .handle()
-        .insert_source(
-            calloop::channel::Channel::new(),
-            |_, _, _| {},
-        )
-        .ok();
-
-    // Draw initial placeholder (dark gray)
-    window.draw_solid(40, 40, 40);
+    // Draw initial placeholder
+    let (r, g, b) = PLACEHOLDER_COLOR;
+    window.draw_solid(r, g, b);
     info!("Window created: {}x{}", window.dimensions().0, window.dimensions().1);
 
     // Main event loop
+    // NOTE: Network channel is polled manually via try_recv. Future optimization could
+    // integrate it as a calloop source for true event-driven dispatch.
     loop {
-        // Check for window close
-        if window.close_requested() {
-            info!("Window close requested");
-            let _ = to_network_tx.blocking_send(ToNetwork::Disconnect);
-            break;
-        }
-
         // Poll network messages (non-blocking)
         match from_network_rx.try_recv() {
             Ok(FromNetwork::Disconnected) => {
@@ -362,26 +358,27 @@ fn run_event_loop(
             }
         }
 
-        // Dispatch Wayland events
-        if let Err(e) = event_loop.dispatch(std::time::Duration::from_millis(16), &mut window) {
+        // Dispatch Wayland events with timeout
+        let timeout = std::time::Duration::from_millis(EVENT_LOOP_TIMEOUT_MS);
+        if let Err(e) = event_loop.dispatch(timeout, &mut window) {
             error!("Event loop error: {}", e);
             break;
         }
 
-        // Check window events
+        // Check window events (includes close request from WindowHandler)
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 WindowEvent::CloseRequested => {
-                    info!("Window close requested via event");
+                    info!("Window close requested");
                     let _ = to_network_tx.blocking_send(ToNetwork::Disconnect);
                     return Ok(exit_codes::SUCCESS);
                 }
                 WindowEvent::Resized { width, height } => {
                     debug!("Window resized to {}x{}", width, height);
-                    window.draw_solid(40, 40, 40);
+                    window.draw_solid(r, g, b);
                 }
                 WindowEvent::RedrawRequested => {
-                    window.draw_solid(40, 40, 40);
+                    window.draw_solid(r, g, b);
                 }
             }
         }

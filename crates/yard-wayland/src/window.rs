@@ -173,6 +173,9 @@ mod linux {
         }
 
         /// Draws a solid color frame (placeholder until real frames arrive).
+        ///
+        /// Errors are logged but do not propagate - this allows graceful degradation
+        /// if buffer allocation fails temporarily.
         pub fn draw_solid(&mut self, r: u8, g: u8, b: u8) {
             if !self.dirty {
                 return;
@@ -183,15 +186,18 @@ mod linux {
             let stride = width * 4;
 
             // Get or create buffer
-            let (buffer, canvas) = self
-                .pool
-                .create_buffer(
-                    width as i32,
-                    height as i32,
-                    stride as i32,
-                    smithay_client_toolkit::shm::wl_shm::Format::Argb8888,
-                )
-                .expect("Failed to create buffer");
+            let (buffer, canvas) = match self.pool.create_buffer(
+                width as i32,
+                height as i32,
+                stride as i32,
+                smithay_client_toolkit::shm::wl_shm::Format::Argb8888,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!("Failed to create buffer for solid frame: {}", e);
+                    return;
+                }
+            };
 
             // Fill with solid color (ARGB format)
             let color = [b, g, r, 255u8]; // BGRA order for ARGB8888
@@ -237,15 +243,18 @@ mod linux {
             }
 
             // Create buffer and copy data
-            let (buffer, canvas) = self
-                .pool
-                .create_buffer(
-                    width as i32,
-                    height as i32,
-                    stride as i32,
-                    smithay_client_toolkit::shm::wl_shm::Format::Argb8888,
-                )
-                .expect("Failed to create buffer");
+            let (buffer, canvas) = match self.pool.create_buffer(
+                width as i32,
+                height as i32,
+                stride as i32,
+                smithay_client_toolkit::shm::wl_shm::Format::Argb8888,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!("Failed to create buffer for frame: {}", e);
+                    return;
+                }
+            };
 
             canvas.copy_from_slice(data);
 
@@ -411,11 +420,21 @@ mod stub {
     }
 
     /// Stub WindowConfig for non-Linux platforms.
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone)]
     pub struct WindowConfig {
         pub title: String,
         pub width: u32,
         pub height: u32,
+    }
+
+    impl Default for WindowConfig {
+        fn default() -> Self {
+            Self {
+                title: "YARD".to_string(),
+                width: 1280,
+                height: 720,
+            }
+        }
     }
 
     impl WindowConfig {
@@ -461,3 +480,42 @@ mod stub {
 
 #[cfg(not(target_os = "linux"))]
 pub use stub::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_window_config_default() {
+        let config = WindowConfig::default();
+        assert_eq!(config.title, "YARD");
+        assert_eq!(config.width, 1280);
+        assert_eq!(config.height, 720);
+    }
+
+    #[test]
+    fn test_window_config_with_connection_info_no_username() {
+        let config = WindowConfig::with_connection_info("server.example.com", 3389, None);
+        assert_eq!(config.title, "YARD - server.example.com:3389");
+        assert_eq!(config.width, 1280);
+        assert_eq!(config.height, 720);
+    }
+
+    #[test]
+    fn test_window_config_with_connection_info_with_username() {
+        let config = WindowConfig::with_connection_info("server.example.com", 3389, Some("john"));
+        assert_eq!(config.title, "YARD - server.example.com:3389 [john]");
+    }
+
+    #[test]
+    fn test_window_config_with_custom_port() {
+        let config = WindowConfig::with_connection_info("10.0.0.1", 13389, Some("admin"));
+        assert_eq!(config.title, "YARD - 10.0.0.1:13389 [admin]");
+    }
+
+    #[test]
+    fn test_window_config_with_unicode_username() {
+        let config = WindowConfig::with_connection_info("server", 3389, Some("用户"));
+        assert_eq!(config.title, "YARD - server:3389 [用户]");
+    }
+}
