@@ -87,7 +87,10 @@ fn main() -> ExitCode {
         EnvFilter::from_default_env()
     } else if cli.verbose {
         // --verbose enables debug level for all yard crates
-        EnvFilter::new("warn,yard_client=debug,yard_protocol=debug,yard_core=debug,yard_wayland=debug")
+        EnvFilter::new(
+            "warn,yard_client=debug,yard_protocol=debug,yard_core=debug,\
+             yard_wayland=debug,yard_video=debug,yard_audio=debug"
+        )
     } else {
         // Default: only errors and warnings (AC 1)
         EnvFilter::new("warn")
@@ -118,7 +121,8 @@ fn run(cli: Cli) -> Result<u8> {
             username,
             domain,
         }) => {
-            info!("YARD v{}", env!("CARGO_PKG_VERSION"));
+            // User feedback (always visible, not affected by log level)
+            eprintln!("YARD v{}", env!("CARGO_PKG_VERSION"));
 
             // Apply config defaults: CLI args take precedence over config file
             let effective_port = port.unwrap_or_else(|| app_config.defaults.effective_port());
@@ -259,11 +263,12 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
         "rdp_connection",
         server = %config.host,
         port = config.port,
-        user = config.username.as_deref().unwrap_or("-"),
+        user = config.username.as_deref().unwrap_or("<none>"),
     );
     let _guard = connection_span.enter();
 
-    info!("Connecting to {}...", config.address());
+    // User feedback (always visible, not affected by log level)
+    eprintln!("Connecting to {}...", config.address());
 
     if let Some(ref user) = config.username {
         if let Some(ref dom) = config.domain {
