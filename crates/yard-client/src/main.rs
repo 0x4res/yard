@@ -402,8 +402,11 @@ fn run_event_loop(
     // Main event loop
     // NOTE: Network channel is polled manually via try_recv. Future optimization could
     // integrate it as a calloop source for true event-driven dispatch.
+    // TODO: Add frame pacing via Wayland frame callbacks to avoid rendering faster
+    // than the compositor can display (reduces CPU usage and potential tearing).
     loop {
         // Poll network messages (non-blocking) - process all available
+        // TODO: Consider rate limiting if frames arrive faster than display refresh
         loop {
             match from_network_rx.try_recv() {
                 Ok(FromNetwork::Disconnected) => {
@@ -431,13 +434,14 @@ fn run_event_loop(
                         info!("First frame received in {:?}", elapsed);
                     }
 
-                    // Use draw_frame_at for partial updates with position
-                    window.draw_frame_at(
+                    // Use draw_frame_at_with_stride for partial updates with position
+                    window.draw_frame_at_with_stride(
                         &frame.data,
                         frame.width,
                         frame.height,
                         frame.x,
                         frame.y,
+                        frame.stride,
                     );
                     frame_count += 1;
 
