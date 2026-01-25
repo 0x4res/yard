@@ -217,8 +217,9 @@ async fn handle_connect(
     let mut active_stage = ActiveStage::new(connection_result);
 
     // Create decoded image buffer for frame accumulation
+    // Use BgrA32 format to match DecodedFrame's expected BGRA pixel order
     let mut image =
-        ironrdp::session::image::DecodedImage::new(PixelFormat::RgbA32, img_width, img_height);
+        ironrdp::session::image::DecodedImage::new(PixelFormat::BgrA32, img_width, img_height);
 
     // Session loop
     if let Err(e) = session_loop(&mut tls_framed, &mut active_stage, &mut image, tx).await {
@@ -258,14 +259,34 @@ where
                 }
                 ActiveStageOutput::GraphicsUpdate(rect) => {
                     // Extract the updated region and send to main thread
+                    let x = rect.left;
+                    let y = rect.top;
                     let width = rect.width();
                     let height = rect.height();
 
+                    // Validate rect bounds against image dimensions
+                    let img_width = image.width();
+                    let img_height = image.height();
+                    if rect.right >= img_width || rect.bottom >= img_height {
+                        warn!(
+                            "Graphics update rect ({},{})x({},{}) exceeds image bounds {}x{}",
+                            x, y, rect.right, rect.bottom, img_width, img_height
+                        );
+                        continue;
+                    }
+
                     // Get the pixel data for the updated region
-                    // The image data is in RgbA32 format (4 bytes per pixel)
+                    // The image data is in BgrA32 format (4 bytes per pixel, BGRA order)
                     let data = image.data_for_rect(&rect).to_vec();
 
-                    let frame = DecodedFrame::new(data, u32::from(width), u32::from(height));
+                    // Create frame with position for partial update support
+                    let frame = DecodedFrame::with_position(
+                        data,
+                        u32::from(width),
+                        u32::from(height),
+                        u32::from(x),
+                        u32::from(y),
+                    );
 
                     if tx.send(FromNetwork::Frame(frame)).await.is_err() {
                         return Ok(()); // Main thread disconnected
@@ -696,5 +717,65 @@ mod tests {
         let size = DesktopSize::new(1920, 1080);
         assert_eq!(size.width, 1920);
         assert_eq!(size.height, 1080);
+    }
+
+    #[test]
+    fn test_build_rdp_config_basic() {
+        let conn_config = ConnectionConfig::new("test.example.com", 3389)
+            .with_username("testuser")
+            .with_password("testpass");
+
+        let rdp_config = build_rdp_config(&conn_config).unwrap();
+
+        assert_eq!(rdp_config.client_name, "YARD");
+        assert!(rdp_config.enable_tls);
+        assert!(rdp_config.enable_credssp);
+        assert_eq!(rdp_config.desktop_size.width, DEFAULT_WIDTH);
+        assert_eq!(rdp_config.desktop_size.height, DEFAULT_HEIGHT);
+    }
+
+    #[test]
+    fn test_build_rdp_config_with_domain() {
+        let conn_config = ConnectionConfig::new("server", 3389)
+            .with_username("user")
+            .with_domain("CORP")
+            .with_password("pass");
+
+        let rdp_config = build_rdp_config(&conn_config).unwrap();
+
+        assert_eq!(rdp_config.domain, Some("CORP".to_string()));
+    }
+
+    #[test]
+    fn test_build_rdp_config_empty_credentials() {
+        // Empty credentials should still build config (server validates)
+        let conn_config = ConnectionConfig::new("server", 3389);
+
+        let rdp_config = build_rdp_config(&conn_config).unwrap();
+
+        // Credentials default to empty strings
+        match &rdp_config.credentials {
+            ironrdp::connector::Credentials::UsernamePassword { username, password } => {
+                assert!(username.is_empty());
+                assert!(password.is_empty());
+            }
+            _ => panic!("Expected UsernamePassword credentials"),
+        }
+    }
+
+    #[test]
+    fn test_build_rdp_config_bitmap_settings() {
+        let conn_config = ConnectionConfig::new("server", 3389);
+        let rdp_config = build_rdp_config(&conn_config).unwrap();
+
+        let bitmap = rdp_config.bitmap.expect("bitmap config should be set");
+        assert!(bitmap.lossy_compression);
+        assert_eq!(bitmap.color_depth, 32);
+    }
+
+    #[test]
+    fn test_default_dimensions() {
+        assert_eq!(DEFAULT_WIDTH, 1920);
+        assert_eq!(DEFAULT_HEIGHT, 1080);
     }
 }

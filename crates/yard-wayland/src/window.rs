@@ -75,6 +75,14 @@ mod linux {
                 ..Default::default()
             }
         }
+
+        /// Sets the window size.
+        #[must_use]
+        pub fn with_size(mut self, width: u32, height: u32) -> Self {
+            self.width = width;
+            self.height = height;
+            self
+        }
     }
 
     /// The main Wayland window state.
@@ -448,6 +456,14 @@ mod stub {
                 width: 1280,
                 height: 720,
             }
+        }
+
+        /// Sets the window size.
+        #[must_use]
+        pub fn with_size(mut self, width: u32, height: u32) -> Self {
+            self.width = width;
+            self.height = height;
+            self
         }
     }
 

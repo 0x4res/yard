@@ -51,6 +51,10 @@ impl std::fmt::Display for VideoCodec {
 }
 
 /// A decoded video frame with raw pixel data.
+///
+/// Represents either a full frame or a partial update region.
+/// For partial updates, `x` and `y` indicate where on the desktop
+/// this region should be placed.
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
     /// Raw pixel data in BGRA format.
@@ -59,6 +63,10 @@ pub struct DecodedFrame {
     pub width: u32,
     /// Frame height in pixels.
     pub height: u32,
+    /// X position on desktop (for partial updates).
+    pub x: u32,
+    /// Y position on desktop (for partial updates).
+    pub y: u32,
     /// Stride (bytes per row).
     pub stride: u32,
     /// Optional timestamp in microseconds for frame pacing.
@@ -66,14 +74,27 @@ pub struct DecodedFrame {
 }
 
 impl DecodedFrame {
-    /// Creates a new decoded frame.
+    /// Creates a new decoded frame at position (0, 0).
+    ///
+    /// Use this for full-screen frames or when the position is not relevant.
     #[must_use]
     pub fn new(data: Vec<u8>, width: u32, height: u32) -> Self {
+        Self::with_position(data, width, height, 0, 0)
+    }
+
+    /// Creates a new decoded frame with a specific position.
+    ///
+    /// Use this for partial screen updates where the frame represents
+    /// a region that should be placed at (x, y) on the desktop.
+    #[must_use]
+    pub fn with_position(data: Vec<u8>, width: u32, height: u32, x: u32, y: u32) -> Self {
         let stride = width * BYTES_PER_PIXEL_BGRA;
         Self {
             data,
             width,
             height,
+            x,
+            y,
             stride,
             timestamp: None,
         }
@@ -331,9 +352,21 @@ mod tests {
         let frame = DecodedFrame::new(data.clone(), 1920, 1080);
         assert_eq!(frame.width, 1920);
         assert_eq!(frame.height, 1080);
+        assert_eq!(frame.x, 0);
+        assert_eq!(frame.y, 0);
         assert_eq!(frame.stride, 1920 * 4);
         assert_eq!(frame.data.len(), 1920 * 1080 * 4);
         assert!(frame.timestamp.is_none());
+    }
+
+    #[test]
+    fn test_decoded_frame_with_position() {
+        let data = vec![0u8; 100 * 100 * 4];
+        let frame = DecodedFrame::with_position(data, 100, 100, 50, 75);
+        assert_eq!(frame.width, 100);
+        assert_eq!(frame.height, 100);
+        assert_eq!(frame.x, 50);
+        assert_eq!(frame.y, 75);
     }
 
     #[test]

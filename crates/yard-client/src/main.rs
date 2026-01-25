@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 use yard_core::Config;
-use yard_protocol::{CertificateInfo, ConnectionConfig, FromNetwork, ToNetwork, spawn_network_thread};
+use yard_protocol::{CertificateInfo, ConnectionConfig, DesktopSize, FromNetwork, ToNetwork, spawn_network_thread};
 use yard_wayland::WindowConfig;
 
 /// Exit codes for YARD.
@@ -331,18 +331,18 @@ fn run_event_loop(
     use yard_wayland::{WaylandWindow, WindowEvent};
 
     // Wait for initial connection before creating window
-    let mut connected = false;
-    while !connected {
+    let mut desktop_size: Option<DesktopSize> = None;
+    while desktop_size.is_none() {
         match from_network_rx.blocking_recv() {
             Some(FromNetwork::Connecting) => {
                 info!("Establishing connection...");
             }
-            Some(FromNetwork::Connected(desktop_size)) => {
+            Some(FromNetwork::Connected(size)) => {
                 info!(
                     "Connected successfully! Desktop: {}x{}",
-                    desktop_size.width, desktop_size.height
+                    size.width, size.height
                 );
-                connected = true;
+                desktop_size = Some(size);
             }
             Some(FromNetwork::CertificateVerify { server, cert_info }) => {
                 let accepted = prompt_certificate_verification(&server, &cert_info);
@@ -371,6 +371,13 @@ fn run_event_loop(
             }
         }
     }
+
+    // Use server's desktop size for window dimensions
+    let desktop_size = desktop_size.expect("desktop_size must be set after loop");
+    let window_config = window_config.with_size(
+        u32::from(desktop_size.width),
+        u32::from(desktop_size.height),
+    );
 
     // Create Wayland window
     info!("Creating Wayland window...");
@@ -492,17 +499,19 @@ fn run_event_loop(
     _window_config: WindowConfig,
 ) -> Result<u8> {
     // On non-Linux, just use blocking loop (no Wayland window)
+    let mut _desktop_size: Option<DesktopSize> = None;
     loop {
         match from_network_rx.blocking_recv() {
             Some(FromNetwork::Connecting) => {
                 info!("Establishing connection...");
             }
-            Some(FromNetwork::Connected(desktop_size)) => {
+            Some(FromNetwork::Connected(size)) => {
                 info!(
                     "Connected successfully! Desktop: {}x{}",
-                    desktop_size.width, desktop_size.height
+                    size.width, size.height
                 );
                 info!("Note: Wayland window requires Linux");
+                _desktop_size = Some(size);
             }
             Some(FromNetwork::Disconnected) => {
                 info!("Disconnected.");
