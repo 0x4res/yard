@@ -434,6 +434,15 @@ mod tests {
     }
 
     #[test]
+    fn test_from_network_frame_debug() {
+        let frame = DecodedFrame::new(vec![0u8; 16], 2, 2);
+        let msg = FromNetwork::Frame(frame);
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("Frame"));
+        assert!(debug.contains("DecodedFrame"));
+    }
+
+    #[test]
     fn test_parse_username_plain() {
         let (user, domain) = ConnectionConfig::parse_username("john");
         assert_eq!(user, "john");

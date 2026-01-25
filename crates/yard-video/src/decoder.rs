@@ -6,6 +6,9 @@
 
 use thiserror::Error;
 
+/// Bytes per pixel for BGRA format.
+const BYTES_PER_PIXEL_BGRA: u32 = 4;
+
 /// Errors that can occur during video decoding.
 #[derive(Error, Debug)]
 pub enum DecoderError {
@@ -58,19 +61,29 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Stride (bytes per row).
     pub stride: u32,
+    /// Optional timestamp in microseconds for frame pacing.
+    pub timestamp: Option<u64>,
 }
 
 impl DecodedFrame {
     /// Creates a new decoded frame.
     #[must_use]
     pub fn new(data: Vec<u8>, width: u32, height: u32) -> Self {
-        let stride = width * 4; // BGRA = 4 bytes per pixel
+        let stride = width * BYTES_PER_PIXEL_BGRA;
         Self {
             data,
             width,
             height,
             stride,
+            timestamp: None,
         }
+    }
+
+    /// Creates a new decoded frame with a timestamp.
+    #[must_use]
+    pub fn with_timestamp(mut self, timestamp: u64) -> Self {
+        self.timestamp = Some(timestamp);
+        self
     }
 
     /// Returns the expected data length for the frame dimensions.
@@ -78,13 +91,19 @@ impl DecodedFrame {
     pub fn expected_len(&self) -> usize {
         (self.stride * self.height) as usize
     }
+
+    /// Returns true if the data buffer matches the expected dimensions.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.data.len() == self.expected_len()
+    }
 }
 
 // Linux implementation using FFmpeg
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use tracing::{debug, warn};
+    use tracing::debug;
 
     /// Video decoder using FFmpeg.
     pub struct VideoDecoder {
@@ -141,16 +160,43 @@ mod linux {
         ///
         /// Returns an error if decoding fails.
         pub fn decode(&mut self, encoded_data: &[u8]) -> Result<Option<DecodedFrame>> {
-            use ffmpeg_next::format::Pixel;
-            use ffmpeg_next::software::scaling::{Context, Flags};
-
             // Create packet from encoded data
-            let mut packet = ffmpeg_next::Packet::copy(encoded_data);
+            let packet = ffmpeg_next::Packet::copy(encoded_data);
 
             // Send packet to decoder
             self.decoder
                 .send_packet(&packet)
                 .map_err(|e| DecoderError::DecodeFailed(e.to_string()))?;
+
+            // Try to receive and convert frame
+            self.receive_and_convert_frame()
+        }
+
+        /// Flushes the decoder, returning any remaining frames.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if flushing fails.
+        pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
+            self.decoder
+                .send_eof()
+                .map_err(|e| DecoderError::DecodeFailed(e.to_string()))?;
+
+            let mut frames = Vec::new();
+            loop {
+                match self.receive_and_convert_frame()? {
+                    Some(frame) => frames.push(frame),
+                    None => break,
+                }
+            }
+
+            Ok(frames)
+        }
+
+        /// Receives a frame from the decoder and converts it to BGRA format.
+        fn receive_and_convert_frame(&mut self) -> Result<Option<DecodedFrame>> {
+            use ffmpeg_next::format::Pixel;
+            use ffmpeg_next::software::scaling::{Context, Flags};
 
             // Try to receive decoded frame
             let mut frame = ffmpeg_next::frame::Video::empty();
@@ -203,32 +249,6 @@ mod linux {
             let data = bgra_frame.data(0).to_vec();
 
             Ok(Some(DecodedFrame::new(data, width, height)))
-        }
-
-        /// Flushes the decoder, returning any remaining frames.
-        ///
-        /// # Errors
-        ///
-        /// Returns an error if flushing fails.
-        pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
-            self.decoder
-                .send_eof()
-                .map_err(|e| DecoderError::DecodeFailed(e.to_string()))?;
-
-            let mut frames = Vec::new();
-            loop {
-                let mut frame = ffmpeg_next::frame::Video::empty();
-                match self.decoder.receive_frame(&mut frame) {
-                    Ok(()) => {
-                        // Process frame similar to decode()
-                        // For simplicity, we'll skip the conversion here
-                        // Real implementation should handle this
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            Ok(frames)
         }
     }
 }
@@ -296,8 +316,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_video_codec_display() {
+    fn test_video_codec_display_h264() {
         assert_eq!(VideoCodec::H264.to_string(), "H.264/AVC");
+    }
+
+    #[test]
+    fn test_video_codec_display_h265() {
         assert_eq!(VideoCodec::H265.to_string(), "H.265/HEVC");
     }
 
@@ -309,6 +333,14 @@ mod tests {
         assert_eq!(frame.height, 1080);
         assert_eq!(frame.stride, 1920 * 4);
         assert_eq!(frame.data.len(), 1920 * 1080 * 4);
+        assert!(frame.timestamp.is_none());
+    }
+
+    #[test]
+    fn test_decoded_frame_with_timestamp() {
+        let data = vec![0u8; 100 * 100 * 4];
+        let frame = DecodedFrame::new(data, 100, 100).with_timestamp(12345);
+        assert_eq!(frame.timestamp, Some(12345));
     }
 
     #[test]
@@ -318,15 +350,44 @@ mod tests {
     }
 
     #[test]
+    fn test_decoded_frame_is_valid() {
+        let valid_data = vec![0u8; 100 * 100 * 4];
+        let valid_frame = DecodedFrame::new(valid_data, 100, 100);
+        assert!(valid_frame.is_valid());
+
+        let invalid_frame = DecodedFrame::new(vec![0u8; 100], 100, 100);
+        assert!(!invalid_frame.is_valid());
+    }
+
+    #[test]
     fn test_decoder_error_display() {
         let err = DecoderError::UnsupportedCodec("VP9".to_string());
         assert!(err.to_string().contains("VP9"));
     }
 
+    #[test]
+    fn test_decoder_error_variants() {
+        let init_err = DecoderError::InitFailed("test".to_string());
+        assert!(init_err.to_string().contains("initialize"));
+
+        let decode_err = DecoderError::DecodeFailed("test".to_string());
+        assert!(decode_err.to_string().contains("Decode"));
+
+        let invalid_err = DecoderError::InvalidData("test".to_string());
+        assert!(invalid_err.to_string().contains("Invalid"));
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn test_decoder_stub_returns_error() {
+    fn test_decoder_stub_h264_returns_error() {
         let result = VideoDecoder::new(VideoCodec::H264);
+        assert!(result.is_err());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_decoder_stub_h265_returns_error() {
+        let result = VideoDecoder::new(VideoCodec::H265);
         assert!(result.is_err());
     }
 }
