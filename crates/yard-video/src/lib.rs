@@ -5,6 +5,9 @@
 //!
 //! **Note:** This crate requires FFmpeg libraries installed on the system.
 
-#![cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+#![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
 
+pub mod decoder;
+
+pub use decoder::{DecodedFrame, DecoderError, VideoCodec, VideoDecoder};
 pub use yard_core::prelude::*;

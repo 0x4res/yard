@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 yard-core = { path = "../yard-core" }
+yard-video = { path = "../yard-video" }
 
 ironrdp.workspace = true
 ironrdp-tls.workspace = true

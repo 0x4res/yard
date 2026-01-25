@@ -359,6 +359,9 @@ fn run_event_loop(
                 error!("{}", err);
                 return Ok(map_error_to_exit_code(&err));
             }
+            Some(FromNetwork::Frame(_)) => {
+                // Frames received before window created are discarded
+            }
             None => {
                 error!("Network thread terminated unexpectedly");
                 return Ok(exit_codes::CONNECTION_ERROR);
@@ -512,6 +515,9 @@ fn run_event_loop(
             Some(FromNetwork::Error(err)) => {
                 error!("{}", err);
                 return Ok(map_error_to_exit_code(&err));
+            }
+            Some(FromNetwork::Frame(_)) => {
+                // Frames discarded on non-Linux (no window)
             }
             None => {
                 error!("Network thread terminated unexpectedly");

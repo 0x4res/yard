@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+pub use yard_video::{DecodedFrame, VideoCodec};
+
 /// Configuration for establishing an RDP connection.
 ///
 /// Note: Password is intentionally excluded from Debug to prevent credential leakage in logs.
@@ -227,6 +229,9 @@ pub enum FromNetwork {
         /// Certificate information to display to the user.
         cert_info: CertificateInfo,
     },
+    /// A decoded video frame ready for rendering.
+    /// The main thread should pass this to the window for display.
+    Frame(DecodedFrame),
 }
 
 /// Error types for connection failures.

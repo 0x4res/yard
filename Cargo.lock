@@ -3907,6 +3907,7 @@ dependencies = [
  "tracing",
  "x509-cert",
  "yard-core",
+ "yard-video",
 ]
 
 [[package]]
@@ -3914,6 +3915,8 @@ name = "yard-video"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-next",
+ "thiserror",
+ "tracing",
  "yard-core",
 ]
 
