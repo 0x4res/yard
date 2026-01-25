@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tokio::sync::mpsc;
-use tracing::{error, info, debug};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
+use yard_core::Config;
 use yard_protocol::{CertificateInfo, ConnectionConfig, FromNetwork, ToNetwork, spawn_network_thread};
 use yard_wayland::WindowConfig;
 
@@ -48,9 +49,9 @@ enum Commands {
         /// Target hostname or IP address.
         host: String,
 
-        /// Target port.
-        #[arg(short, long, default_value = "3389")]
-        port: u16,
+        /// Target port (default: 3389, or from config file).
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Username for authentication.
         #[arg(short, long)]
@@ -91,6 +92,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<u8> {
+    // Load configuration file (defaults if missing)
+    let app_config = load_config();
+
     match cli.command {
         Some(Commands::Connect {
             host,
@@ -100,16 +104,21 @@ fn run(cli: Cli) -> Result<u8> {
         }) => {
             info!("YARD v{}", env!("CARGO_PKG_VERSION"));
 
-            // Build config, parsing domain from username if present
+            // Apply config defaults: CLI args take precedence over config file
+            let effective_port = port.unwrap_or(app_config.defaults.port);
+            let effective_username = username.or(app_config.defaults.username.clone());
+            let effective_domain = domain.or(app_config.defaults.domain.clone());
+
+            // Build connection config, parsing domain from username if present
             // Supports: DOMAIN\user, user@domain.com, or plain username
-            let mut config = if let Some(ref user) = username {
-                ConnectionConfig::from_username(&host, port, user)
+            let mut config = if let Some(ref user) = effective_username {
+                ConnectionConfig::from_username(&host, effective_port, user)
             } else {
-                ConnectionConfig::new(&host, port)
+                ConnectionConfig::new(&host, effective_port)
             };
 
-            // Explicit -d/--domain flag overrides parsed domain
-            if let Some(dom) = domain {
+            // Explicit domain (CLI or config) overrides parsed domain from username
+            if let Some(dom) = effective_domain {
                 config = config.with_domain(dom);
             }
 
@@ -131,6 +140,23 @@ fn run(cli: Cli) -> Result<u8> {
             Cli::command().print_help()?;
             println!();
             Ok(exit_codes::SUCCESS)
+        }
+    }
+}
+
+/// Loads the application configuration from the config file.
+///
+/// Returns default configuration if the file doesn't exist.
+/// Logs a warning and returns defaults if the file exists but is invalid.
+fn load_config() -> Config {
+    match Config::load() {
+        Ok(config) => {
+            debug!("Config loaded from {}", Config::config_path().display());
+            config
+        }
+        Err(e) => {
+            warn!("Failed to load config: {}. Using defaults.", e);
+            Config::default()
         }
     }
 }
