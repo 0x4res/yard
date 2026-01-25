@@ -3,23 +3,41 @@
 //! This module provides the async connection logic that runs in a dedicated
 //! Tokio thread, communicating with the main thread via message channels.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ironrdp::connector::{self, ClientConnector, Credentials};
+use ironrdp::pdu::gcc::KeyboardType;
+use ironrdp::pdu::geometry::Rectangle as _;
+use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
+use ironrdp::pdu::rdp::client_info::PerformanceFlags;
+use ironrdp::session::{ActiveStage, ActiveStageOutput};
+use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_tokio::{Framed, FramedWrite, TokioFramed, TokioStream};
 use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, lookup_host};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::messages::{CertificateInfo, ConnectionConfig, ConnectionError, FromNetwork, ToNetwork};
+use crate::messages::{
+    CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, ToNetwork,
+};
 
 /// Default connection timeout in seconds.
 const CONNECTION_TIMEOUT_SECS: u64 = 10;
 
 /// Timeout for user to decide on certificate acceptance (in seconds).
 const CERTIFICATE_DECISION_TIMEOUT_SECS: u64 = 60;
+
+/// Default desktop width.
+const DEFAULT_WIDTH: u16 = 1920;
+
+/// Default desktop height.
+const DEFAULT_HEIGHT: u16 = 1080;
 
 /// Spawns the network thread and returns a channel sender for commands.
 ///
@@ -70,7 +88,7 @@ async fn network_loop(
     }
 }
 
-/// Handles a connection request with TLS and certificate verification.
+/// Handles a connection request with TLS and RDP session establishment.
 async fn handle_connect(
     config: ConnectionConfig,
     to_network_rx: &mut mpsc::Receiver<ToNetwork>,
@@ -82,8 +100,8 @@ async fn handle_connect(
     }
 
     // Attempt TCP connection
-    let stream = match attempt_tcp_connection(&config).await {
-        Ok(stream) => stream,
+    let (stream, local_addr) = match attempt_tcp_connection(&config).await {
+        Ok(result) => result,
         Err(err) => {
             let _ = tx.send(FromNetwork::Error(err)).await;
             return;
@@ -92,28 +110,259 @@ async fn handle_connect(
 
     debug!("TCP connection established to {}", config.address());
 
-    // Perform TLS upgrade with certificate verification
-    let _tls_stream = match perform_tls_upgrade(stream, &config, to_network_rx, tx).await {
-        Ok(stream) => stream,
+    // Create IronRDP config
+    let rdp_config = match build_rdp_config(&config) {
+        Ok(cfg) => cfg,
         Err(err) => {
             let _ = tx.send(FromNetwork::Error(err)).await;
             return;
         }
     };
 
-    debug!("TLS connection established");
+    // Create framed transport for IronRDP
+    let mut framed: TokioFramed<TcpStream> = TokioFramed::new(stream);
 
-    // Connection established (TLS level)
-    // TODO: Continue with RDP handshake (CredSSP/NLA) in future stories
-    let _ = tx.send(FromNetwork::Connected).await;
+    // Create connector with local address
+    let mut connector = ClientConnector::new(rdp_config, local_addr);
 
-    // For now, just disconnect after successful TLS connection
-    // Full RDP session handling will come in later stories
+    // Phase 1: Initial RDP negotiation (before TLS)
+    debug!("Starting RDP negotiation");
+    let should_upgrade = match ironrdp_tokio::connect_begin(&mut framed, &mut connector).await {
+        Ok(upgrade) => upgrade,
+        Err(e) => {
+            let _ = tx
+                .send(FromNetwork::Error(ConnectionError::Protocol(format!(
+                    "RDP negotiation failed: {e}"
+                ))))
+                .await;
+            return;
+        }
+    };
+
+    debug!("RDP negotiation complete, upgrading to TLS");
+
+    // Phase 2: TLS upgrade with certificate verification
+    let (tls_stream, server_public_key) =
+        match perform_tls_upgrade(framed, &config, to_network_rx, tx).await {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = tx.send(FromNetwork::Error(err)).await;
+                return;
+            }
+        };
+
+    debug!("TLS upgrade complete");
+
+    // Mark connector as upgraded using the ShouldUpgrade token from connect_begin
+    let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
+
+    // Create new framed transport with TLS stream
+    let mut tls_framed: TokioFramed<tokio_rustls::client::TlsStream<TcpStream>> =
+        TokioFramed::new(tls_stream);
+
+    // Phase 3: Complete RDP handshake (CredSSP if enabled, capabilities, channels)
+    let server_name = connector::ServerName::new(&config.host);
+
+    // NetworkClient implementation for SSPI (stub - we don't support Kerberos yet)
+    let mut network_client = StubNetworkClient;
+
+    debug!("Completing RDP handshake");
+    let connection_result = match ironrdp_tokio::connect_finalize(
+        upgraded,
+        connector,
+        &mut tls_framed,
+        &mut network_client,
+        server_name,
+        server_public_key,
+        None, // No Kerberos config
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let err_msg = e.to_string();
+            let conn_err =
+                if err_msg.contains("access denied") || err_msg.contains("Access denied") {
+                    ConnectionError::AuthenticationFailed(err_msg)
+                } else {
+                    ConnectionError::Protocol(format!("RDP handshake failed: {err_msg}"))
+                };
+            let _ = tx.send(FromNetwork::Error(conn_err)).await;
+            return;
+        }
+    };
+
+    info!(
+        "RDP connection established: {}x{}",
+        connection_result.desktop_size.width, connection_result.desktop_size.height
+    );
+
+    let desktop_size = DesktopSize::new(
+        connection_result.desktop_size.width,
+        connection_result.desktop_size.height,
+    );
+
+    // Notify main thread of successful connection
+    if tx.send(FromNetwork::Connected(desktop_size)).await.is_err() {
+        return;
+    }
+
+    // Store dimensions before moving connection_result
+    let (img_width, img_height) = (
+        connection_result.desktop_size.width,
+        connection_result.desktop_size.height,
+    );
+
+    // Create session handler (takes ownership of connection_result)
+    let mut active_stage = ActiveStage::new(connection_result);
+
+    // Create decoded image buffer for frame accumulation
+    let mut image =
+        ironrdp::session::image::DecodedImage::new(PixelFormat::RgbA32, img_width, img_height);
+
+    // Session loop
+    if let Err(e) = session_loop(&mut tls_framed, &mut active_stage, &mut image, tx).await {
+        error!("Session error: {e}");
+        let _ = tx
+            .send(FromNetwork::Error(ConnectionError::Protocol(e.to_string())))
+            .await;
+    }
+
     let _ = tx.send(FromNetwork::Disconnected).await;
 }
 
+/// Session loop that processes RDP frames.
+async fn session_loop<S>(
+    framed: &mut Framed<TokioStream<S>>,
+    active_stage: &mut ActiveStage,
+    image: &mut ironrdp::session::image::DecodedImage,
+    tx: &mpsc::Sender<FromNetwork>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    use yard_video::DecodedFrame;
+
+    loop {
+        // Read next PDU from server
+        let (action, frame) = framed.read_pdu().await?;
+
+        // Process the frame
+        let outputs = active_stage.process(image, action, &frame)?;
+
+        for output in outputs {
+            match output {
+                ActiveStageOutput::ResponseFrame(response) => {
+                    // Send response back to server
+                    framed.write_all(&response).await?;
+                }
+                ActiveStageOutput::GraphicsUpdate(rect) => {
+                    // Extract the updated region and send to main thread
+                    let width = rect.width();
+                    let height = rect.height();
+
+                    // Get the pixel data for the updated region
+                    // The image data is in RgbA32 format (4 bytes per pixel)
+                    let data = image.data_for_rect(&rect).to_vec();
+
+                    let frame = DecodedFrame::new(data, u32::from(width), u32::from(height));
+
+                    if tx.send(FromNetwork::Frame(frame)).await.is_err() {
+                        return Ok(()); // Main thread disconnected
+                    }
+                }
+                ActiveStageOutput::Terminate(reason) => {
+                    info!("Session terminated: {reason}");
+                    return Ok(());
+                }
+                ActiveStageOutput::DeactivateAll(_) => {
+                    // Server is requesting reactivation - handle reconnection
+                    warn!("Server requested deactivation - reconnection not implemented");
+                    return Ok(());
+                }
+                ActiveStageOutput::PointerDefault
+                | ActiveStageOutput::PointerHidden
+                | ActiveStageOutput::PointerPosition { .. }
+                | ActiveStageOutput::PointerBitmap(_) => {
+                    // Pointer updates - TODO: implement cursor handling
+                }
+            }
+        }
+    }
+}
+
+/// Builds IronRDP connector config from our ConnectionConfig.
+fn build_rdp_config(config: &ConnectionConfig) -> Result<connector::Config, ConnectionError> {
+    let credentials = Credentials::UsernamePassword {
+        username: config.username.clone().unwrap_or_default(),
+        password: config.password.clone().unwrap_or_default(),
+    };
+
+    // Use default codecs (includes RemoteFX)
+    let bitmap_codecs = client_codecs_capabilities(&[])
+        .map_err(|e| ConnectionError::Protocol(format!("Failed to build codec config: {e}")))?;
+
+    let bitmap_config = connector::BitmapConfig {
+        lossy_compression: true,
+        color_depth: 32,
+        codecs: bitmap_codecs,
+    };
+
+    Ok(connector::Config {
+        credentials,
+        domain: config.domain.clone(),
+        desktop_size: connector::DesktopSize {
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+        },
+        desktop_scale_factor: 100,
+        enable_tls: true,
+        enable_credssp: true,
+        client_name: "YARD".to_string(),
+        client_build: 0,
+        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_subtype: 0,
+        keyboard_functional_keys_count: 12,
+        keyboard_layout: 0x0409, // US English
+        ime_file_name: String::new(),
+        bitmap: Some(bitmap_config),
+        dig_product_id: String::new(),
+        client_dir: String::new(),
+        platform: MajorPlatformType::UNIX,
+        hardware_id: None,
+        request_data: None,
+        autologon: false,
+        enable_audio_playback: false,
+        performance_flags: PerformanceFlags::default(),
+        license_cache: None,
+        timezone_info: Default::default(),
+        enable_server_pointer: true,
+        pointer_software_rendering: false,
+    })
+}
+
+/// Stub network client for SSPI - we don't support Kerberos authentication yet.
+struct StubNetworkClient;
+
+impl ironrdp_tokio::NetworkClient for StubNetworkClient {
+    fn send(
+        &mut self,
+        _request: &ironrdp::connector::sspi::generator::NetworkRequest,
+    ) -> impl std::future::Future<Output = connector::ConnectorResult<Vec<u8>>> {
+        async {
+            Err(connector::ConnectorError::new(
+                "Kerberos authentication not supported",
+                connector::ConnectorErrorKind::General,
+            ))
+        }
+    }
+}
+
 /// Attempts to establish a TCP connection to the RDP server.
-async fn attempt_tcp_connection(config: &ConnectionConfig) -> Result<TcpStream, ConnectionError> {
+/// Returns both the stream and the local socket address (needed for ClientConnector).
+async fn attempt_tcp_connection(
+    config: &ConnectionConfig,
+) -> Result<(TcpStream, SocketAddr), ConnectionError> {
     let address = config.address();
 
     // Resolve DNS asynchronously (non-blocking)
@@ -137,23 +386,26 @@ async fn attempt_tcp_connection(config: &ConnectionConfig) -> Result<TcpStream, 
             }
         })?;
 
-    Ok(stream)
+    // Get local address for the connector
+    let local_addr = stream
+        .local_addr()
+        .map_err(|e| ConnectionError::Io(format!("Failed to get local address: {e}")))?;
+
+    Ok((stream, local_addr))
 }
 
 /// Performs TLS upgrade with certificate verification.
 ///
-/// This function:
-/// 1. Upgrades the TCP connection to TLS
-/// 2. Extracts certificate information
-/// 3. Sends CertificateVerify to main thread for user decision
-/// 4. Waits for CertificateDecision response
-/// 5. Returns the TLS stream if accepted, or error if rejected
+/// Returns the TLS stream and the server's public key (for CredSSP).
 async fn perform_tls_upgrade(
-    stream: TcpStream,
+    framed: TokioFramed<TcpStream>,
     config: &ConnectionConfig,
     to_network_rx: &mut mpsc::Receiver<ToNetwork>,
     tx: &mpsc::Sender<FromNetwork>,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ConnectionError> {
+) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, Vec<u8>), ConnectionError> {
+    // Extract the TCP stream from the framed transport
+    let (stream, _leftover) = framed.into_inner();
+
     // Create TLS config that accepts all certificates (we verify manually)
     // This is necessary because RDP servers commonly use self-signed certs
     let tls_config = rustls::ClientConfig::builder()
@@ -173,8 +425,8 @@ async fn perform_tls_upgrade(
         .await
         .map_err(|e| ConnectionError::TlsError(e.to_string()))?;
 
-    // Extract certificate information from the TLS connection
-    let cert_info = extract_certificate_info(&tls_stream)?;
+    // Extract certificate information and public key
+    let (cert_info, server_public_key) = extract_certificate_info(&tls_stream)?;
 
     // Send certificate info to main thread for user verification
     let server = config.address();
@@ -186,7 +438,9 @@ async fn perform_tls_upgrade(
         .await
         .is_err()
     {
-        return Err(ConnectionError::Io("Failed to send certificate info".to_string()));
+        return Err(ConnectionError::Io(
+            "Failed to send certificate info".to_string(),
+        ));
     }
 
     // Wait for user's decision
@@ -194,7 +448,7 @@ async fn perform_tls_upgrade(
 
     if accepted {
         debug!("Certificate accepted by user");
-        Ok(tls_stream)
+        Ok((tls_stream, server_public_key))
     } else {
         Err(ConnectionError::CertificateRejected(
             "User rejected the server certificate".to_string(),
@@ -202,10 +456,10 @@ async fn perform_tls_upgrade(
     }
 }
 
-/// Extracts certificate information from a TLS connection.
+/// Extracts certificate information and public key from a TLS connection.
 fn extract_certificate_info(
     tls_stream: &tokio_rustls::client::TlsStream<TcpStream>,
-) -> Result<CertificateInfo, ConnectionError> {
+) -> Result<(CertificateInfo, Vec<u8>), ConnectionError> {
     let (_, client_conn) = tls_stream.get_ref();
 
     // Get peer certificates
@@ -223,7 +477,7 @@ fn extract_certificate_info(
         .map_err(|e| ConnectionError::TlsError(format!("Failed to parse certificate: {e}")))?;
 
     // Extract fingerprint (SHA-256)
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(cert_der.as_ref());
     let fingerprint_bytes = hasher.finalize();
@@ -254,7 +508,13 @@ fn extract_certificate_info(
         cert_info = cert_info.with_organization(org);
     }
 
-    Ok(cert_info)
+    // Extract server public key for CredSSP
+    // The public key is the SubjectPublicKeyInfo from the certificate
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let public_key = x509_cert::der::Encode::to_der(spki)
+        .map_err(|e| ConnectionError::TlsError(format!("Failed to encode public key: {e}")))?;
+
+    Ok((cert_info, public_key))
 }
 
 /// Formats a fingerprint as hex with colons (e.g., "SHA256:AB:CD:EF:...")
@@ -304,11 +564,15 @@ async fn wait_for_certificate_decision(
         match timeout(remaining, to_network_rx.recv()).await {
             Ok(Some(ToNetwork::CertificateDecision(accepted))) => return Ok(accepted),
             Ok(Some(ToNetwork::Disconnect)) => {
-                return Err(ConnectionError::Io("Connection cancelled by user".to_string()));
+                return Err(ConnectionError::Io(
+                    "Connection cancelled by user".to_string(),
+                ));
             }
             Ok(Some(_)) => {
                 // Unexpected message - ignore and keep waiting
-                warn!("Received unexpected message while waiting for certificate decision, ignoring");
+                warn!(
+                    "Received unexpected message while waiting for certificate decision, ignoring"
+                );
                 continue;
             }
             Ok(None) => return Err(ConnectionError::Io("Channel closed".to_string())),
@@ -393,10 +657,9 @@ mod tests {
     fn test_format_fingerprint_sha256_length() {
         // SHA-256 produces 32 bytes
         let bytes: [u8; 32] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-            0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0x1D, 0x1E, 0x1F, 0x20,
         ];
         let result = format_fingerprint(&bytes);
         assert!(result.starts_with("SHA256:"));
@@ -426,5 +689,12 @@ mod tests {
     #[test]
     fn test_certificate_decision_timeout_constant() {
         assert_eq!(CERTIFICATE_DECISION_TIMEOUT_SECS, 60);
+    }
+
+    #[test]
+    fn test_desktop_size_new() {
+        let size = DesktopSize::new(1920, 1080);
+        assert_eq!(size.width, 1920);
+        assert_eq!(size.height, 1080);
     }
 }

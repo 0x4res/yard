@@ -10,6 +10,7 @@ yard-core = { path = "../yard-core" }
 yard-video = { path = "../yard-video" }
 
 ironrdp.workspace = true
+ironrdp-graphics.workspace = true
 ironrdp-tls.workspace = true
 ironrdp-tokio.workspace = true
 tokio.workspace = true

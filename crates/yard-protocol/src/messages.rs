@@ -209,13 +209,29 @@ pub enum ToNetwork {
     CertificateDecision(bool),
 }
 
+/// Desktop size information from the RDP server.
+#[derive(Debug, Clone, Copy)]
+pub struct DesktopSize {
+    /// Width in pixels.
+    pub width: u16,
+    /// Height in pixels.
+    pub height: u16,
+}
+
+impl DesktopSize {
+    /// Creates a new DesktopSize.
+    pub fn new(width: u16, height: u16) -> Self {
+        Self { width, height }
+    }
+}
+
 /// Messages sent from the network thread to the main thread.
 #[derive(Debug)]
 pub enum FromNetwork {
     /// Connection attempt is in progress.
     Connecting,
-    /// Connection established successfully.
-    Connected,
+    /// Connection established successfully with desktop dimensions.
+    Connected(DesktopSize),
     /// Disconnected (gracefully or due to error).
     Disconnected,
     /// An error occurred.

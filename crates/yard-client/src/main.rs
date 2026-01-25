@@ -337,8 +337,11 @@ fn run_event_loop(
             Some(FromNetwork::Connecting) => {
                 info!("Establishing connection...");
             }
-            Some(FromNetwork::Connected) => {
-                info!("Connected successfully!");
+            Some(FromNetwork::Connected(desktop_size)) => {
+                info!(
+                    "Connected successfully! Desktop: {}x{}",
+                    desktop_size.width, desktop_size.height
+                );
                 connected = true;
             }
             Some(FromNetwork::CertificateVerify { server, cert_info }) => {
@@ -494,8 +497,11 @@ fn run_event_loop(
             Some(FromNetwork::Connecting) => {
                 info!("Establishing connection...");
             }
-            Some(FromNetwork::Connected) => {
-                info!("Connected successfully!");
+            Some(FromNetwork::Connected(desktop_size)) => {
+                info!(
+                    "Connected successfully! Desktop: {}x{}",
+                    desktop_size.width, desktop_size.height
+                );
                 info!("Note: Wayland window requires Linux");
             }
             Some(FromNetwork::Disconnected) => {
