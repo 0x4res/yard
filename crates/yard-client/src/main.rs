@@ -395,35 +395,67 @@ fn run_event_loop(
     window.draw_solid(r, g, b);
     info!("Window created: {}x{}", window.dimensions().0, window.dimensions().1);
 
+    // Track frame statistics
+    let mut frame_count: u64 = 0;
+    let start_time = std::time::Instant::now();
+
     // Main event loop
     // NOTE: Network channel is polled manually via try_recv. Future optimization could
     // integrate it as a calloop source for true event-driven dispatch.
     loop {
-        // Poll network messages (non-blocking)
-        match from_network_rx.try_recv() {
-            Ok(FromNetwork::Disconnected) => {
-                info!("Disconnected.");
-                break;
-            }
-            Ok(FromNetwork::Error(err)) => {
-                error!("{}", err);
-                return Ok(map_error_to_exit_code(&err));
-            }
-            Ok(FromNetwork::CertificateVerify { server, cert_info }) => {
-                let accepted = prompt_certificate_verification(&server, &cert_info);
-                if to_network_tx
-                    .blocking_send(ToNetwork::CertificateDecision(accepted))
-                    .is_err()
-                {
-                    error!("Failed to send certificate decision");
+        // Poll network messages (non-blocking) - process all available
+        loop {
+            match from_network_rx.try_recv() {
+                Ok(FromNetwork::Disconnected) => {
+                    info!("Disconnected after {} frames.", frame_count);
+                    return Ok(exit_codes::SUCCESS);
+                }
+                Ok(FromNetwork::Error(err)) => {
+                    error!("{}", err);
+                    return Ok(map_error_to_exit_code(&err));
+                }
+                Ok(FromNetwork::CertificateVerify { server, cert_info }) => {
+                    let accepted = prompt_certificate_verification(&server, &cert_info);
+                    if to_network_tx
+                        .blocking_send(ToNetwork::CertificateDecision(accepted))
+                        .is_err()
+                    {
+                        error!("Failed to send certificate decision");
+                        return Ok(exit_codes::CONNECTION_ERROR);
+                    }
+                }
+                Ok(FromNetwork::Frame(frame)) => {
+                    // Render frame to window
+                    if frame_count == 0 {
+                        let elapsed = start_time.elapsed();
+                        info!("First frame received in {:?}", elapsed);
+                    }
+
+                    // Use draw_frame_at for partial updates with position
+                    window.draw_frame_at(
+                        &frame.data,
+                        frame.width,
+                        frame.height,
+                        frame.x,
+                        frame.y,
+                    );
+                    frame_count += 1;
+
+                    if frame_count % 300 == 0 {
+                        debug!("Rendered {} frames", frame_count);
+                    }
+                }
+                Ok(FromNetwork::Connecting) => {
+                    // Already connected, ignore
+                }
+                Ok(FromNetwork::Connected(_)) => {
+                    // Already handled before window creation
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    error!("Network thread terminated");
                     return Ok(exit_codes::CONNECTION_ERROR);
                 }
-            }
-            Ok(_) => {}
-            Err(mpsc::error::TryRecvError::Empty) => {}
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                error!("Network thread terminated");
-                break;
             }
         }
 
@@ -438,22 +470,28 @@ fn run_event_loop(
         while let Ok(event) = event_rx.try_recv() {
             match event {
                 WindowEvent::CloseRequested => {
-                    info!("Window close requested");
+                    info!("Window close requested after {} frames", frame_count);
                     let _ = to_network_tx.blocking_send(ToNetwork::Disconnect);
                     return Ok(exit_codes::SUCCESS);
                 }
                 WindowEvent::Resized { width, height } => {
                     debug!("Window resized to {}x{}", width, height);
-                    window.draw_solid(r, g, b);
+                    // Only draw solid placeholder if no frames received yet
+                    if frame_count == 0 {
+                        window.draw_solid(r, g, b);
+                    }
                 }
                 WindowEvent::RedrawRequested => {
-                    window.draw_solid(r, g, b);
+                    // Only draw solid placeholder if no frames received yet
+                    // Once frames start arriving, the compositor will handle
+                    // redraw via damage
+                    if frame_count == 0 {
+                        window.draw_solid(r, g, b);
+                    }
                 }
             }
         }
     }
-
-    Ok(exit_codes::SUCCESS)
 }
 
 /// Runs headless event loop (no window) - used as fallback.
