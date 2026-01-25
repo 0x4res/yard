@@ -9,9 +9,10 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, debug};
 use tracing_subscriber::EnvFilter;
 use yard_protocol::{CertificateInfo, ConnectionConfig, FromNetwork, ToNetwork, spawn_network_thread};
+use yard_wayland::WindowConfig;
 
 /// Exit codes for YARD.
 mod exit_codes {
@@ -221,6 +222,14 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
         }
     }
 
+    // Prepare window config for later use
+    let window_config = WindowConfig::with_connection_info(
+        &config.host,
+        config.port,
+        config.username.as_deref(),
+    );
+    debug!("Window config prepared: {:?}", window_config);
+
     // Create channel for receiving messages from network thread
     let (from_network_tx, mut from_network_rx) = mpsc::channel::<FromNetwork>(32);
 
@@ -232,19 +241,40 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
         .blocking_send(ToNetwork::Connect(config))
         .map_err(|_| anyhow::anyhow!("Failed to send connect command"))?;
 
-    // Simple blocking loop to receive messages
-    // TODO: Replace with calloop event loop in Story 1.8
-    let exit_code = loop {
+    // Event loop for handling messages
+    // On Linux, this will be replaced with calloop + Wayland window
+    // For now, use blocking receive
+    let exit_code = run_event_loop(
+        &mut from_network_rx,
+        &to_network_tx,
+        window_config,
+    )?;
+
+    Ok(exit_code)
+}
+
+/// Runs the main event loop.
+///
+/// On Linux with Wayland, this creates a window and uses calloop.
+/// On other platforms, this uses a simple blocking receive loop.
+#[cfg(target_os = "linux")]
+fn run_event_loop(
+    from_network_rx: &mut mpsc::Receiver<FromNetwork>,
+    to_network_tx: &mpsc::Sender<ToNetwork>,
+    window_config: WindowConfig,
+) -> Result<u8> {
+    use yard_wayland::{WaylandWindow, WindowEvent};
+
+    // Wait for initial connection before creating window
+    let mut connected = false;
+    while !connected {
         match from_network_rx.blocking_recv() {
             Some(FromNetwork::Connecting) => {
                 info!("Establishing connection...");
             }
             Some(FromNetwork::Connected) => {
                 info!("Connected successfully!");
-            }
-            Some(FromNetwork::Disconnected) => {
-                info!("Disconnected.");
-                break exit_codes::SUCCESS;
+                connected = true;
             }
             Some(FromNetwork::CertificateVerify { server, cert_info }) => {
                 let accepted = prompt_certificate_verification(&server, &cert_info);
@@ -253,27 +283,198 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
                     .is_err()
                 {
                     error!("Failed to send certificate decision");
-                    break exit_codes::CONNECTION_ERROR;
+                    return Ok(exit_codes::CONNECTION_ERROR);
+                }
+            }
+            Some(FromNetwork::Disconnected) => {
+                info!("Disconnected before window created.");
+                return Ok(exit_codes::SUCCESS);
+            }
+            Some(FromNetwork::Error(err)) => {
+                error!("{}", err);
+                return Ok(map_error_to_exit_code(&err));
+            }
+            None => {
+                error!("Network thread terminated unexpectedly");
+                return Ok(exit_codes::CONNECTION_ERROR);
+            }
+        }
+    }
+
+    // Create Wayland window
+    info!("Creating Wayland window...");
+    let (mut event_loop, mut window, event_rx) = match WaylandWindow::new(window_config) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to create Wayland window: {}", e);
+            // Fallback to headless mode
+            return run_headless_loop(from_network_rx, to_network_tx);
+        }
+    };
+
+    // Insert network channel into event loop
+    let _channel_token = event_loop
+        .handle()
+        .insert_source(
+            calloop::channel::Channel::new(),
+            |_, _, _| {},
+        )
+        .ok();
+
+    // Draw initial placeholder (dark gray)
+    window.draw_solid(40, 40, 40);
+    info!("Window created: {}x{}", window.dimensions().0, window.dimensions().1);
+
+    // Main event loop
+    loop {
+        // Check for window close
+        if window.close_requested() {
+            info!("Window close requested");
+            let _ = to_network_tx.blocking_send(ToNetwork::Disconnect);
+            break;
+        }
+
+        // Poll network messages (non-blocking)
+        match from_network_rx.try_recv() {
+            Ok(FromNetwork::Disconnected) => {
+                info!("Disconnected.");
+                break;
+            }
+            Ok(FromNetwork::Error(err)) => {
+                error!("{}", err);
+                return Ok(map_error_to_exit_code(&err));
+            }
+            Ok(FromNetwork::CertificateVerify { server, cert_info }) => {
+                let accepted = prompt_certificate_verification(&server, &cert_info);
+                if to_network_tx
+                    .blocking_send(ToNetwork::CertificateDecision(accepted))
+                    .is_err()
+                {
+                    error!("Failed to send certificate decision");
+                    return Ok(exit_codes::CONNECTION_ERROR);
+                }
+            }
+            Ok(_) => {}
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                error!("Network thread terminated");
+                break;
+            }
+        }
+
+        // Dispatch Wayland events
+        if let Err(e) = event_loop.dispatch(std::time::Duration::from_millis(16), &mut window) {
+            error!("Event loop error: {}", e);
+            break;
+        }
+
+        // Check window events
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                WindowEvent::CloseRequested => {
+                    info!("Window close requested via event");
+                    let _ = to_network_tx.blocking_send(ToNetwork::Disconnect);
+                    return Ok(exit_codes::SUCCESS);
+                }
+                WindowEvent::Resized { width, height } => {
+                    debug!("Window resized to {}x{}", width, height);
+                    window.draw_solid(40, 40, 40);
+                }
+                WindowEvent::RedrawRequested => {
+                    window.draw_solid(40, 40, 40);
+                }
+            }
+        }
+    }
+
+    Ok(exit_codes::SUCCESS)
+}
+
+/// Runs headless event loop (no window) - used as fallback.
+#[cfg(target_os = "linux")]
+fn run_headless_loop(
+    from_network_rx: &mut mpsc::Receiver<FromNetwork>,
+    to_network_tx: &mpsc::Sender<ToNetwork>,
+) -> Result<u8> {
+    loop {
+        match from_network_rx.blocking_recv() {
+            Some(FromNetwork::Disconnected) => {
+                info!("Disconnected.");
+                return Ok(exit_codes::SUCCESS);
+            }
+            Some(FromNetwork::Error(err)) => {
+                error!("{}", err);
+                return Ok(map_error_to_exit_code(&err));
+            }
+            Some(FromNetwork::CertificateVerify { server, cert_info }) => {
+                let accepted = prompt_certificate_verification(&server, &cert_info);
+                if to_network_tx
+                    .blocking_send(ToNetwork::CertificateDecision(accepted))
+                    .is_err()
+                {
+                    error!("Failed to send certificate decision");
+                    return Ok(exit_codes::CONNECTION_ERROR);
+                }
+            }
+            Some(_) => {}
+            None => {
+                error!("Network thread terminated unexpectedly");
+                return Ok(exit_codes::CONNECTION_ERROR);
+            }
+        }
+    }
+}
+
+/// Non-Linux event loop (simple blocking).
+#[cfg(not(target_os = "linux"))]
+fn run_event_loop(
+    from_network_rx: &mut mpsc::Receiver<FromNetwork>,
+    to_network_tx: &mpsc::Sender<ToNetwork>,
+    _window_config: WindowConfig,
+) -> Result<u8> {
+    // On non-Linux, just use blocking loop (no Wayland window)
+    loop {
+        match from_network_rx.blocking_recv() {
+            Some(FromNetwork::Connecting) => {
+                info!("Establishing connection...");
+            }
+            Some(FromNetwork::Connected) => {
+                info!("Connected successfully!");
+                info!("Note: Wayland window requires Linux");
+            }
+            Some(FromNetwork::Disconnected) => {
+                info!("Disconnected.");
+                return Ok(exit_codes::SUCCESS);
+            }
+            Some(FromNetwork::CertificateVerify { server, cert_info }) => {
+                let accepted = prompt_certificate_verification(&server, &cert_info);
+                if to_network_tx
+                    .blocking_send(ToNetwork::CertificateDecision(accepted))
+                    .is_err()
+                {
+                    error!("Failed to send certificate decision");
+                    return Ok(exit_codes::CONNECTION_ERROR);
                 }
             }
             Some(FromNetwork::Error(err)) => {
                 error!("{}", err);
-                break match err {
-                    yard_protocol::ConnectionError::AuthenticationFailed(_) => {
-                        exit_codes::AUTH_ERROR
-                    }
-                    yard_protocol::ConnectionError::Protocol(_) => exit_codes::PROTOCOL_ERROR,
-                    _ => exit_codes::CONNECTION_ERROR,
-                };
+                return Ok(map_error_to_exit_code(&err));
             }
             None => {
                 error!("Network thread terminated unexpectedly");
-                break exit_codes::CONNECTION_ERROR;
+                return Ok(exit_codes::CONNECTION_ERROR);
             }
         }
-    };
+    }
+}
 
-    Ok(exit_code)
+/// Maps a ConnectionError to an exit code.
+fn map_error_to_exit_code(err: &yard_protocol::ConnectionError) -> u8 {
+    match err {
+        yard_protocol::ConnectionError::AuthenticationFailed(_) => exit_codes::AUTH_ERROR,
+        yard_protocol::ConnectionError::Protocol(_) => exit_codes::PROTOCOL_ERROR,
+        _ => exit_codes::CONNECTION_ERROR,
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,9 @@
 //!
 //! **Note:** This crate requires Linux with Wayland support.
 
-#![cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+#![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
 
+pub mod window;
+
+pub use window::{WindowConfig, WindowEvent, WaylandWindow};
 pub use yard_core::prelude::*;
