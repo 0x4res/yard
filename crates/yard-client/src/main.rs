@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 use yard_core::Config;
 use yard_protocol::{CertificateInfo, ConnectionConfig, FromNetwork, ToNetwork, spawn_network_thread};
@@ -32,9 +32,17 @@ mod exit_codes {
 /// A native Wayland RDP client for Linux with multi-monitor fullscreen support.
 #[derive(Parser)]
 #[command(name = "yard")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about)]
+#[command(long_about = "A native Wayland RDP client for Linux with multi-monitor fullscreen support.\n\n\
+Exit codes:\n  \
+  0  Success\n  \
+  1  Connection error (network, timeout, server unreachable)\n  \
+  2  Authentication error (invalid credentials)\n  \
+  3  Protocol error (RDP negotiation failed)\n\n\
+Logging:\n  \
+  Set RUST_LOG for fine-grained control (e.g., RUST_LOG=yard_protocol=trace)")]
 struct Cli {
-    /// Enable verbose logging (debug level).
+    /// Enable verbose logging (debug level for yard_* crates).
     #[arg(short, long, global = true)]
     verbose: bool,
 
@@ -73,14 +81,22 @@ enum Commands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Initialize logging
-    let filter = if cli.verbose {
-        EnvFilter::new("debug")
+    // Initialize logging with priority: RUST_LOG > --verbose > default (warn)
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        // RUST_LOG takes full priority for fine-grained control
+        EnvFilter::from_default_env()
+    } else if cli.verbose {
+        // --verbose enables debug level for all yard crates
+        EnvFilter::new("warn,yard_client=debug,yard_protocol=debug,yard_core=debug,yard_wayland=debug")
     } else {
-        EnvFilter::new("info")
+        // Default: only errors and warnings (AC 1)
+        EnvFilter::new("warn")
     };
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true) // Show crate/module in logs
+        .init();
 
     match run(cli) {
         Ok(code) => ExitCode::from(code),
@@ -238,13 +254,22 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 
 /// Runs the RDP connection.
 fn run_connection(config: ConnectionConfig) -> Result<u8> {
+    // Create structured span with connection context (AC 4)
+    let connection_span = info_span!(
+        "rdp_connection",
+        server = %config.host,
+        port = config.port,
+        user = config.username.as_deref().unwrap_or("-"),
+    );
+    let _guard = connection_span.enter();
+
     info!("Connecting to {}...", config.address());
 
     if let Some(ref user) = config.username {
         if let Some(ref dom) = config.domain {
-            info!("User: {}\\{}", dom, user);
+            debug!(domain = %dom, username = %user, "Authenticating with domain credentials");
         } else {
-            info!("User: {}", user);
+            debug!(username = %user, "Authenticating with local credentials");
         }
     }
 
@@ -254,7 +279,7 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
         config.port,
         config.username.as_deref(),
     );
-    debug!("Window config prepared: {:?}", window_config);
+    debug!(?window_config, "Window config prepared");
 
     // Create channel for receiving messages from network thread
     let (from_network_tx, mut from_network_rx) = mpsc::channel::<FromNetwork>(32);
