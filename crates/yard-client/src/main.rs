@@ -105,7 +105,7 @@ fn run(cli: Cli) -> Result<u8> {
             info!("YARD v{}", env!("CARGO_PKG_VERSION"));
 
             // Apply config defaults: CLI args take precedence over config file
-            let effective_port = port.unwrap_or(app_config.defaults.port);
+            let effective_port = port.unwrap_or_else(|| app_config.defaults.effective_port());
             let effective_username = username.or(app_config.defaults.username.clone());
             let effective_domain = domain.or(app_config.defaults.domain.clone());
 

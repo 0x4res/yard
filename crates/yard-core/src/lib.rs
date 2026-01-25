@@ -7,5 +7,5 @@ pub mod config;
 pub mod error;
 pub mod prelude;
 
-pub use config::{Config, ConnectionDefaults};
+pub use config::{Config, ConnectionDefaults, DEFAULT_PORT};
 pub use error::{Error, Result};

@@ -3,7 +3,7 @@
 //! This module handles loading and parsing the YARD configuration file
 //! from `~/.config/yard/config.toml` (or `$XDG_CONFIG_HOME/yard/config.toml`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -50,9 +50,24 @@ impl Default for ConnectionDefaults {
     }
 }
 
+impl ConnectionDefaults {
+    /// Returns the port, defaulting to 3389 if port is 0.
+    ///
+    /// Port 0 is invalid for RDP connections, so this method
+    /// treats it as "use default".
+    #[must_use]
+    pub fn effective_port(&self) -> u16 {
+        if self.port == 0 {
+            DEFAULT_PORT
+        } else {
+            self.port
+        }
+    }
+}
+
 /// Error details for configuration parsing failures.
 #[derive(Debug)]
-pub struct ConfigParseError {
+struct ConfigParseError {
     /// Human-readable error message.
     pub message: String,
     /// Line number where error occurred (if available).
@@ -79,7 +94,10 @@ impl Config {
     /// Loads configuration from the default config file location.
     ///
     /// Returns `Ok(Config::default())` if the config file doesn't exist.
-    /// Returns an error if the file exists but cannot be parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read or parsed.
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
         Self::load_from_path(&path)
@@ -88,8 +106,11 @@ impl Config {
     /// Loads configuration from a specific path.
     ///
     /// Returns `Ok(Config::default())` if the file doesn't exist.
-    /// Returns an error if the file exists but cannot be parsed.
-    pub fn load_from_path(path: &PathBuf) -> Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read or contains invalid TOML.
+    pub fn load_from_path(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -102,6 +123,10 @@ impl Config {
     }
 
     /// Parses configuration from a TOML string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TOML is invalid or contains incorrect types.
     pub fn parse(contents: &str) -> Result<Self> {
         toml::from_str(contents).map_err(|e| {
             let parse_error = ConfigParseError {
@@ -124,23 +149,41 @@ impl Config {
     ///
     /// Uses `$XDG_CONFIG_HOME/yard/config.toml` if set,
     /// otherwise falls back to `~/.config/yard/config.toml`.
+    /// On Windows, uses `%APPDATA%\yard\config.toml`.
+    #[must_use]
     pub fn config_path() -> PathBuf {
         Self::config_dir().join(CONFIG_FILE_NAME)
     }
 
     /// Returns the configuration directory path.
+    ///
+    /// Platform-specific:
+    /// - Linux/macOS: `$XDG_CONFIG_HOME/yard` or `~/.config/yard`
+    /// - Windows: `%APPDATA%\yard`
+    #[must_use]
     pub fn config_dir() -> PathBuf {
+        // XDG_CONFIG_HOME takes priority on all platforms
         if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
-            PathBuf::from(xdg_config).join(APP_DIR_NAME)
-        } else if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home).join(".config").join(APP_DIR_NAME)
-        } else if let Ok(home) = std::env::var("USERPROFILE") {
-            // Windows fallback
-            PathBuf::from(home).join(".config").join(APP_DIR_NAME)
-        } else {
-            // Last resort fallback
-            PathBuf::from(".").join(".config").join(APP_DIR_NAME)
+            return PathBuf::from(xdg_config).join(APP_DIR_NAME);
         }
+
+        // Windows: use APPDATA
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join(APP_DIR_NAME);
+        }
+
+        // Unix: use HOME/.config
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".config").join(APP_DIR_NAME);
+        }
+
+        // Windows fallback: USERPROFILE
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            return PathBuf::from(home).join(".config").join(APP_DIR_NAME);
+        }
+
+        // Last resort fallback
+        PathBuf::from(".").join(".config").join(APP_DIR_NAME)
     }
 }
 
@@ -244,5 +287,23 @@ foo = "bar"
         assert_eq!(defaults.port, 3389);
         assert!(defaults.domain.is_none());
         assert!(defaults.username.is_none());
+    }
+
+    #[test]
+    fn test_effective_port_normal() {
+        let defaults = ConnectionDefaults {
+            port: 13389,
+            ..Default::default()
+        };
+        assert_eq!(defaults.effective_port(), 13389);
+    }
+
+    #[test]
+    fn test_effective_port_zero_uses_default() {
+        let defaults = ConnectionDefaults {
+            port: 0,
+            ..Default::default()
+        };
+        assert_eq!(defaults.effective_port(), DEFAULT_PORT);
     }
 }
