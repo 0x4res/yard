@@ -95,6 +95,10 @@ mod linux {
         width: u32,
         height: u32,
         buffer: Option<Buffer>,
+        /// Retained frame content for partial updates.
+        /// This preserves pixels from previous frames so partial updates
+        /// only modify the changed regions.
+        retained_content: Vec<u8>,
         event_tx: Sender<WindowEvent>,
         close_requested: bool,
         dirty: bool,
@@ -153,6 +157,10 @@ mod linux {
                 &shm,
             )?;
 
+            // Initialize retained content buffer (black/transparent)
+            let retained_size = (config.width * config.height * 4) as usize;
+            let retained_content = vec![0u8; retained_size];
+
             let state = Self {
                 registry_state: RegistryState::new(&globals),
                 output_state: OutputState::new(&globals, &qh),
@@ -162,6 +170,7 @@ mod linux {
                 width: config.width,
                 height: config.height,
                 buffer: None,
+                retained_content,
                 event_tx,
                 close_requested: false,
                 dirty: true,
@@ -210,6 +219,12 @@ mod linux {
             // Fill with solid color (ARGB format)
             let color = [b, g, r, 255u8]; // BGRA order for ARGB8888
             for chunk in canvas.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&color);
+            }
+
+            // Update retained content with the solid color
+            // This ensures partial updates work correctly on top of placeholder
+            for chunk in self.retained_content.chunks_exact_mut(4) {
                 chunk.copy_from_slice(&color);
             }
 
@@ -284,7 +299,7 @@ mod linux {
         fn draw_full_frame(&mut self, data: &[u8], width: u32, height: u32, stride: u32) {
             let buffer_size = (stride * height) as usize;
 
-            // Resize pool if needed
+            // Resize pool and retained content if needed
             if width != self.width || height != self.height {
                 self.width = width;
                 self.height = height;
@@ -292,6 +307,8 @@ mod linux {
                     tracing::error!("Failed to resize buffer pool: {}", e);
                     return;
                 }
+                // Resize retained content buffer
+                self.retained_content.resize(buffer_size, 0);
             }
 
             // Create buffer and copy data
@@ -312,6 +329,10 @@ mod linux {
             let copy_len = canvas.len().min(data.len());
             canvas[..copy_len].copy_from_slice(&data[..copy_len]);
 
+            // Update retained content for future partial updates
+            let retain_len = self.retained_content.len().min(data.len());
+            self.retained_content[..retain_len].copy_from_slice(&data[..retain_len]);
+
             // Attach and commit
             self.window
                 .wl_surface()
@@ -328,7 +349,7 @@ mod linux {
         /// Draws a partial frame update at the specified position.
         ///
         /// This preserves existing content outside the updated region by copying
-        /// from the previous buffer before blitting the new partial data.
+        /// from retained_content before blitting the new partial data.
         fn draw_partial_frame(&mut self, data: &[u8], width: u32, height: u32, x: u32, y: u32, stride: u32) {
             let window_stride = self.width * 4;
             let frame_stride = stride;
@@ -347,18 +368,12 @@ mod linux {
                 }
             };
 
-            // Copy existing buffer content to preserve pixels outside the update region
-            // If no previous buffer exists, initialize with black (first partial update case)
-            if let Some(ref prev_buffer) = self.buffer {
-                // Note: SlotPool buffers share the same underlying pool, so the previous
-                // buffer's data may still be accessible. However, since we can't directly
-                // access it after it's been attached, we initialize to black on first use.
-                // Future optimization: double-buffering with retained content.
-                let _ = prev_buffer; // Acknowledge we have a previous buffer
+            // Copy retained content to preserve pixels outside the update region
+            // This implements proper double-buffering for partial updates
+            let copy_len = canvas.len().min(self.retained_content.len());
+            if copy_len > 0 {
+                canvas[..copy_len].copy_from_slice(&self.retained_content[..copy_len]);
             }
-            // Initialize canvas to black for pixels not covered by partial update
-            // This ensures no garbage data is displayed
-            canvas.fill(0);
 
             // Blit the partial update into the buffer at (x, y)
             for row in 0..height {
@@ -382,6 +397,11 @@ mod linux {
 
                 if dest_end <= canvas.len() && src_end <= data.len() {
                     canvas[dest_start..dest_end].copy_from_slice(&data[src_start..src_end]);
+                    // Also update retained content for future partial updates
+                    if dest_end <= self.retained_content.len() {
+                        self.retained_content[dest_start..dest_end]
+                            .copy_from_slice(&data[src_start..src_end]);
+                    }
                 }
             }
 
