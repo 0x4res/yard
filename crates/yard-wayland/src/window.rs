@@ -370,20 +370,27 @@ mod linux {
 
             // Copy retained content to preserve pixels outside the update region
             // This implements proper double-buffering for partial updates
+            // TODO: Optimization - only copy affected rows instead of full buffer
+            // to reduce memory bandwidth for small partial updates
             let copy_len = canvas.len().min(self.retained_content.len());
             if copy_len > 0 {
                 canvas[..copy_len].copy_from_slice(&self.retained_content[..copy_len]);
             }
 
             // Blit the partial update into the buffer at (x, y)
+            // Note: frame_stride may include padding, but we only copy width*4 actual pixels
+            let copy_width = (width as usize).saturating_mul(4);
+
             for row in 0..height {
                 let dest_y = y.saturating_add(row);
                 if dest_y >= self.height {
                     break;
                 }
 
+                // Source uses frame_stride for row offset (handles padding)
                 let src_start = (row as usize).saturating_mul(frame_stride as usize);
-                let src_end = src_start.saturating_add(frame_stride as usize);
+                // But we only copy width*4 bytes (actual pixel data, no padding)
+                let src_end = src_start.saturating_add(copy_width);
 
                 if src_end > data.len() {
                     break;
@@ -392,7 +399,6 @@ mod linux {
                 let dest_start = (dest_y as usize)
                     .saturating_mul(window_stride as usize)
                     .saturating_add((x as usize).saturating_mul(4));
-                let copy_width = (width as usize).saturating_mul(4);
                 let dest_end = dest_start.saturating_add(copy_width);
 
                 if dest_end <= canvas.len() && src_end <= data.len() {
@@ -525,6 +531,9 @@ mod linux {
             if width != self.width || height != self.height {
                 self.width = width;
                 self.height = height;
+                // Resize retained content buffer to match new window size
+                let new_size = (width as usize) * (height as usize) * 4;
+                self.retained_content.resize(new_size, 0);
                 self.dirty = true;
                 let _ = self.event_tx.send(WindowEvent::Resized { width, height });
             }
