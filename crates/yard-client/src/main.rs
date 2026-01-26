@@ -15,6 +15,7 @@ use yard_core::Config;
 use yard_protocol::{
     CertificateInfo, ConnectionConfig, DesktopSize, FromNetwork, ToNetwork, spawn_network_thread,
 };
+
 use yard_wayland::WindowConfig;
 
 /// Exit codes for YARD.
@@ -513,6 +514,30 @@ fn run_event_loop(
                             debug!("Toggle fullscreen shortcut received");
                             window.toggle_fullscreen();
                         }
+                    }
+                }
+                WindowEvent::KeyPressed { scancode } => {
+                    // Send key press to remote server
+                    if to_network_tx
+                        .blocking_send(ToNetwork::KeyboardInput {
+                            scancode,
+                            pressed: true,
+                        })
+                        .is_err()
+                    {
+                        error!("Failed to send key press to network thread");
+                    }
+                }
+                WindowEvent::KeyReleased { scancode } => {
+                    // Send key release to remote server
+                    if to_network_tx
+                        .blocking_send(ToNetwork::KeyboardInput {
+                            scancode,
+                            pressed: false,
+                        })
+                        .is_err()
+                    {
+                        error!("Failed to send key release to network thread");
                     }
                 }
             }

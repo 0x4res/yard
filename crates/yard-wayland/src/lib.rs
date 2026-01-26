@@ -7,7 +7,9 @@
 
 #![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
 
+pub mod input;
 pub mod window;
 
+pub use input::wayland_to_rdp_scancode;
 pub use window::{KeyboardShortcut, WaylandWindow, WindowConfig, WindowEvent};
 pub use yard_core::prelude::*;

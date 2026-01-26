@@ -210,6 +210,18 @@ pub enum ToNetwork {
     Disconnect,
     /// Response to a certificate verification request.
     CertificateDecision(bool),
+    /// Keyboard input event to send to the remote server.
+    ///
+    /// The scancode is an RDP scancode (not a keysym or evdev keycode).
+    /// Standard keys use scancodes 0x00-0x7F.
+    /// Extended keys (arrows, Home, End, etc.) use 0xE0xx format where
+    /// the high byte is 0xE0 and the low byte is the scancode.
+    KeyboardInput {
+        /// RDP scancode for the key.
+        scancode: u16,
+        /// True for key press, false for key release.
+        pressed: bool,
+    },
 }
 
 /// Desktop size information from the RDP server.

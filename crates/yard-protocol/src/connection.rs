@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ironrdp::connector::{self, ClientConnector, Credentials};
+use ironrdp::input::{Database as InputDatabase, Operation, Scancode};
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::geometry::Rectangle as _;
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
@@ -83,6 +84,11 @@ async fn network_loop(
             ToNetwork::CertificateDecision(_) => {
                 // Certificate decisions should be received during handle_connect
                 warn!("Received unexpected CertificateDecision outside of connection");
+            }
+            ToNetwork::KeyboardInput { .. } => {
+                // Keyboard input should be received during active session
+                // Ignore if received outside of session (no connection established)
+                warn!("Received KeyboardInput outside of active session");
             }
         }
     }
@@ -222,7 +228,15 @@ async fn handle_connect(
         ironrdp::session::image::DecodedImage::new(PixelFormat::BgrA32, img_width, img_height);
 
     // Session loop
-    if let Err(e) = session_loop(&mut tls_framed, &mut active_stage, &mut image, tx).await {
+    if let Err(e) = session_loop(
+        &mut tls_framed,
+        &mut active_stage,
+        &mut image,
+        to_network_rx,
+        tx,
+    )
+    .await
+    {
         error!("Session error: {e}");
         let _ = tx
             .send(FromNetwork::Error(ConnectionError::Protocol(e.to_string())))
@@ -232,11 +246,12 @@ async fn handle_connect(
     let _ = tx.send(FromNetwork::Disconnected).await;
 }
 
-/// Session loop that processes RDP frames.
+/// Session loop that processes RDP frames and handles user input.
 async fn session_loop<S>(
     framed: &mut Framed<TokioStream<S>>,
     active_stage: &mut ActiveStage,
     image: &mut ironrdp::session::image::DecodedImage,
+    to_network_rx: &mut mpsc::Receiver<ToNetwork>,
     tx: &mpsc::Sender<FromNetwork>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -244,68 +259,149 @@ where
 {
     use yard_video::DecodedFrame;
 
+    // Input database for tracking keyboard/mouse state and generating FastPath events
+    let mut input_database = InputDatabase::new();
+
     loop {
-        // Read next PDU from server
-        let (action, frame) = framed.read_pdu().await?;
+        // Use select to handle both incoming PDUs and outgoing input events
+        tokio::select! {
+            // Read next PDU from server (biased to prioritize server data)
+            biased;
 
-        // Process the frame
-        let outputs = active_stage.process(image, action, &frame)?;
+            pdu_result = framed.read_pdu() => {
+                let (action, frame) = pdu_result?;
 
-        for output in outputs {
-            match output {
-                ActiveStageOutput::ResponseFrame(response) => {
-                    // Send response back to server
-                    framed.write_all(&response).await?;
-                }
-                ActiveStageOutput::GraphicsUpdate(rect) => {
-                    // Extract the updated region and send to main thread
-                    let x = rect.left;
-                    let y = rect.top;
-                    let width = rect.width();
-                    let height = rect.height();
+                // Process the frame
+                let outputs = active_stage.process(image, action, &frame)?;
 
-                    // Validate rect bounds against image dimensions
-                    let img_width = image.width();
-                    let img_height = image.height();
-                    if rect.right >= img_width || rect.bottom >= img_height {
-                        warn!(
-                            "Graphics update rect ({},{})x({},{}) exceeds image bounds {}x{}",
-                            x, y, rect.right, rect.bottom, img_width, img_height
-                        );
-                        continue;
+                for output in outputs {
+                    match output {
+                        ActiveStageOutput::ResponseFrame(response) => {
+                            // Send response back to server
+                            framed.write_all(&response).await?;
+                        }
+                        ActiveStageOutput::GraphicsUpdate(rect) => {
+                            // Extract the updated region and send to main thread
+                            let x = rect.left;
+                            let y = rect.top;
+                            let width = rect.width();
+                            let height = rect.height();
+
+                            // Validate rect bounds against image dimensions
+                            let img_width = image.width();
+                            let img_height = image.height();
+                            if rect.right >= img_width || rect.bottom >= img_height {
+                                warn!(
+                                    "Graphics update rect ({},{})x({},{}) exceeds image bounds {}x{}",
+                                    x, y, rect.right, rect.bottom, img_width, img_height
+                                );
+                                continue;
+                            }
+
+                            // Get the pixel data for the updated region
+                            // The image data is in BgrA32 format (4 bytes per pixel, BGRA order)
+                            let data = image.data_for_rect(&rect).to_vec();
+
+                            // Create frame with position for partial update support
+                            let frame = DecodedFrame::with_position(
+                                data,
+                                u32::from(width),
+                                u32::from(height),
+                                u32::from(x),
+                                u32::from(y),
+                            );
+
+                            if tx.send(FromNetwork::Frame(frame)).await.is_err() {
+                                return Ok(()); // Main thread disconnected
+                            }
+                        }
+                        ActiveStageOutput::Terminate(reason) => {
+                            info!("Session terminated: {reason}");
+                            return Ok(());
+                        }
+                        ActiveStageOutput::DeactivateAll(_) => {
+                            // Server is requesting reactivation - handle reconnection
+                            warn!("Server requested deactivation - reconnection not implemented");
+                            return Ok(());
+                        }
+                        ActiveStageOutput::PointerDefault
+                        | ActiveStageOutput::PointerHidden
+                        | ActiveStageOutput::PointerPosition { .. }
+                        | ActiveStageOutput::PointerBitmap(_) => {
+                            // Pointer updates - TODO: implement cursor handling
+                        }
                     }
+                }
+            }
 
-                    // Get the pixel data for the updated region
-                    // The image data is in BgrA32 format (4 bytes per pixel, BGRA order)
-                    let data = image.data_for_rect(&rect).to_vec();
+            // Handle messages from main thread (keyboard input, disconnect)
+            msg = to_network_rx.recv() => {
+                match msg {
+                    Some(ToNetwork::KeyboardInput { scancode, pressed }) => {
+                        // Convert our scancode format to IronRDP Scancode
+                        // Our format: extended keys have 0xE0 in high byte
+                        let extended = (scancode & 0xE000) == 0xE000;
+                        let code = (scancode & 0xFF) as u8;
+                        let sc = Scancode::from_u8(extended, code);
 
-                    // Create frame with position for partial update support
-                    let frame = DecodedFrame::with_position(
-                        data,
-                        u32::from(width),
-                        u32::from(height),
-                        u32::from(x),
-                        u32::from(y),
-                    );
+                        // Create the appropriate operation
+                        let operation = if pressed {
+                            Operation::KeyPressed(sc)
+                        } else {
+                            Operation::KeyReleased(sc)
+                        };
 
-                    if tx.send(FromNetwork::Frame(frame)).await.is_err() {
-                        return Ok(()); // Main thread disconnected
+                        // Apply to input database and get FastPath events to send
+                        let events = input_database.apply([operation]);
+
+                        if !events.is_empty() {
+                            // Process the input events through ActiveStage
+                            // This encodes them and may produce response frames
+                            // Note: We log errors instead of propagating to avoid disconnecting
+                            // the session due to a single key input error
+                            match active_stage.process_fastpath_input(image, &events) {
+                                Ok(outputs) => {
+                                    // Send any response frames to the server
+                                    for output in outputs {
+                                        if let ActiveStageOutput::ResponseFrame(response) = output {
+                                            framed.write_all(&response).await?;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to process keyboard input: {e}");
+                                }
+                            }
+                        }
                     }
-                }
-                ActiveStageOutput::Terminate(reason) => {
-                    info!("Session terminated: {reason}");
-                    return Ok(());
-                }
-                ActiveStageOutput::DeactivateAll(_) => {
-                    // Server is requesting reactivation - handle reconnection
-                    warn!("Server requested deactivation - reconnection not implemented");
-                    return Ok(());
-                }
-                ActiveStageOutput::PointerDefault
-                | ActiveStageOutput::PointerHidden
-                | ActiveStageOutput::PointerPosition { .. }
-                | ActiveStageOutput::PointerBitmap(_) => {
-                    // Pointer updates - TODO: implement cursor handling
+                    Some(ToNetwork::Disconnect) => {
+                        info!("Disconnect requested");
+                        // Release all pressed keys before disconnecting to prevent stuck keys
+                        let release_events = input_database.release_all();
+                        if !release_events.is_empty() {
+                            if let Ok(outputs) = active_stage.process_fastpath_input(image, &release_events) {
+                                for output in outputs {
+                                    if let ActiveStageOutput::ResponseFrame(response) = output {
+                                        let _ = framed.write_all(&response).await;
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                    Some(ToNetwork::Connect(_)) => {
+                        // Ignore - already connected
+                        warn!("Received Connect message during active session");
+                    }
+                    Some(ToNetwork::CertificateDecision(_)) => {
+                        // Ignore - certificate already verified
+                        warn!("Received CertificateDecision during active session");
+                    }
+                    None => {
+                        // Channel closed - main thread disconnected
+                        info!("Main thread disconnected");
+                        return Ok(());
+                    }
                 }
             }
         }

@@ -48,6 +48,12 @@ mod linux {
         FullscreenChanged { is_fullscreen: bool },
         /// A keyboard shortcut was pressed.
         KeyboardShortcut(KeyboardShortcut),
+        /// A key was pressed.
+        /// The scancode is an RDP scancode (translated from evdev).
+        KeyPressed { scancode: u16 },
+        /// A key was released.
+        /// The scancode is an RDP scancode (translated from evdev).
+        KeyReleased { scancode: u16 },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -713,12 +719,22 @@ mod linux {
             _serial: u32,
             event: KeyEvent,
         ) {
-            // Check for Ctrl+Alt+Enter (toggle fullscreen shortcut)
+            // Check for client shortcuts BEFORE forwarding to remote
+            // Ctrl+Alt+Enter toggles fullscreen (Story 2.5)
             if self.modifiers.ctrl && self.modifiers.alt && event.keysym == Keysym::Return {
                 tracing::debug!("Ctrl+Alt+Enter detected - toggling fullscreen");
                 let _ = self.event_tx.send(WindowEvent::KeyboardShortcut(
                     KeyboardShortcut::ToggleFullscreen,
                 ));
+                return; // Don't forward client shortcuts to remote
+            }
+
+            // Translate evdev keycode to RDP scancode and forward
+            if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw) {
+                tracing::trace!("Key pressed: evdev {} -> RDP 0x{:04X}", event.raw, scancode);
+                let _ = self.event_tx.send(WindowEvent::KeyPressed { scancode });
+            } else {
+                tracing::trace!("Unknown key pressed: evdev {}", event.raw);
             }
         }
 
@@ -728,9 +744,17 @@ mod linux {
             _qh: &QueueHandle<Self>,
             _keyboard: &WlKeyboard,
             _serial: u32,
-            _event: KeyEvent,
+            event: KeyEvent,
         ) {
-            // Key release handling (not needed for shortcuts)
+            // Translate evdev keycode to RDP scancode and forward
+            if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw) {
+                tracing::trace!(
+                    "Key released: evdev {} -> RDP 0x{:04X}",
+                    event.raw,
+                    scancode
+                );
+                let _ = self.event_tx.send(WindowEvent::KeyReleased { scancode });
+            }
         }
 
         fn update_modifiers(
@@ -770,6 +794,8 @@ mod stub {
         RedrawRequested,
         FullscreenChanged { is_fullscreen: bool },
         KeyboardShortcut(KeyboardShortcut),
+        KeyPressed { scancode: u16 },
+        KeyReleased { scancode: u16 },
     }
 
     /// Keyboard shortcuts that the window can detect.
