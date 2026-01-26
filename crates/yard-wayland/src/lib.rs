@@ -9,5 +9,5 @@
 
 pub mod window;
 
-pub use window::{WindowConfig, WindowEvent, WaylandWindow};
+pub use window::{KeyboardShortcut, WaylandWindow, WindowConfig, WindowEvent};
 pub use yard_core::prelude::*;
