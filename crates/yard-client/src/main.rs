@@ -16,6 +16,9 @@ use yard_protocol::{
     CertificateInfo, ConnectionConfig, DesktopSize, FromNetwork, ToNetwork, spawn_network_thread,
 };
 
+#[cfg(target_os = "linux")]
+use yard_protocol::MouseButton;
+
 use yard_wayland::WindowConfig;
 
 /// Exit codes for YARD.
@@ -394,13 +397,21 @@ fn run_event_loop(
         }
     };
 
+    // Set remote resolution for coordinate mapping
+    window.set_remote_resolution(
+        u32::from(desktop_size.width),
+        u32::from(desktop_size.height),
+    );
+
     // Draw initial placeholder
     let (r, g, b) = PLACEHOLDER_COLOR;
     window.draw_solid(r, g, b);
     info!(
-        "Window created: {}x{}",
+        "Window created: {}x{} (remote: {}x{})",
         window.dimensions().0,
-        window.dimensions().1
+        window.dimensions().1,
+        desktop_size.width,
+        desktop_size.height
     );
 
     // Track frame statistics
@@ -540,9 +551,138 @@ fn run_event_loop(
                         error!("Failed to send key release to network thread");
                     }
                 }
+                WindowEvent::MouseMove { x, y } => {
+                    // Map window coordinates to remote desktop coordinates
+                    let (remote_x, remote_y) = map_to_remote_coords(
+                        x,
+                        y,
+                        window.dimensions(),
+                        window.remote_resolution(),
+                    );
+                    if to_network_tx
+                        .blocking_send(ToNetwork::MouseMove {
+                            x: remote_x,
+                            y: remote_y,
+                        })
+                        .is_err()
+                    {
+                        error!("Failed to send mouse move to network thread");
+                    }
+                }
+                WindowEvent::MouseButton {
+                    button,
+                    pressed,
+                    x,
+                    y,
+                } => {
+                    // Map button code to MouseButton enum
+                    // Linux evdev button codes: BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112
+                    let rdp_button = match button {
+                        0x110 => Some(MouseButton::Left),
+                        0x111 => Some(MouseButton::Right),
+                        0x112 => Some(MouseButton::Middle),
+                        _ => {
+                            debug!("Unknown mouse button: 0x{:x}", button);
+                            None
+                        }
+                    };
+                    if let Some(btn) = rdp_button {
+                        let (remote_x, remote_y) = map_to_remote_coords(
+                            x,
+                            y,
+                            window.dimensions(),
+                            window.remote_resolution(),
+                        );
+                        if to_network_tx
+                            .blocking_send(ToNetwork::MouseButton {
+                                button: btn,
+                                pressed,
+                                x: remote_x,
+                                y: remote_y,
+                            })
+                            .is_err()
+                        {
+                            error!("Failed to send mouse button to network thread");
+                        }
+                    }
+                }
+                WindowEvent::MouseAxis {
+                    horizontal,
+                    value,
+                    x,
+                    y,
+                } => {
+                    // Convert scroll value to RDP wheel delta
+                    // RDP uses 120 units per wheel notch (Windows standard WHEEL_DELTA)
+                    //
+                    // Wayland scroll values:
+                    // - Discrete (mouse wheel): small integers like -1, 0, +1 per notch
+                    // - Continuous (touchpad): larger values representing pixel distance
+                    //
+                    // Threshold of 10.0 distinguishes these cases:
+                    // - Mouse wheels rarely exceed ±3 per event
+                    // - Touchpad scrolls are typically 15-100+ pixels per event
+                    let delta = if value.abs() < 10.0 {
+                        // Discrete scroll: multiply by RDP's WHEEL_DELTA (120)
+                        (value * 120.0) as i16
+                    } else {
+                        // Continuous scroll: scale down for usable scroll speed
+                        // Factor of 12 gives roughly 1 notch per 10 pixels
+                        (value * 12.0) as i16
+                    };
+
+                    // Only send if there's actual scroll
+                    if delta != 0 {
+                        let (remote_x, remote_y) = map_to_remote_coords(
+                            x,
+                            y,
+                            window.dimensions(),
+                            window.remote_resolution(),
+                        );
+                        if to_network_tx
+                            .blocking_send(ToNetwork::MouseWheel {
+                                horizontal,
+                                delta,
+                                x: remote_x,
+                                y: remote_y,
+                            })
+                            .is_err()
+                        {
+                            error!("Failed to send mouse wheel to network thread");
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+/// Maps window-local coordinates to remote desktop coordinates.
+///
+/// Scales coordinates from window space to remote desktop space, handling
+/// aspect ratio differences between local window and remote desktop.
+#[cfg(target_os = "linux")]
+fn map_to_remote_coords(
+    local_x: f64,
+    local_y: f64,
+    window_size: (u32, u32),
+    remote_size: (u32, u32),
+) -> (u16, u16) {
+    let (window_w, window_h) = window_size;
+    let (remote_w, remote_h) = remote_size;
+
+    // Avoid division by zero
+    if window_w == 0 || window_h == 0 {
+        return (0, 0);
+    }
+
+    // Scale and clamp coordinates
+    let x = (local_x / window_w as f64 * remote_w as f64)
+        .clamp(0.0, (remote_w.saturating_sub(1)) as f64) as u16;
+    let y = (local_y / window_h as f64 * remote_h as f64)
+        .clamp(0.0, (remote_h.saturating_sub(1)) as f64) as u16;
+
+    (x, y)
 }
 
 /// Runs headless event loop (no window) - used as fallback.
@@ -677,5 +817,75 @@ mod tests {
         assert_eq!(truncate_string("héllo", 4), "h...");
         assert_eq!(truncate_string("日本語テスト", 5), "日本...");
         assert_eq!(truncate_string("émoji🎉test", 6), "émo...");
+    }
+
+    #[cfg(target_os = "linux")]
+    mod coordinate_tests {
+        use super::*;
+
+        #[test]
+        fn test_map_to_remote_coords_same_size() {
+            // Same window and remote size - coordinates should be unchanged
+            let (x, y) = map_to_remote_coords(100.0, 200.0, (1920, 1080), (1920, 1080));
+            assert_eq!(x, 100);
+            assert_eq!(y, 200);
+        }
+
+        #[test]
+        fn test_map_to_remote_coords_scaled() {
+            // Window is half the remote size - coordinates should double
+            let (x, y) = map_to_remote_coords(100.0, 100.0, (960, 540), (1920, 1080));
+            assert_eq!(x, 200);
+            assert_eq!(y, 200);
+        }
+
+        #[test]
+        fn test_map_to_remote_coords_origin() {
+            let (x, y) = map_to_remote_coords(0.0, 0.0, (1920, 1080), (1920, 1080));
+            assert_eq!(x, 0);
+            assert_eq!(y, 0);
+        }
+
+        #[test]
+        fn test_map_to_remote_coords_clamped_max() {
+            // Coordinates at the edge should be clamped to remote_size - 1
+            let (x, y) = map_to_remote_coords(1920.0, 1080.0, (1920, 1080), (1920, 1080));
+            assert_eq!(x, 1919);
+            assert_eq!(y, 1079);
+        }
+
+        #[test]
+        fn test_map_to_remote_coords_negative() {
+            // Negative coordinates should be clamped to 0
+            let (x, y) = map_to_remote_coords(-10.0, -20.0, (1920, 1080), (1920, 1080));
+            assert_eq!(x, 0);
+            assert_eq!(y, 0);
+        }
+
+        #[test]
+        fn test_map_to_remote_coords_zero_window() {
+            // Zero window size should return (0, 0) to avoid division by zero
+            let (x, y) = map_to_remote_coords(100.0, 200.0, (0, 0), (1920, 1080));
+            assert_eq!(x, 0);
+            assert_eq!(y, 0);
+        }
+
+        #[test]
+        fn test_map_to_remote_coords_different_aspect_ratio() {
+            // 4:3 window to 16:9 remote - coordinates scale independently
+            let (x, y) = map_to_remote_coords(400.0, 300.0, (800, 600), (1920, 1080));
+            // x: 400/800 * 1920 = 960
+            // y: 300/600 * 1080 = 540
+            assert_eq!(x, 960);
+            assert_eq!(y, 540);
+        }
+
+        #[test]
+        fn test_map_to_remote_coords_subpixel() {
+            // Subpixel coordinates should be properly scaled and truncated
+            let (x, y) = map_to_remote_coords(0.5, 0.5, (100, 100), (1000, 1000));
+            assert_eq!(x, 5);
+            assert_eq!(y, 5);
+        }
     }
 }

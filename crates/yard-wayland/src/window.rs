@@ -16,12 +16,14 @@ mod linux {
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
     use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
     use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard;
+    use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
     use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
     use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
     use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
     use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
     use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
     use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers};
+    use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
     use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
     use smithay_client_toolkit::shell::WaylandSurface;
     use smithay_client_toolkit::shell::xdg::XdgShell;
@@ -31,8 +33,9 @@ mod linux {
     use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
     use smithay_client_toolkit::shm::{Shm, ShmHandler};
     use smithay_client_toolkit::{
-        delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
-        delegate_shm, delegate_xdg_shell, delegate_xdg_window, registry_handlers,
+        delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer,
+        delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
+        registry_handlers,
     };
 
     /// Messages sent from the Wayland window to the main application.
@@ -54,6 +57,15 @@ mod linux {
         /// A key was released.
         /// The scancode is an RDP scancode (translated from evdev).
         KeyReleased { scancode: u16 },
+        /// Mouse pointer moved.
+        /// Coordinates are in surface-local space (f64 for subpixel precision).
+        MouseMove { x: f64, y: f64 },
+        /// Mouse button pressed or released.
+        /// Button codes are Linux evdev button codes (BTN_LEFT=0x110, etc.).
+        MouseButton { button: u32, pressed: bool, x: f64, y: f64 },
+        /// Mouse wheel/scroll event.
+        /// Value is scroll amount (positive = up/left, negative = down/right).
+        MouseAxis { horizontal: bool, value: f64, x: f64, y: f64 },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -140,6 +152,17 @@ mod linux {
         modifiers: Modifiers,
         /// Reference to the keyboard object (if available).
         keyboard: Option<WlKeyboard>,
+        /// Reference to the pointer object (if available).
+        pointer: Option<WlPointer>,
+        /// Current pointer position (surface-local coordinates).
+        pointer_position: (f64, f64),
+        /// Currently pressed mouse buttons (evdev codes).
+        /// Used to release buttons when pointer leaves surface.
+        pressed_buttons: Vec<u32>,
+        /// Remote desktop width (for coordinate mapping).
+        remote_width: u32,
+        /// Remote desktop height (for coordinate mapping).
+        remote_height: u32,
     }
 
     impl WaylandWindow {
@@ -216,6 +239,11 @@ mod linux {
                 is_fullscreen: false, // Will be updated when compositor confirms
                 modifiers: Modifiers::default(),
                 keyboard: None,
+                pointer: None,
+                pointer_position: (0.0, 0.0),
+                pressed_buttons: Vec::new(),
+                remote_width: config.width,  // Default to window size, updated by set_remote_resolution
+                remote_height: config.height,
             };
 
             Ok((event_loop, state, event_rx))
@@ -258,6 +286,30 @@ mod linux {
             } else {
                 self.set_fullscreen(None);
             }
+        }
+
+        /// Sets the remote desktop resolution for coordinate mapping.
+        ///
+        /// Mouse coordinates are mapped from window space to remote desktop space.
+        /// Call this when the connection is established with the server's desktop size.
+        pub fn set_remote_resolution(&mut self, width: u32, height: u32) {
+            self.remote_width = width;
+            self.remote_height = height;
+            tracing::debug!(
+                "Remote resolution set to {}x{} (window: {}x{})",
+                width,
+                height,
+                self.width,
+                self.height
+            );
+        }
+
+        /// Returns the remote desktop resolution (width, height).
+        ///
+        /// Used by the main thread to map window-local mouse coordinates
+        /// to remote desktop coordinates.
+        pub fn remote_resolution(&self) -> (u32, u32) {
+            (self.remote_width, self.remote_height)
         }
 
         /// Draws a solid color frame (placeholder until real frames arrive).
@@ -663,6 +715,11 @@ mod linux {
                 let keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
                 self.keyboard = keyboard.map(|k| k.wl_keyboard().clone());
             }
+            if capability == Capability::Pointer && self.pointer.is_none() {
+                tracing::debug!("Pointer capability available, requesting pointer");
+                let pointer = self.seat_state.get_pointer(qh, &seat).ok();
+                self.pointer = pointer.map(|p| p.wl_pointer().clone());
+            }
         }
 
         fn remove_capability(
@@ -675,6 +732,10 @@ mod linux {
             if capability == Capability::Keyboard {
                 tracing::debug!("Keyboard capability removed");
                 self.keyboard = None;
+            }
+            if capability == Capability::Pointer {
+                tracing::debug!("Pointer capability removed");
+                self.pointer = None;
             }
         }
 
@@ -770,10 +831,130 @@ mod linux {
         }
     }
 
+    impl PointerHandler for WaylandWindow {
+        fn pointer_frame(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _pointer: &WlPointer,
+            events: &[PointerEvent],
+        ) {
+            // Process all pointer events in this frame
+            for event in events {
+                // Update stored position from event
+                self.pointer_position = event.position;
+
+                match event.kind {
+                    PointerEventKind::Enter { .. } => {
+                        tracing::trace!(
+                            "Pointer entered at ({:.1}, {:.1})",
+                            event.position.0,
+                            event.position.1
+                        );
+                    }
+                    PointerEventKind::Leave { .. } => {
+                        tracing::trace!("Pointer left surface");
+                        // Release any pressed buttons to prevent stuck buttons on remote
+                        let (x, y) = self.pointer_position;
+                        for button in self.pressed_buttons.drain(..) {
+                            tracing::trace!(
+                                "Releasing button {} due to pointer leave",
+                                button
+                            );
+                            let _ = self.event_tx.send(WindowEvent::MouseButton {
+                                button,
+                                pressed: false,
+                                x,
+                                y,
+                            });
+                        }
+                    }
+                    PointerEventKind::Motion { .. } => {
+                        let (x, y) = event.position;
+                        let _ = self.event_tx.send(WindowEvent::MouseMove { x, y });
+                    }
+                    PointerEventKind::Press { button, .. } => {
+                        let (x, y) = event.position;
+                        tracing::trace!("Mouse button {} pressed at ({:.1}, {:.1})", button, x, y);
+                        // Track pressed button for release on Leave
+                        if !self.pressed_buttons.contains(&button) {
+                            self.pressed_buttons.push(button);
+                        }
+                        let _ = self.event_tx.send(WindowEvent::MouseButton {
+                            button,
+                            pressed: true,
+                            x,
+                            y,
+                        });
+                    }
+                    PointerEventKind::Release { button, .. } => {
+                        let (x, y) = event.position;
+                        tracing::trace!(
+                            "Mouse button {} released at ({:.1}, {:.1})",
+                            button,
+                            x,
+                            y
+                        );
+                        // Remove from tracked pressed buttons
+                        self.pressed_buttons.retain(|&b| b != button);
+                        let _ = self.event_tx.send(WindowEvent::MouseButton {
+                            button,
+                            pressed: false,
+                            x,
+                            y,
+                        });
+                    }
+                    PointerEventKind::Axis {
+                        horizontal,
+                        vertical,
+                        ..
+                    } => {
+                        let (x, y) = event.position;
+                        // Handle vertical scroll (most common)
+                        if let Some(value) = vertical.discrete {
+                            // Discrete scroll (wheel notches)
+                            let _ = self.event_tx.send(WindowEvent::MouseAxis {
+                                horizontal: false,
+                                value: value as f64,
+                                x,
+                                y,
+                            });
+                        } else if vertical.absolute != 0.0 {
+                            // Continuous scroll (touchpad)
+                            let _ = self.event_tx.send(WindowEvent::MouseAxis {
+                                horizontal: false,
+                                value: vertical.absolute,
+                                x,
+                                y,
+                            });
+                        }
+                        // Handle horizontal scroll
+                        if let Some(value) = horizontal.discrete {
+                            let _ = self.event_tx.send(WindowEvent::MouseAxis {
+                                horizontal: true,
+                                value: value as f64,
+                                x,
+                                y,
+                            });
+                        } else if horizontal.absolute != 0.0 {
+                            let _ = self.event_tx.send(WindowEvent::MouseAxis {
+                                horizontal: true,
+                                value: horizontal.absolute,
+                                x,
+                                y,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     delegate_compositor!(WaylandWindow);
     delegate_output!(WaylandWindow);
     delegate_seat!(WaylandWindow);
     delegate_keyboard!(WaylandWindow);
+    delegate_pointer!(WaylandWindow);
     delegate_shm!(WaylandWindow);
     delegate_xdg_shell!(WaylandWindow);
     delegate_xdg_window!(WaylandWindow);
@@ -796,6 +977,9 @@ mod stub {
         KeyboardShortcut(KeyboardShortcut),
         KeyPressed { scancode: u16 },
         KeyReleased { scancode: u16 },
+        MouseMove { x: f64, y: f64 },
+        MouseButton { button: u32, pressed: bool, x: f64, y: f64 },
+        MouseAxis { horizontal: bool, value: f64, x: f64, y: f64 },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -880,6 +1064,12 @@ mod stub {
         pub fn unset_fullscreen(&self) {}
 
         pub fn toggle_fullscreen(&self) {}
+
+        pub fn set_remote_resolution(&mut self, _width: u32, _height: u32) {}
+
+        pub fn remote_resolution(&self) -> (u32, u32) {
+            (0, 0)
+        }
 
         pub fn draw_solid(&mut self, _r: u8, _g: u8, _b: u8) {}
 

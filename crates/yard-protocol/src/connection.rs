@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ironrdp::connector::{self, ClientConnector, Credentials};
-use ironrdp::input::{Database as InputDatabase, Operation, Scancode};
+use ironrdp::input::{
+    Database as InputDatabase, MouseButton as IronMouseButton, MousePosition, Operation, Scancode,
+    WheelRotations,
+};
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::geometry::Rectangle as _;
 use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
@@ -25,7 +28,8 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 use crate::messages::{
-    CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, ToNetwork,
+    CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, MouseButton,
+    ToNetwork,
 };
 
 /// Default connection timeout in seconds.
@@ -89,6 +93,13 @@ async fn network_loop(
                 // Keyboard input should be received during active session
                 // Ignore if received outside of session (no connection established)
                 warn!("Received KeyboardInput outside of active session");
+            }
+            ToNetwork::MouseMove { .. }
+            | ToNetwork::MouseButton { .. }
+            | ToNetwork::MouseWheel { .. } => {
+                // Mouse input should be received during active session
+                // Ignore if received outside of session (no connection established)
+                warn!("Received mouse input outside of active session");
             }
         }
     }
@@ -374,16 +385,106 @@ where
                             }
                         }
                     }
+                    Some(ToNetwork::MouseMove { x, y }) => {
+                        // Create mouse move operation
+                        let operation = Operation::MouseMove(MousePosition { x, y });
+
+                        // Apply to input database and send
+                        let events = input_database.apply([operation]);
+
+                        if !events.is_empty() {
+                            match active_stage.process_fastpath_input(image, &events) {
+                                Ok(outputs) => {
+                                    for output in outputs {
+                                        if let ActiveStageOutput::ResponseFrame(response) = output {
+                                            framed.write_all(&response).await?;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to process mouse move: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Some(ToNetwork::MouseButton { button, pressed, x, y }) => {
+                        // Map our button enum to IronRDP's
+                        let iron_button = match button {
+                            MouseButton::Left => IronMouseButton::Left,
+                            MouseButton::Right => IronMouseButton::Right,
+                            MouseButton::Middle => IronMouseButton::Middle,
+                        };
+
+                        // Create mouse button operation with position
+                        let operation = if pressed {
+                            Operation::MouseButtonPressed(iron_button)
+                        } else {
+                            Operation::MouseButtonReleased(iron_button)
+                        };
+
+                        // Also update position to ensure click is at correct location
+                        let pos_operation = Operation::MouseMove(MousePosition { x, y });
+
+                        // Apply both operations
+                        let events = input_database.apply([pos_operation, operation]);
+
+                        if !events.is_empty() {
+                            match active_stage.process_fastpath_input(image, &events) {
+                                Ok(outputs) => {
+                                    for output in outputs {
+                                        if let ActiveStageOutput::ResponseFrame(response) = output {
+                                            framed.write_all(&response).await?;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to process mouse button: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Some(ToNetwork::MouseWheel { horizontal, delta, x, y }) => {
+                        // Update position first
+                        let pos_operation = Operation::MouseMove(MousePosition { x, y });
+
+                        // Create wheel operation
+                        // IronRDP uses WheelRotations which takes rotation units
+                        let wheel_operation = Operation::WheelRotations(WheelRotations {
+                            is_vertical: !horizontal,
+                            rotation_units: delta,
+                        });
+
+                        // Apply both operations
+                        let events = input_database.apply([pos_operation, wheel_operation]);
+
+                        if !events.is_empty() {
+                            match active_stage.process_fastpath_input(image, &events) {
+                                Ok(outputs) => {
+                                    for output in outputs {
+                                        if let ActiveStageOutput::ResponseFrame(response) = output {
+                                            framed.write_all(&response).await?;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to process mouse wheel: {e}");
+                                }
+                            }
+                        }
+                    }
                     Some(ToNetwork::Disconnect) => {
                         info!("Disconnect requested");
-                        // Release all pressed keys before disconnecting to prevent stuck keys
+                        // Release all pressed keys and mouse buttons before disconnecting
+                        // to prevent stuck inputs on the remote server.
+                        // InputDatabase::release_all() handles both keyboard and mouse state.
                         let release_events = input_database.release_all();
-                        if !release_events.is_empty() {
-                            if let Ok(outputs) = active_stage.process_fastpath_input(image, &release_events) {
-                                for output in outputs {
-                                    if let ActiveStageOutput::ResponseFrame(response) = output {
-                                        let _ = framed.write_all(&response).await;
-                                    }
+                        if !release_events.is_empty()
+                            && let Ok(outputs) =
+                                active_stage.process_fastpath_input(image, &release_events)
+                        {
+                            for output in outputs {
+                                if let ActiveStageOutput::ResponseFrame(response) = output {
+                                    let _ = framed.write_all(&response).await;
                                 }
                             }
                         }

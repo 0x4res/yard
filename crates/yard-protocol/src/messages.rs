@@ -100,10 +100,10 @@ impl ConnectionConfig {
 
         // Check for UPN-style: user@domain.com
         // Only treat as UPN if domain part contains a dot (looks like FQDN)
-        if let Some((user, domain)) = input.rsplit_once('@') {
-            if domain.contains('.') {
-                return (user.to_string(), Some(domain.to_string()));
-            }
+        if let Some((user, domain)) = input.rsplit_once('@')
+            && domain.contains('.')
+        {
+            return (user.to_string(), Some(domain.to_string()));
         }
 
         // Plain username, no domain
@@ -201,6 +201,17 @@ impl CertificateInfo {
     }
 }
 
+/// Mouse button types for RDP input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    /// Left mouse button (primary).
+    Left,
+    /// Right mouse button (secondary/context).
+    Right,
+    /// Middle mouse button (wheel click).
+    Middle,
+}
+
 /// Messages sent from the main thread to the network thread.
 #[derive(Debug)]
 pub enum ToNetwork {
@@ -221,6 +232,40 @@ pub enum ToNetwork {
         scancode: u16,
         /// True for key press, false for key release.
         pressed: bool,
+    },
+    /// Mouse movement event to send to the remote server.
+    ///
+    /// Coordinates are absolute positions in the remote desktop coordinate space.
+    MouseMove {
+        /// X position in remote desktop pixels.
+        x: u16,
+        /// Y position in remote desktop pixels.
+        y: u16,
+    },
+    /// Mouse button event to send to the remote server.
+    MouseButton {
+        /// Which button was pressed/released.
+        button: MouseButton,
+        /// True for button press, false for button release.
+        pressed: bool,
+        /// X position at time of click (for click accuracy).
+        x: u16,
+        /// Y position at time of click (for click accuracy).
+        y: u16,
+    },
+    /// Mouse wheel scroll event to send to the remote server.
+    ///
+    /// Delta is in wheel rotation units (positive = up/left, negative = down/right).
+    MouseWheel {
+        /// True for horizontal scroll, false for vertical scroll.
+        horizontal: bool,
+        /// Scroll delta (positive = up/left, negative = down/right).
+        /// Standard wheel delta is 120 units per notch.
+        delta: i16,
+        /// X position at time of scroll.
+        x: u16,
+        /// Y position at time of scroll.
+        y: u16,
     },
 }
 
@@ -529,6 +574,61 @@ mod tests {
         let config = ConnectionConfig::from_username("server", 3389, "admin");
         assert_eq!(config.username, Some("admin".to_string()));
         assert!(config.domain.is_none());
+    }
+
+    #[test]
+    fn test_mouse_button_enum() {
+        // Verify MouseButton variants exist and are Debug-able
+        let left = MouseButton::Left;
+        let right = MouseButton::Right;
+        let middle = MouseButton::Middle;
+
+        assert_eq!(format!("{:?}", left), "Left");
+        assert_eq!(format!("{:?}", right), "Right");
+        assert_eq!(format!("{:?}", middle), "Middle");
+    }
+
+    #[test]
+    fn test_mouse_button_equality() {
+        assert_eq!(MouseButton::Left, MouseButton::Left);
+        assert_ne!(MouseButton::Left, MouseButton::Right);
+        assert_ne!(MouseButton::Right, MouseButton::Middle);
+    }
+
+    #[test]
+    fn test_to_network_mouse_move_debug() {
+        let msg = ToNetwork::MouseMove { x: 100, y: 200 };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("MouseMove"));
+        assert!(debug.contains("100"));
+        assert!(debug.contains("200"));
+    }
+
+    #[test]
+    fn test_to_network_mouse_button_debug() {
+        let msg = ToNetwork::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+            x: 50,
+            y: 75,
+        };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("MouseButton"));
+        assert!(debug.contains("Left"));
+        assert!(debug.contains("true"));
+    }
+
+    #[test]
+    fn test_to_network_mouse_wheel_debug() {
+        let msg = ToNetwork::MouseWheel {
+            horizontal: false,
+            delta: -120,
+            x: 100,
+            y: 100,
+        };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("MouseWheel"));
+        assert!(debug.contains("-120"));
     }
 
     #[test]
