@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 use yard_core::Config;
-use yard_protocol::{CertificateInfo, ConnectionConfig, DesktopSize, FromNetwork, ToNetwork, spawn_network_thread};
+use yard_protocol::{
+    CertificateInfo, ConnectionConfig, DesktopSize, FromNetwork, ToNetwork, spawn_network_thread,
+};
 use yard_wayland::WindowConfig;
 
 /// Exit codes for YARD.
@@ -33,14 +35,16 @@ mod exit_codes {
 #[derive(Parser)]
 #[command(name = "yard")]
 #[command(author, version, about)]
-#[command(long_about = "A native Wayland RDP client for Linux with multi-monitor fullscreen support.\n\n\
+#[command(
+    long_about = "A native Wayland RDP client for Linux with multi-monitor fullscreen support.\n\n\
 Exit codes:\n  \
   0  Success\n  \
   1  Connection error (network, timeout, server unreachable)\n  \
   2  Authentication error (invalid credentials)\n  \
   3  Protocol error (RDP negotiation failed)\n\n\
 Logging:\n  \
-  Set RUST_LOG for fine-grained control (e.g., RUST_LOG=yard_protocol=trace)")]
+  Set RUST_LOG for fine-grained control (e.g., RUST_LOG=yard_protocol=trace)"
+)]
 struct Cli {
     /// Enable verbose logging (debug level for yard_* crates).
     #[arg(short, long, global = true)]
@@ -68,6 +72,10 @@ enum Commands {
         /// Domain for authentication.
         #[arg(short, long)]
         domain: Option<String>,
+
+        /// Start in fullscreen mode.
+        #[arg(short = 'f', long)]
+        fullscreen: bool,
     },
 
     /// Generate shell completion scripts.
@@ -89,7 +97,7 @@ fn main() -> ExitCode {
         // --verbose enables debug level for all yard crates
         EnvFilter::new(
             "warn,yard_client=debug,yard_protocol=debug,yard_core=debug,\
-             yard_wayland=debug,yard_video=debug,yard_audio=debug"
+             yard_wayland=debug,yard_video=debug,yard_audio=debug",
         )
     } else {
         // Default: only errors and warnings (AC 1)
@@ -120,6 +128,7 @@ fn run(cli: Cli) -> Result<u8> {
             port,
             username,
             domain,
+            fullscreen,
         }) => {
             // User feedback (always visible, not affected by log level)
             eprintln!("YARD v{}", env!("CARGO_PKG_VERSION"));
@@ -148,7 +157,7 @@ fn run(cli: Cli) -> Result<u8> {
                 config = config.with_password(password);
             }
 
-            run_connection(config)
+            run_connection(config, fullscreen)
         }
 
         Some(Commands::Completions { shell }) => {
@@ -257,7 +266,7 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 }
 
 /// Runs the RDP connection.
-fn run_connection(config: ConnectionConfig) -> Result<u8> {
+fn run_connection(config: ConnectionConfig, start_fullscreen: bool) -> Result<u8> {
     // Create structured span with connection context (AC 4)
     let connection_span = info_span!(
         "rdp_connection",
@@ -279,11 +288,9 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
     }
 
     // Prepare window config for later use
-    let window_config = WindowConfig::with_connection_info(
-        &config.host,
-        config.port,
-        config.username.as_deref(),
-    );
+    let window_config =
+        WindowConfig::with_connection_info(&config.host, config.port, config.username.as_deref())
+            .with_fullscreen(start_fullscreen);
     debug!(?window_config, "Window config prepared");
 
     // Create channel for receiving messages from network thread
@@ -300,11 +307,7 @@ fn run_connection(config: ConnectionConfig) -> Result<u8> {
     // Event loop for handling messages
     // On Linux, this will be replaced with calloop + Wayland window
     // For now, use blocking receive
-    let exit_code = run_event_loop(
-        &mut from_network_rx,
-        &to_network_tx,
-        window_config,
-    )?;
+    let exit_code = run_event_loop(&mut from_network_rx, &to_network_tx, window_config)?;
 
     Ok(exit_code)
 }
@@ -393,7 +396,11 @@ fn run_event_loop(
     // Draw initial placeholder
     let (r, g, b) = PLACEHOLDER_COLOR;
     window.draw_solid(r, g, b);
-    info!("Window created: {}x{}", window.dimensions().0, window.dimensions().1);
+    info!(
+        "Window created: {}x{}",
+        window.dimensions().0,
+        window.dimensions().1
+    );
 
     // Track frame statistics
     let mut frame_count: u64 = 0;
@@ -491,6 +498,21 @@ fn run_event_loop(
                     // redraw via damage
                     if frame_count == 0 {
                         window.draw_solid(r, g, b);
+                    }
+                }
+                WindowEvent::FullscreenChanged { is_fullscreen } => {
+                    info!(
+                        "Fullscreen mode: {}",
+                        if is_fullscreen { "entered" } else { "exited" }
+                    );
+                }
+                WindowEvent::KeyboardShortcut(shortcut) => {
+                    use yard_wayland::KeyboardShortcut;
+                    match shortcut {
+                        KeyboardShortcut::ToggleFullscreen => {
+                            debug!("Toggle fullscreen shortcut received");
+                            window.toggle_fullscreen();
+                        }
                     }
                 }
             }

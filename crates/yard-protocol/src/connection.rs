@@ -10,7 +10,7 @@ use std::time::Duration;
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::geometry::Rectangle as _;
-use ironrdp::pdu::rdp::capability_sets::{client_codecs_capabilities, MajorPlatformType};
+use ironrdp::pdu::rdp::capability_sets::{MajorPlatformType, client_codecs_capabilities};
 use ironrdp::pdu::rdp::client_info::PerformanceFlags;
 use ironrdp::session::{ActiveStage, ActiveStageOutput};
 use ironrdp_graphics::image_processing::PixelFormat;
@@ -181,12 +181,12 @@ async fn handle_connect(
         Ok(result) => result,
         Err(e) => {
             let err_msg = e.to_string();
-            let conn_err =
-                if err_msg.contains("access denied") || err_msg.contains("Access denied") {
-                    ConnectionError::AuthenticationFailed(err_msg)
-                } else {
-                    ConnectionError::Protocol(format!("RDP handshake failed: {err_msg}"))
-                };
+            let conn_err = if err_msg.contains("access denied") || err_msg.contains("Access denied")
+            {
+                ConnectionError::AuthenticationFailed(err_msg)
+            } else {
+                ConnectionError::Protocol(format!("RDP handshake failed: {err_msg}"))
+            };
             let _ = tx.send(FromNetwork::Error(conn_err)).await;
             return;
         }
@@ -366,16 +366,14 @@ fn build_rdp_config(config: &ConnectionConfig) -> Result<connector::Config, Conn
 struct StubNetworkClient;
 
 impl ironrdp_tokio::NetworkClient for StubNetworkClient {
-    fn send(
+    async fn send(
         &mut self,
         _request: &ironrdp::connector::sspi::generator::NetworkRequest,
-    ) -> impl std::future::Future<Output = connector::ConnectorResult<Vec<u8>>> {
-        async {
-            Err(connector::ConnectorError::new(
-                "Kerberos authentication not supported",
-                connector::ConnectorErrorKind::General,
-            ))
-        }
+    ) -> connector::ConnectorResult<Vec<u8>> {
+        Err(connector::ConnectorError::new(
+            "Kerberos authentication not supported",
+            connector::ConnectorErrorKind::General,
+        ))
     }
 }
 
@@ -557,7 +555,10 @@ fn extract_rdn_value(name: &x509_cert::name::Name, oid_str: &str) -> Option<Stri
                 if let Ok(s) = atv.value.decode_as::<x509_cert::der::asn1::Utf8StringRef>() {
                     return Some(s.to_string());
                 }
-                if let Ok(s) = atv.value.decode_as::<x509_cert::der::asn1::PrintableStringRef>() {
+                if let Ok(s) = atv
+                    .value
+                    .decode_as::<x509_cert::der::asn1::PrintableStringRef>()
+                {
                     return Some(s.to_string());
                 }
             }

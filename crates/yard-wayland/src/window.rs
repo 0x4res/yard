@@ -15,20 +15,24 @@ mod linux {
     use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
     use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+    use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard;
     use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
+    use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
     use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
     use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
     use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-    use smithay_client_toolkit::shell::xdg::window::{
-        Window, WindowConfigure, WindowDecorations, WindowHandler,
-    };
-    use smithay_client_toolkit::shell::xdg::XdgShell;
+    use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers};
+    use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
     use smithay_client_toolkit::shell::WaylandSurface;
+    use smithay_client_toolkit::shell::xdg::XdgShell;
+    use smithay_client_toolkit::shell::xdg::window::{
+        Window, WindowConfigure, WindowDecorations, WindowHandler, WindowState,
+    };
     use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
     use smithay_client_toolkit::shm::{Shm, ShmHandler};
     use smithay_client_toolkit::{
-        delegate_compositor, delegate_output, delegate_registry, delegate_shm, delegate_xdg_shell,
-        delegate_xdg_window, registry_handlers,
+        delegate_compositor, delegate_keyboard, delegate_output, delegate_registry, delegate_seat,
+        delegate_shm, delegate_xdg_shell, delegate_xdg_window, registry_handlers,
     };
 
     /// Messages sent from the Wayland window to the main application.
@@ -40,6 +44,17 @@ mod linux {
         Resized { width: u32, height: u32 },
         /// Window needs to be redrawn.
         RedrawRequested,
+        /// Fullscreen state changed.
+        FullscreenChanged { is_fullscreen: bool },
+        /// A keyboard shortcut was pressed.
+        KeyboardShortcut(KeyboardShortcut),
+    }
+
+    /// Keyboard shortcuts that the window can detect.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum KeyboardShortcut {
+        /// Toggle fullscreen mode (Ctrl+Alt+Enter).
+        ToggleFullscreen,
     }
 
     /// Configuration for creating a Wayland window.
@@ -51,6 +66,8 @@ mod linux {
         pub width: u32,
         /// Initial height in pixels.
         pub height: u32,
+        /// Start in fullscreen mode.
+        pub fullscreen: bool,
     }
 
     impl Default for WindowConfig {
@@ -59,6 +76,7 @@ mod linux {
                 title: "YARD".to_string(),
                 width: 1280,
                 height: 720,
+                fullscreen: false,
             }
         }
     }
@@ -83,12 +101,20 @@ mod linux {
             self.height = height;
             self
         }
+
+        /// Sets fullscreen mode.
+        #[must_use]
+        pub fn with_fullscreen(mut self, fullscreen: bool) -> Self {
+            self.fullscreen = fullscreen;
+            self
+        }
     }
 
     /// The main Wayland window state.
     pub struct WaylandWindow {
         registry_state: RegistryState,
         output_state: OutputState,
+        seat_state: SeatState,
         shm: Shm,
         pool: SlotPool,
         window: Window,
@@ -102,6 +128,12 @@ mod linux {
         event_tx: Sender<WindowEvent>,
         close_requested: bool,
         dirty: bool,
+        /// Whether the window is currently in fullscreen mode.
+        is_fullscreen: bool,
+        /// Current keyboard modifiers state.
+        modifiers: Modifiers,
+        /// Reference to the keyboard object (if available).
+        keyboard: Option<WlKeyboard>,
     }
 
     impl WaylandWindow {
@@ -137,14 +169,11 @@ mod linux {
             let compositor = CompositorState::bind(&globals, &qh)?;
             let xdg_shell = XdgShell::bind(&globals, &qh)?;
             let shm = Shm::bind(&globals, &qh)?;
+            let seat_state = SeatState::new(&globals, &qh);
 
             // Create surface and window
             let surface = compositor.create_surface(&qh);
-            let window = xdg_shell.create_window(
-                surface,
-                WindowDecorations::ServerDefault,
-                &qh,
-            );
+            let window = xdg_shell.create_window(surface, WindowDecorations::ServerDefault, &qh);
 
             window.set_title(config.title);
             window.set_app_id("yard");
@@ -152,18 +181,22 @@ mod linux {
             window.commit();
 
             // Create shared memory pool for buffers
-            let pool = SlotPool::new(
-                (config.width * config.height * 4) as usize,
-                &shm,
-            )?;
+            let pool = SlotPool::new((config.width * config.height * 4) as usize, &shm)?;
 
             // Initialize retained content buffer (black/transparent)
             let retained_size = (config.width * config.height * 4) as usize;
             let retained_content = vec![0u8; retained_size];
 
+            // Request fullscreen if configured
+            let start_fullscreen = config.fullscreen;
+            if start_fullscreen {
+                window.set_fullscreen(None);
+            }
+
             let state = Self {
                 registry_state: RegistryState::new(&globals),
                 output_state: OutputState::new(&globals, &qh),
+                seat_state,
                 shm,
                 pool,
                 window,
@@ -174,6 +207,9 @@ mod linux {
                 event_tx,
                 close_requested: false,
                 dirty: true,
+                is_fullscreen: false, // Will be updated when compositor confirms
+                modifiers: Modifiers::default(),
+                keyboard: None,
             };
 
             Ok((event_loop, state, event_rx))
@@ -187,6 +223,35 @@ mod linux {
         /// Returns the current window dimensions.
         pub fn dimensions(&self) -> (u32, u32) {
             (self.width, self.height)
+        }
+
+        /// Returns true if the window is currently in fullscreen mode.
+        pub fn is_fullscreen(&self) -> bool {
+            self.is_fullscreen
+        }
+
+        /// Requests fullscreen mode on the specified output.
+        ///
+        /// Pass `None` to use the current output (compositor's choice).
+        /// The actual fullscreen state change is confirmed via the configure event.
+        pub fn set_fullscreen(&self, output: Option<&WlOutput>) {
+            self.window.set_fullscreen(output);
+        }
+
+        /// Requests to exit fullscreen mode.
+        ///
+        /// The actual state change is confirmed via the configure event.
+        pub fn unset_fullscreen(&self) {
+            self.window.unset_fullscreen();
+        }
+
+        /// Toggles between fullscreen and windowed mode.
+        pub fn toggle_fullscreen(&self) {
+            if self.is_fullscreen {
+                self.unset_fullscreen();
+            } else {
+                self.set_fullscreen(None);
+            }
         }
 
         /// Draws a solid color frame (placeholder until real frames arrive).
@@ -350,7 +415,15 @@ mod linux {
         ///
         /// This preserves existing content outside the updated region by copying
         /// from retained_content before blitting the new partial data.
-        fn draw_partial_frame(&mut self, data: &[u8], width: u32, height: u32, x: u32, y: u32, stride: u32) {
+        fn draw_partial_frame(
+            &mut self,
+            data: &[u8],
+            width: u32,
+            height: u32,
+            x: u32,
+            y: u32,
+            stride: u32,
+        ) {
             let window_stride = self.width * 4;
             let frame_stride = stride;
 
@@ -483,13 +556,7 @@ mod linux {
             &mut self.output_state
         }
 
-        fn new_output(
-            &mut self,
-            _conn: &Connection,
-            _qh: &QueueHandle<Self>,
-            _output: WlOutput,
-        ) {
-        }
+        fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {}
 
         fn update_output(
             &mut self,
@@ -536,6 +603,21 @@ mod linux {
                 self.retained_content.resize(new_size, 0);
                 self.dirty = true;
                 let _ = self.event_tx.send(WindowEvent::Resized { width, height });
+                tracing::debug!("Window resized to {}x{}", width, height);
+                // TODO: Notify RDP server of resolution change via DISPLAYCONTROL (Epic 3)
+            }
+
+            // Check fullscreen state change
+            let new_fullscreen = configure.state.contains(WindowState::FULLSCREEN);
+            if new_fullscreen != self.is_fullscreen {
+                self.is_fullscreen = new_fullscreen;
+                let _ = self.event_tx.send(WindowEvent::FullscreenChanged {
+                    is_fullscreen: new_fullscreen,
+                });
+                tracing::info!(
+                    "Fullscreen state changed: {}",
+                    if new_fullscreen { "entered" } else { "exited" }
+                );
             }
         }
     }
@@ -551,11 +633,123 @@ mod linux {
             &mut self.registry_state
         }
 
-        registry_handlers![OutputState];
+        registry_handlers![OutputState, SeatState];
+    }
+
+    impl SeatHandler for WaylandWindow {
+        fn seat_state(&mut self) -> &mut SeatState {
+            &mut self.seat_state
+        }
+
+        fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {
+            // Seat will be handled when capabilities are announced
+        }
+
+        fn new_capability(
+            &mut self,
+            _conn: &Connection,
+            qh: &QueueHandle<Self>,
+            seat: WlSeat,
+            capability: Capability,
+        ) {
+            if capability == Capability::Keyboard && self.keyboard.is_none() {
+                tracing::debug!("Keyboard capability available, requesting keyboard");
+                let keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
+                self.keyboard = keyboard.map(|k| k.wl_keyboard().clone());
+            }
+        }
+
+        fn remove_capability(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _seat: WlSeat,
+            capability: Capability,
+        ) {
+            if capability == Capability::Keyboard {
+                tracing::debug!("Keyboard capability removed");
+                self.keyboard = None;
+            }
+        }
+
+        fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {
+            // Nothing to clean up
+        }
+    }
+
+    impl KeyboardHandler for WaylandWindow {
+        fn enter(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _keyboard: &WlKeyboard,
+            _surface: &WlSurface,
+            _serial: u32,
+            _raw: &[u32],
+            _keysyms: &[Keysym],
+        ) {
+            // Keyboard focus gained
+            tracing::trace!("Keyboard focus entered");
+        }
+
+        fn leave(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _keyboard: &WlKeyboard,
+            _surface: &WlSurface,
+            _serial: u32,
+        ) {
+            // Keyboard focus lost - reset modifiers
+            tracing::trace!("Keyboard focus left");
+            self.modifiers = Modifiers::default();
+        }
+
+        fn press_key(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _keyboard: &WlKeyboard,
+            _serial: u32,
+            event: KeyEvent,
+        ) {
+            // Check for Ctrl+Alt+Enter (toggle fullscreen shortcut)
+            if self.modifiers.ctrl && self.modifiers.alt && event.keysym == Keysym::Return {
+                tracing::debug!("Ctrl+Alt+Enter detected - toggling fullscreen");
+                let _ = self.event_tx.send(WindowEvent::KeyboardShortcut(
+                    KeyboardShortcut::ToggleFullscreen,
+                ));
+            }
+        }
+
+        fn release_key(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _keyboard: &WlKeyboard,
+            _serial: u32,
+            _event: KeyEvent,
+        ) {
+            // Key release handling (not needed for shortcuts)
+        }
+
+        fn update_modifiers(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _keyboard: &WlKeyboard,
+            _serial: u32,
+            modifiers: Modifiers,
+            _layout: u32,
+        ) {
+            self.modifiers = modifiers;
+        }
     }
 
     delegate_compositor!(WaylandWindow);
     delegate_output!(WaylandWindow);
+    delegate_seat!(WaylandWindow);
+    delegate_keyboard!(WaylandWindow);
     delegate_shm!(WaylandWindow);
     delegate_xdg_shell!(WaylandWindow);
     delegate_xdg_window!(WaylandWindow);
@@ -574,6 +768,15 @@ mod stub {
         CloseRequested,
         Resized { width: u32, height: u32 },
         RedrawRequested,
+        FullscreenChanged { is_fullscreen: bool },
+        KeyboardShortcut(KeyboardShortcut),
+    }
+
+    /// Keyboard shortcuts that the window can detect.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum KeyboardShortcut {
+        /// Toggle fullscreen mode (Ctrl+Alt+Enter).
+        ToggleFullscreen,
     }
 
     /// Stub WindowConfig for non-Linux platforms.
@@ -582,6 +785,7 @@ mod stub {
         pub title: String,
         pub width: u32,
         pub height: u32,
+        pub fullscreen: bool,
     }
 
     impl Default for WindowConfig {
@@ -590,6 +794,7 @@ mod stub {
                 title: "YARD".to_string(),
                 width: 1280,
                 height: 720,
+                fullscreen: false,
             }
         }
     }
@@ -604,6 +809,7 @@ mod stub {
                 title,
                 width: 1280,
                 height: 720,
+                fullscreen: false,
             }
         }
 
@@ -614,18 +820,20 @@ mod stub {
             self.height = height;
             self
         }
+
+        /// Sets fullscreen mode.
+        #[must_use]
+        pub fn with_fullscreen(mut self, fullscreen: bool) -> Self {
+            self.fullscreen = fullscreen;
+            self
+        }
     }
 
     /// Stub WaylandWindow for non-Linux platforms.
     pub struct WaylandWindow;
 
     impl WaylandWindow {
-        pub fn new(
-            _config: WindowConfig,
-        ) -> Result<
-            ((), Self, ()),
-            Box<dyn std::error::Error>,
-        > {
+        pub fn new(_config: WindowConfig) -> Result<((), Self, ()), Box<dyn std::error::Error>> {
             Err("Wayland is only supported on Linux".into())
         }
 
@@ -637,11 +845,22 @@ mod stub {
             (0, 0)
         }
 
+        pub fn is_fullscreen(&self) -> bool {
+            false
+        }
+
+        pub fn set_fullscreen(&self, _output: Option<&()>) {}
+
+        pub fn unset_fullscreen(&self) {}
+
+        pub fn toggle_fullscreen(&self) {}
+
         pub fn draw_solid(&mut self, _r: u8, _g: u8, _b: u8) {}
 
         pub fn draw_frame(&mut self, _data: &[u8], _width: u32, _height: u32) {}
 
-        pub fn draw_frame_at(&mut self, _data: &[u8], _width: u32, _height: u32, _x: u32, _y: u32) {}
+        pub fn draw_frame_at(&mut self, _data: &[u8], _width: u32, _height: u32, _x: u32, _y: u32) {
+        }
 
         pub fn draw_frame_at_with_stride(
             &mut self,
@@ -651,7 +870,8 @@ mod stub {
             _x: u32,
             _y: u32,
             _stride: u32,
-        ) {}
+        ) {
+        }
     }
 }
 
@@ -705,10 +925,33 @@ mod tests {
 
     #[test]
     fn test_window_config_with_size_chained() {
-        let config = WindowConfig::with_connection_info("host", 3389, Some("user"))
-            .with_size(2560, 1440);
+        let config =
+            WindowConfig::with_connection_info("host", 3389, Some("user")).with_size(2560, 1440);
         assert_eq!(config.title, "YARD - host:3389 [user]");
         assert_eq!(config.width, 2560);
         assert_eq!(config.height, 1440);
+    }
+
+    #[test]
+    fn test_window_config_fullscreen_default() {
+        let config = WindowConfig::default();
+        assert!(!config.fullscreen);
+    }
+
+    #[test]
+    fn test_window_config_with_fullscreen() {
+        let config = WindowConfig::default().with_fullscreen(true);
+        assert!(config.fullscreen);
+    }
+
+    #[test]
+    fn test_window_config_with_fullscreen_chained() {
+        let config = WindowConfig::with_connection_info("host", 3389, Some("user"))
+            .with_size(1920, 1080)
+            .with_fullscreen(true);
+        assert_eq!(config.title, "YARD - host:3389 [user]");
+        assert_eq!(config.width, 1920);
+        assert_eq!(config.height, 1080);
+        assert!(config.fullscreen);
     }
 }
