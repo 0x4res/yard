@@ -1,0 +1,14 @@
+# Security audit configuration for cargo-audit
+# See: https://docs.rs/cargo-audit/latest/cargo_audit/config/index.html
+
+[advisories]
+# Vulnerabilities to ignore (transitive dependencies we can't fix)
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack in rsa crate
+    # This is a transitive dependency of IronRDP via sspi/winscard
+    # No fix is available upstream. IronRDP issue tracking:
+    # https://github.com/Devolutions/IronRDP/issues (monitor for updates)
+    "RUSTSEC-2023-0071",
+]
+# Treat unmaintained crate warnings as allowed (not errors)
+informational_warnings = ["unmaintained"]
