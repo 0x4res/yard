@@ -204,11 +204,8 @@ mod linux {
                 .map_err(|e| DecoderError::DecodeFailed(e.to_string()))?;
 
             let mut frames = Vec::new();
-            loop {
-                match self.receive_and_convert_frame()? {
-                    Some(frame) => frames.push(frame),
-                    None => break,
-                }
+            while let Some(frame) = self.receive_and_convert_frame()? {
+                frames.push(frame);
             }
 
             Ok(frames)
