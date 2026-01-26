@@ -149,8 +149,8 @@ mod linux {
                 VideoCodec::H265 => ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::HEVC),
             };
 
-            let ffmpeg_codec = ffmpeg_codec
-                .ok_or_else(|| DecoderError::UnsupportedCodec(codec.to_string()))?;
+            let ffmpeg_codec =
+                ffmpeg_codec.ok_or_else(|| DecoderError::UnsupportedCodec(codec.to_string()))?;
 
             let context = ffmpeg_next::codec::Context::new_with_codec(ffmpeg_codec);
             let decoder = context
@@ -223,7 +223,9 @@ mod linux {
             let mut frame = ffmpeg_next::frame::Video::empty();
             match self.decoder.receive_frame(&mut frame) {
                 Ok(()) => {}
-                Err(ffmpeg_next::Error::Other { errno: ffmpeg_next::error::EAGAIN }) => {
+                Err(ffmpeg_next::Error::Other {
+                    errno: ffmpeg_next::error::EAGAIN,
+                }) => {
                     // Need more data
                     return Ok(None);
                 }
@@ -257,9 +259,10 @@ mod linux {
             }
 
             // Convert to BGRA
-            let scaler = self.scaler.as_mut().ok_or_else(|| {
-                DecoderError::DecodeFailed("Scaler not initialized".to_string())
-            })?;
+            let scaler = self
+                .scaler
+                .as_mut()
+                .ok_or_else(|| DecoderError::DecodeFailed("Scaler not initialized".to_string()))?;
 
             let mut bgra_frame = ffmpeg_next::frame::Video::empty();
             scaler

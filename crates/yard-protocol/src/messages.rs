@@ -192,7 +192,10 @@ impl CertificateInfo {
         }
 
         lines.push(format!("Issuer:      {}", self.issuer));
-        lines.push(format!("Valid:       {} to {}", self.not_before, self.not_after));
+        lines.push(format!(
+            "Valid:       {} to {}",
+            self.not_before, self.not_after
+        ));
 
         lines.join("\n")
     }
@@ -543,12 +546,8 @@ mod tests {
 
     #[test]
     fn test_certificate_info_new() {
-        let cert = CertificateInfo::new(
-            "SHA256:AB:CD:EF",
-            "Self-signed",
-            "2024-01-01",
-            "2025-01-01",
-        );
+        let cert =
+            CertificateInfo::new("SHA256:AB:CD:EF", "Self-signed", "2024-01-01", "2025-01-01");
         assert_eq!(cert.fingerprint, "SHA256:AB:CD:EF");
         assert_eq!(cert.issuer, "Self-signed");
         assert!(cert.common_name.is_none());

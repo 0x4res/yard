@@ -116,7 +116,11 @@ impl Config {
         }
 
         let contents = std::fs::read_to_string(path).map_err(|e| {
-            Error::Config(format!("Failed to read config file {}: {}", path.display(), e))
+            Error::Config(format!(
+                "Failed to read config file {}: {}",
+                path.display(),
+                e
+            ))
         })?;
 
         Self::parse(&contents)
@@ -138,7 +142,10 @@ impl Config {
                 column: e.span().map(|s| {
                     // Find column within the line
                     let before = &contents[..s.start];
-                    before.rfind('\n').map(|pos| s.start - pos).unwrap_or(s.start + 1)
+                    before
+                        .rfind('\n')
+                        .map(|pos| s.start - pos)
+                        .unwrap_or(s.start + 1)
                 }),
             };
             Error::Config(parse_error.to_string())
