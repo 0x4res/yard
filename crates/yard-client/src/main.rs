@@ -486,7 +486,7 @@ fn run_event_loop(
         let timeout = std::time::Duration::from_millis(EVENT_LOOP_TIMEOUT_MS);
         if let Err(e) = event_loop.dispatch(timeout, &mut window) {
             error!("Event loop error: {}", e);
-            break;
+            return Ok(exit_codes::CONNECTION_ERROR);
         }
 
         // Check window events (includes close request from WindowHandler)
