@@ -464,7 +464,7 @@ fn run_event_loop(
                     );
                     frame_count += 1;
 
-                    if frame_count % 300 == 0 {
+                    if frame_count.is_multiple_of(300) {
                         debug!("Rendered {} frames", frame_count);
                     }
                 }
