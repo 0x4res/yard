@@ -7,8 +7,8 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use calloop::channel::Sender;
     use calloop::EventLoop;
+    use calloop::channel::Sender;
     use calloop_wayland_source::WaylandSource;
     use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -20,18 +20,18 @@ mod linux {
     use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format as WlShmFormat;
     use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
     use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
-    use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
     use smithay_client_toolkit::reexports::csd_frame::WindowState;
+    use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
     use smithay_client_toolkit::seat::keyboard::{
         KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
     };
     use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
     use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
+    use smithay_client_toolkit::shell::WaylandSurface;
+    use smithay_client_toolkit::shell::xdg::XdgShell;
     use smithay_client_toolkit::shell::xdg::window::{
         Window, WindowConfigure, WindowDecorations, WindowHandler,
     };
-    use smithay_client_toolkit::shell::xdg::XdgShell;
-    use smithay_client_toolkit::shell::WaylandSurface;
     use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
     use smithay_client_toolkit::shm::{Shm, ShmHandler};
     use smithay_client_toolkit::{
@@ -64,10 +64,20 @@ mod linux {
         MouseMove { x: f64, y: f64 },
         /// Mouse button pressed or released.
         /// Button codes are Linux evdev button codes (BTN_LEFT=0x110, etc.).
-        MouseButton { button: u32, pressed: bool, x: f64, y: f64 },
+        MouseButton {
+            button: u32,
+            pressed: bool,
+            x: f64,
+            y: f64,
+        },
         /// Mouse wheel/scroll event.
         /// Value is scroll amount (positive = up/left, negative = down/right).
-        MouseAxis { horizontal: bool, value: f64, x: f64, y: f64 },
+        MouseAxis {
+            horizontal: bool,
+            value: f64,
+            x: f64,
+            y: f64,
+        },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -244,7 +254,7 @@ mod linux {
                 has_pointer: false,
                 pointer_position: (0.0, 0.0),
                 pressed_buttons: Vec::new(),
-                remote_width: config.width,  // Default to window size, updated by set_remote_resolution
+                remote_width: config.width, // Default to window size, updated by set_remote_resolution
                 remote_height: config.height,
             };
 
@@ -796,7 +806,11 @@ mod linux {
 
             // Translate evdev keycode to RDP scancode and forward
             if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw_code) {
-                tracing::trace!("Key pressed: evdev {} -> RDP 0x{:04X}", event.raw_code, scancode);
+                tracing::trace!(
+                    "Key pressed: evdev {} -> RDP 0x{:04X}",
+                    event.raw_code,
+                    scancode
+                );
                 let _ = self.event_tx.send(WindowEvent::KeyPressed { scancode });
             } else {
                 tracing::trace!("Unknown key pressed: evdev {}", event.raw_code);
@@ -876,10 +890,7 @@ mod linux {
                         // Release any pressed buttons to prevent stuck buttons on remote
                         let (x, y) = self.pointer_position;
                         for button in self.pressed_buttons.drain(..) {
-                            tracing::trace!(
-                                "Releasing button {} due to pointer leave",
-                                button
-                            );
+                            tracing::trace!("Releasing button {} due to pointer leave", button);
                             let _ = self.event_tx.send(WindowEvent::MouseButton {
                                 button,
                                 pressed: false,
@@ -908,12 +919,7 @@ mod linux {
                     }
                     PointerEventKind::Release { button, .. } => {
                         let (x, y) = event.position;
-                        tracing::trace!(
-                            "Mouse button {} released at ({:.1}, {:.1})",
-                            button,
-                            x,
-                            y
-                        );
+                        tracing::trace!("Mouse button {} released at ({:.1}, {:.1})", button, x, y);
                         // Remove from tracked pressed buttons
                         self.pressed_buttons.retain(|&b| b != button);
                         let _ = self.event_tx.send(WindowEvent::MouseButton {
@@ -990,15 +996,37 @@ mod stub {
     #[derive(Debug)]
     pub enum WindowEvent {
         CloseRequested,
-        Resized { width: u32, height: u32 },
+        Resized {
+            width: u32,
+            height: u32,
+        },
         RedrawRequested,
-        FullscreenChanged { is_fullscreen: bool },
+        FullscreenChanged {
+            is_fullscreen: bool,
+        },
         KeyboardShortcut(KeyboardShortcut),
-        KeyPressed { scancode: u16 },
-        KeyReleased { scancode: u16 },
-        MouseMove { x: f64, y: f64 },
-        MouseButton { button: u32, pressed: bool, x: f64, y: f64 },
-        MouseAxis { horizontal: bool, value: f64, x: f64, y: f64 },
+        KeyPressed {
+            scancode: u16,
+        },
+        KeyReleased {
+            scancode: u16,
+        },
+        MouseMove {
+            x: f64,
+            y: f64,
+        },
+        MouseButton {
+            button: u32,
+            pressed: bool,
+            x: f64,
+            y: f64,
+        },
+        MouseAxis {
+            horizontal: bool,
+            value: f64,
+            x: f64,
+            y: f64,
+        },
     }
 
     /// Keyboard shortcuts that the window can detect.

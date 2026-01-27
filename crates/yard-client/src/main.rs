@@ -553,12 +553,8 @@ fn run_event_loop(
                 }
                 WindowEvent::MouseMove { x, y } => {
                     // Map window coordinates to remote desktop coordinates
-                    let (remote_x, remote_y) = map_to_remote_coords(
-                        x,
-                        y,
-                        window.dimensions(),
-                        window.remote_resolution(),
-                    );
+                    let (remote_x, remote_y) =
+                        map_to_remote_coords(x, y, window.dimensions(), window.remote_resolution());
                     if to_network_tx
                         .blocking_send(ToNetwork::MouseMove {
                             x: remote_x,
