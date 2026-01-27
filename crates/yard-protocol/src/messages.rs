@@ -401,6 +401,34 @@ pub enum ToNetwork {
         /// Y position at time of scroll.
         y: u16,
     },
+    /// Story 3.6: Update monitor layout due to hot-plug event.
+    ///
+    /// Sent when monitors are connected or disconnected during a session.
+    /// The network thread should notify the server via DISPLAYCONTROL channel.
+    UpdateMonitorLayout {
+        /// The new monitor layout to report to the server.
+        monitors: Vec<RdpMonitorLayout>,
+    },
+}
+
+/// Monitor layout information for RDP DISPLAYCONTROL channel (Story 3.6).
+///
+/// This is a simplified version of MonitorInfo that contains only the
+/// information needed for the DISPLAYCONTROL protocol.
+#[derive(Debug, Clone)]
+pub struct RdpMonitorLayout {
+    /// Unique monitor ID.
+    pub id: u32,
+    /// Monitor width in pixels.
+    pub width: u32,
+    /// Monitor height in pixels.
+    pub height: u32,
+    /// X position in the combined desktop coordinate space.
+    pub x: i32,
+    /// Y position in the combined desktop coordinate space.
+    pub y: i32,
+    /// Whether this is the primary monitor.
+    pub is_primary: bool,
 }
 
 /// Desktop size information from the RDP server.
@@ -771,6 +799,67 @@ mod tests {
         let debug = format!("{:?}", msg);
         assert!(debug.contains("MouseWheel"));
         assert!(debug.contains("-120"));
+    }
+
+    // Story 3.6: RdpMonitorLayout tests
+
+    #[test]
+    fn test_rdp_monitor_layout_new() {
+        let layout = RdpMonitorLayout {
+            id: 1,
+            width: 1920,
+            height: 1080,
+            x: 0,
+            y: 0,
+            is_primary: true,
+        };
+        assert_eq!(layout.id, 1);
+        assert_eq!(layout.width, 1920);
+        assert_eq!(layout.height, 1080);
+        assert_eq!(layout.x, 0);
+        assert_eq!(layout.y, 0);
+        assert!(layout.is_primary);
+    }
+
+    #[test]
+    fn test_rdp_monitor_layout_secondary() {
+        let layout = RdpMonitorLayout {
+            id: 2,
+            width: 2560,
+            height: 1440,
+            x: 1920,
+            y: -180, // Negative Y for vertical offset
+            is_primary: false,
+        };
+        assert_eq!(layout.id, 2);
+        assert_eq!(layout.x, 1920);
+        assert_eq!(layout.y, -180);
+        assert!(!layout.is_primary);
+    }
+
+    #[test]
+    fn test_to_network_update_monitor_layout() {
+        let monitors = vec![
+            RdpMonitorLayout {
+                id: 1,
+                width: 1920,
+                height: 1080,
+                x: 0,
+                y: 0,
+                is_primary: true,
+            },
+            RdpMonitorLayout {
+                id: 2,
+                width: 1920,
+                height: 1080,
+                x: 1920,
+                y: 0,
+                is_primary: false,
+            },
+        ];
+        let msg = ToNetwork::UpdateMonitorLayout { monitors };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("UpdateMonitorLayout"));
     }
 
     #[test]

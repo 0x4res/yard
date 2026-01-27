@@ -104,6 +104,11 @@ async fn network_loop(
                 // Ignore if received outside of session (no connection established)
                 warn!("Received mouse input outside of active session");
             }
+            ToNetwork::UpdateMonitorLayout { .. } => {
+                // Story 3.6: Monitor layout update should be received during active session
+                // Ignore if received outside of session (no connection established)
+                warn!("Received monitor layout update outside of active session");
+            }
         }
     }
 }
@@ -579,6 +584,21 @@ where
                     Some(ToNetwork::CertificateDecision(_)) => {
                         // Ignore - certificate already verified
                         warn!("Received CertificateDecision during active session");
+                    }
+                    Some(ToNetwork::UpdateMonitorLayout { monitors }) => {
+                        // Story 3.6: Update monitor layout due to hot-plug event
+                        // TODO: Send DISPLAYCONTROL message to server when DISPLAYCONTROL
+                        // channel is implemented. For now, log the layout change.
+                        info!(
+                            "Monitor layout update: {} monitor(s) - DISPLAYCONTROL notification not yet implemented",
+                            monitors.len()
+                        );
+                        for m in &monitors {
+                            debug!(
+                                "  Monitor {}: {}x{} at ({}, {}), primary={}",
+                                m.id, m.width, m.height, m.x, m.y, m.is_primary
+                            );
+                        }
                     }
                     None => {
                         // Channel closed - main thread disconnected

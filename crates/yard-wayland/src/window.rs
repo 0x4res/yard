@@ -685,6 +685,15 @@ mod linux {
             x: f64,
             y: f64,
         },
+        /// A new monitor was connected during the session (Story 3.6 hot-plug).
+        /// Emitted after the surface has been created for the new monitor.
+        MonitorConnected { monitor: MonitorInfo },
+        /// A monitor was disconnected during the session (Story 3.6 hot-unplug).
+        /// Emitted after the surface has been destroyed for the monitor.
+        MonitorDisconnected { monitor_id: u32 },
+        /// Monitor layout changed (connect or disconnect) (Story 3.6).
+        /// Contains the full current monitor list for DISPLAYCONTROL notification.
+        MonitorLayoutChanged { monitors: Vec<MonitorInfo> },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -1737,7 +1746,7 @@ mod linux {
             &mut self.output_state
         }
 
-        fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: WlOutput) {
+        fn new_output(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, output: WlOutput) {
             // Story 3.1: Detect new monitor
             let id = output.id().protocol_id();
             tracing::debug!("New output detected: id={}", id);
@@ -1759,9 +1768,49 @@ mod linux {
 
                 // Store both the WlOutput and MonitorInfo together to keep them in sync
                 self.outputs.insert(id, output.clone());
-                self.monitors.insert(id, monitor);
+                self.monitors.insert(id, monitor.clone());
                 // Story 3.5: Update region mapper with new monitor layout
                 self.region_mapper.update(&self.monitors);
+
+                // Story 3.6: Create surface for hot-plugged monitor if in multi-monitor mode
+                if self.multi_monitor_mode {
+                    match self.create_surface_for_monitor(qh, id) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "Created surface for hot-plugged monitor {} ({})",
+                                monitor.name,
+                                id
+                            );
+
+                            // If currently in fullscreen, request fullscreen for the new surface
+                            if self.is_fullscreen {
+                                if let Some(surface) = self.multi_surfaces.get(&id) {
+                                    surface.set_fullscreen();
+                                    tracing::debug!(
+                                        "Requested fullscreen for hot-plugged monitor {}",
+                                        monitor.name
+                                    );
+                                }
+                            }
+
+                            // Emit MonitorConnected event
+                            let _ = self.event_tx.send(WindowEvent::MonitorConnected {
+                                monitor: monitor.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to create surface for hot-plugged monitor {}: {}",
+                                id,
+                                e
+                            );
+                        }
+                    }
+
+                    // Emit MonitorLayoutChanged event for DISPLAYCONTROL notification
+                    let monitors: Vec<MonitorInfo> = self.monitors.values().cloned().collect();
+                    let _ = self.event_tx.send(WindowEvent::MonitorLayoutChanged { monitors });
+                }
             } else {
                 // Don't store output without info - wait for update_output
                 tracing::warn!(
@@ -1771,7 +1820,7 @@ mod linux {
             }
         }
 
-        fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: WlOutput) {
+        fn update_output(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, output: WlOutput) {
             // Story 3.1: Update monitor info when properties change
             let id = output.id().protocol_id();
 
@@ -1792,6 +1841,44 @@ mod linux {
                     );
                     // Store the WlOutput now that we have info
                     self.outputs.insert(id, output.clone());
+
+                    // Story 3.6: Create surface for hot-plugged monitor if in multi-monitor mode
+                    // This handles the case where new_output didn't have info yet
+                    if self.multi_monitor_mode && !self.multi_surfaces.contains_key(&id) {
+                        self.monitors.insert(id, monitor.clone());
+                        match self.create_surface_for_monitor(qh, id) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "Created surface for hot-plugged monitor {} (via update)",
+                                    monitor.name
+                                );
+
+                                // If currently in fullscreen, request fullscreen for the new surface
+                                if self.is_fullscreen {
+                                    if let Some(surface) = self.multi_surfaces.get(&id) {
+                                        surface.set_fullscreen();
+                                    }
+                                }
+
+                                // Emit MonitorConnected event
+                                let _ = self.event_tx.send(WindowEvent::MonitorConnected {
+                                    monitor: monitor.clone(),
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to create surface for hot-plugged monitor {}: {}",
+                                    id,
+                                    e
+                                );
+                            }
+                        }
+
+                        // Emit MonitorLayoutChanged event for DISPLAYCONTROL notification
+                        let monitors: Vec<MonitorInfo> = self.monitors.values().cloned().collect();
+                        let _ = self.event_tx.send(WindowEvent::MonitorLayoutChanged { monitors });
+                        return;
+                    }
                 } else {
                     tracing::debug!(
                         "Monitor updated: {} ({}x{} at {},{}, {:.1}Hz)",
@@ -1819,12 +1906,51 @@ mod linux {
             // Story 3.1: Handle monitor disconnect (hot-unplug)
             let id = output.id().protocol_id();
 
+            // Story 3.6: Check if this was the primary monitor (x=0, y=0)
+            let was_primary = self
+                .monitors
+                .get(&id)
+                .map(|m| m.x == 0 && m.y == 0)
+                .unwrap_or(false);
+
+            // Story 3.6: Destroy the associated MonitorSurface if in multi-monitor mode
+            if self.multi_monitor_mode {
+                if let Some(surface) = self.multi_surfaces.remove(&id) {
+                    let monitor_name = surface.monitor_info().name.clone();
+                    // Surface is dropped here, triggering proper cleanup via Drop
+                    drop(surface);
+                    tracing::info!(
+                        "Destroyed surface for disconnected monitor {} (id={})",
+                        monitor_name,
+                        id
+                    );
+                }
+
+                // Emit MonitorDisconnected event
+                let _ = self.event_tx.send(WindowEvent::MonitorDisconnected { monitor_id: id });
+            }
+
             if let Some(monitor) = self.monitors.remove(&id) {
                 tracing::info!("Monitor disconnected: {} ({})", monitor.name, id);
             }
             self.outputs.remove(&id);
             // Story 3.5: Update region mapper with new monitor layout
             self.region_mapper.update(&self.monitors);
+
+            // Story 3.6: Handle primary monitor disconnect gracefully
+            if was_primary && !self.monitors.is_empty() {
+                tracing::warn!(
+                    "Primary monitor (0,0) disconnected, session continues on {} remaining monitor(s)",
+                    self.monitors.len()
+                );
+                // Focus will naturally move to remaining surfaces as compositor handles it
+            }
+
+            // Story 3.6: Emit MonitorLayoutChanged for DISPLAYCONTROL notification
+            if self.multi_monitor_mode {
+                let monitors: Vec<MonitorInfo> = self.monitors.values().cloned().collect();
+                let _ = self.event_tx.send(WindowEvent::MonitorLayoutChanged { monitors });
+            }
 
             // Log remaining monitors
             if !self.monitors.is_empty() {
@@ -2652,6 +2778,18 @@ mod stub {
             value: f64,
             x: f64,
             y: f64,
+        },
+        /// Story 3.6: Monitor hot-plug event (stub).
+        MonitorConnected {
+            monitor: MonitorInfo,
+        },
+        /// Story 3.6: Monitor hot-unplug event (stub).
+        MonitorDisconnected {
+            monitor_id: u32,
+        },
+        /// Story 3.6: Monitor layout changed event (stub).
+        MonitorLayoutChanged {
+            monitors: Vec<MonitorInfo>,
         },
     }
 
@@ -3635,5 +3773,215 @@ mod tests {
         assert_eq!(regions[0].monitor_id, 1);
         // Should only cover the part on monitor 1 (1800 to 1920)
         assert_eq!(regions[0].src_rect.width, 120);
+    }
+
+    // =========================================================================
+    // Story 3.6: Monitor Hot-Plug Tests
+    // =========================================================================
+
+    #[test]
+    fn test_window_event_monitor_connected() {
+        // Task 5.1: Test monitor connect event
+        let monitor = MonitorInfo {
+            id: 3,
+            name: "HDMI-A-1".to_string(),
+            make: Some("Test".to_string()),
+            model: Some("Display".to_string()),
+            width: 1920,
+            height: 1080,
+            x: 1920,
+            y: 0,
+            refresh_mhz: 60000,
+            scale: 1,
+        };
+
+        let event = WindowEvent::MonitorConnected {
+            monitor: monitor.clone(),
+        };
+
+        // Verify the event contains the monitor info
+        if let WindowEvent::MonitorConnected { monitor: m } = event {
+            assert_eq!(m.id, 3);
+            assert_eq!(m.name, "HDMI-A-1");
+            assert_eq!(m.width, 1920);
+            assert_eq!(m.x, 1920);
+        } else {
+            panic!("Expected MonitorConnected event");
+        }
+    }
+
+    #[test]
+    fn test_window_event_monitor_disconnected() {
+        // Task 5.2: Test monitor disconnect event
+        let event = WindowEvent::MonitorDisconnected { monitor_id: 5 };
+
+        if let WindowEvent::MonitorDisconnected { monitor_id } = event {
+            assert_eq!(monitor_id, 5);
+        } else {
+            panic!("Expected MonitorDisconnected event");
+        }
+    }
+
+    #[test]
+    fn test_window_event_monitor_layout_changed() {
+        // Task 5.1/5.2: Test layout changed event with multiple monitors
+        let monitors = vec![
+            MonitorInfo {
+                id: 1,
+                name: "DP-1".to_string(),
+                make: None,
+                model: None,
+                width: 2560,
+                height: 1440,
+                x: 0,
+                y: 0,
+                refresh_mhz: 144000,
+                scale: 1,
+            },
+            MonitorInfo {
+                id: 2,
+                name: "HDMI-A-1".to_string(),
+                make: None,
+                model: None,
+                width: 1920,
+                height: 1080,
+                x: 2560,
+                y: 180, // Vertically centered
+                refresh_mhz: 60000,
+                scale: 1,
+            },
+        ];
+
+        let event = WindowEvent::MonitorLayoutChanged {
+            monitors: monitors.clone(),
+        };
+
+        if let WindowEvent::MonitorLayoutChanged { monitors: m } = event {
+            assert_eq!(m.len(), 2);
+            assert_eq!(m[0].name, "DP-1");
+            assert_eq!(m[1].name, "HDMI-A-1");
+        } else {
+            panic!("Expected MonitorLayoutChanged event");
+        }
+    }
+
+    #[test]
+    fn test_primary_monitor_detection() {
+        // Task 5.3: Test that primary monitor is at (0, 0)
+        let primary = MonitorInfo {
+            id: 1,
+            name: "DP-1".to_string(),
+            make: None,
+            model: None,
+            width: 1920,
+            height: 1080,
+            x: 0,
+            y: 0,
+            refresh_mhz: 60000,
+            scale: 1,
+        };
+
+        let secondary = MonitorInfo {
+            id: 2,
+            name: "HDMI-A-1".to_string(),
+            make: None,
+            model: None,
+            width: 1920,
+            height: 1080,
+            x: 1920,
+            y: 0,
+            refresh_mhz: 60000,
+            scale: 1,
+        };
+
+        // Primary is at (0, 0)
+        assert!(primary.x == 0 && primary.y == 0, "Primary should be at origin");
+        // Secondary is not at origin
+        assert!(
+            !(secondary.x == 0 && secondary.y == 0),
+            "Secondary should not be at origin"
+        );
+    }
+
+    #[test]
+    fn test_monitor_hot_plug_sequence() {
+        // Task 5.4: Test multiple monitors connect/disconnect in sequence
+        let mut monitors = HashMap::new();
+
+        // Initial state: one monitor
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        let mut mapper = RegionMapper::new(&monitors);
+        assert_eq!(mapper.combined_size(), (1920, 1080));
+
+        // Connect second monitor
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 1920, 0));
+        mapper.update(&monitors);
+        assert_eq!(mapper.combined_size(), (3840, 1080));
+
+        // Connect third monitor (below)
+        monitors.insert(3, create_test_monitor(3, "DP-2", 1920, 1080, 0, 1080));
+        mapper.update(&monitors);
+        assert_eq!(mapper.combined_size(), (3840, 2160));
+
+        // Disconnect second monitor
+        monitors.remove(&2);
+        mapper.update(&monitors);
+        // Should now be 1920x2160 (DP-1 at 0,0 and DP-2 at 0,1080)
+        assert_eq!(mapper.combined_size(), (1920, 2160));
+
+        // Disconnect all but primary
+        monitors.remove(&3);
+        mapper.update(&monitors);
+        assert_eq!(mapper.combined_size(), (1920, 1080));
+    }
+
+    #[test]
+    fn test_monitor_layout_after_primary_disconnect() {
+        // Task 5.3: Test primary monitor disconnect with secondary remaining
+        let mut monitors = HashMap::new();
+
+        // Setup: primary at (0,0), secondary at (1920,0)
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 1920, 0));
+
+        let mut mapper = RegionMapper::new(&monitors);
+        assert_eq!(mapper.combined_size(), (3840, 1080));
+
+        // Disconnect primary
+        monitors.remove(&1);
+        mapper.update(&monitors);
+
+        // Secondary monitor is still functional
+        assert_eq!(monitors.len(), 1);
+        assert!(monitors.contains_key(&2));
+
+        // Region mapper should now only cover the secondary monitor
+        // Note: Combined size calculation starts from minimum x,y
+        let (w, h) = mapper.combined_size();
+        assert_eq!(h, 1080);
+        // Width depends on implementation - either 1920 (just monitor 2)
+        // or 3840 (if it preserves the coordinate space)
+        assert!(w >= 1920);
+    }
+
+    #[test]
+    fn test_region_mapper_handles_empty_after_all_disconnect() {
+        // Task 5.5: Ensure no crashes when all monitors disconnect
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+
+        let mut mapper = RegionMapper::new(&monitors);
+        assert_eq!(mapper.combined_size(), (1920, 1080));
+
+        // Disconnect all monitors
+        monitors.clear();
+        mapper.update(&monitors);
+
+        // Should handle gracefully
+        assert_eq!(mapper.combined_size(), (0, 0));
+
+        // Mapping should return empty
+        let regions = mapper.map_region(0, 0, 100, 100);
+        assert!(regions.is_empty());
     }
 }

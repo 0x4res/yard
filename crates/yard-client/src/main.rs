@@ -770,6 +770,41 @@ fn run_event_loop(
                         }
                     }
                 }
+                // Story 3.6: Handle monitor hot-plug events
+                WindowEvent::MonitorConnected { monitor } => {
+                    info!(
+                        "Monitor connected: {} ({}x{} at {}, {})",
+                        monitor.name, monitor.width, monitor.height, monitor.x, monitor.y
+                    );
+                }
+                WindowEvent::MonitorDisconnected { monitor_id } => {
+                    info!("Monitor disconnected: id={}", monitor_id);
+                }
+                WindowEvent::MonitorLayoutChanged { monitors } => {
+                    // Story 3.6: Notify server of monitor layout change via DISPLAYCONTROL
+                    info!(
+                        "Monitor layout changed: {} monitor(s)",
+                        monitors.len()
+                    );
+                    // Convert MonitorInfo to RdpMonitorLayout
+                    let rdp_monitors: Vec<yard_protocol::RdpMonitorLayout> = monitors
+                        .iter()
+                        .map(|m| yard_protocol::RdpMonitorLayout {
+                            id: m.id,
+                            width: m.width,
+                            height: m.height,
+                            x: m.x,
+                            y: m.y,
+                            is_primary: m.x == 0 && m.y == 0,
+                        })
+                        .collect();
+                    if to_network_tx
+                        .blocking_send(ToNetwork::UpdateMonitorLayout { monitors: rdp_monitors })
+                        .is_err()
+                    {
+                        error!("Failed to send monitor layout update to network thread");
+                    }
+                }
             }
         }
     }

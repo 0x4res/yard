@@ -9,6 +9,6 @@ pub mod messages;
 pub use connection::spawn_network_thread;
 pub use messages::{
     CertificateInfo, ConnectionConfig, ConnectionError, DecodedFrame, DesktopSize, FromNetwork,
-    MouseButton, RdpMonitorInfo, ToNetwork, VideoCodec, validate_monitor_layout,
+    MouseButton, RdpMonitorInfo, RdpMonitorLayout, ToNetwork, VideoCodec, validate_monitor_layout,
 };
 pub use yard_core::prelude::*;
