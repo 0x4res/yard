@@ -21,13 +21,14 @@ mod linux {
     use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
     use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
     use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+    use smithay_client_toolkit::reexports::csd_frame::WindowState;
     use smithay_client_toolkit::seat::keyboard::{
-        KeyEvent, KeyboardHandler, Keysym, Modifiers, RepeatInfo,
+        KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers,
     };
     use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
     use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
     use smithay_client_toolkit::shell::xdg::window::{
-        Window, WindowConfigure, WindowDecorations, WindowHandler, WindowState,
+        Window, WindowConfigure, WindowDecorations, WindowHandler,
     };
     use smithay_client_toolkit::shell::xdg::XdgShell;
     use smithay_client_toolkit::shell::WaylandSurface;
@@ -828,13 +829,24 @@ mod linux {
             _keyboard: &WlKeyboard,
             _serial: u32,
             modifiers: Modifiers,
-            _raw_modifiers: u32,
+            _raw_modifiers: RawModifiers,
+            _layout: u32,
         ) {
             self.modifiers = modifiers;
         }
 
-        fn repeat_info(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &WlKeyboard, _repeat_info: RepeatInfo) {
-            // Key repeat is handled by the compositor
+        fn repeat_key(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _keyboard: &WlKeyboard,
+            _serial: u32,
+            event: KeyEvent,
+        ) {
+            // Forward repeated keys to remote (same as press_key but for repeats)
+            if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw_code) {
+                let _ = self.event_tx.send(WindowEvent::KeyPressed { scancode });
+            }
         }
     }
 
