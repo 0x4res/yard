@@ -60,6 +60,57 @@ impl RdpMonitorInfo {
         self.physical_height_mm = Some(height_mm);
         self
     }
+
+    /// Validates that the primary monitor is at the origin (0, 0).
+    ///
+    /// Per RDP specification, the primary monitor must be positioned at (0, 0).
+    /// Returns `true` if valid or if this is not the primary monitor.
+    pub fn is_position_valid(&self) -> bool {
+        !self.is_primary || (self.x == 0 && self.y == 0)
+    }
+}
+
+/// Validates a monitor layout for RDP compliance.
+///
+/// Returns `Ok(())` if valid, or an error message describing the issue.
+pub fn validate_monitor_layout(monitors: &[RdpMonitorInfo]) -> Result<(), String> {
+    if monitors.is_empty() {
+        return Err("Monitor layout cannot be empty".to_string());
+    }
+
+    // Count primary monitors
+    let primary_count = monitors.iter().filter(|m| m.is_primary).count();
+    if primary_count == 0 {
+        return Err("Monitor layout must have exactly one primary monitor (found none)".to_string());
+    }
+    if primary_count > 1 {
+        return Err(format!(
+            "Monitor layout must have exactly one primary monitor (found {})",
+            primary_count
+        ));
+    }
+
+    // Validate primary monitor position
+    if let Some(primary) = monitors.iter().find(|m| m.is_primary) {
+        if !primary.is_position_valid() {
+            return Err(format!(
+                "Primary monitor must be at position (0, 0), found ({}, {})",
+                primary.x, primary.y
+            ));
+        }
+    }
+
+    // Validate dimensions
+    for (i, m) in monitors.iter().enumerate() {
+        if m.width == 0 || m.height == 0 {
+            return Err(format!(
+                "Monitor {} has invalid dimensions: {}x{}",
+                i, m.width, m.height
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Configuration for establishing an RDP connection.
@@ -891,5 +942,82 @@ mod tests {
         let msg = FromNetwork::MultiMonitorNotSupported;
         let debug = format!("{:?}", msg);
         assert!(debug.contains("MultiMonitorNotSupported"));
+    }
+
+    // Story 3.2: Monitor layout validation tests
+    #[test]
+    fn test_validate_monitor_layout_valid_single() {
+        let monitors = vec![RdpMonitorInfo::new(0, 0, 1920, 1080, true)];
+        assert!(super::validate_monitor_layout(&monitors).is_ok());
+    }
+
+    #[test]
+    fn test_validate_monitor_layout_valid_dual() {
+        let monitors = vec![
+            RdpMonitorInfo::new(0, 0, 1920, 1080, true),
+            RdpMonitorInfo::new(1920, 0, 1920, 1080, false),
+        ];
+        assert!(super::validate_monitor_layout(&monitors).is_ok());
+    }
+
+    #[test]
+    fn test_validate_monitor_layout_empty() {
+        let monitors: Vec<RdpMonitorInfo> = vec![];
+        let result = super::validate_monitor_layout(&monitors);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_monitor_layout_no_primary() {
+        let monitors = vec![
+            RdpMonitorInfo::new(0, 0, 1920, 1080, false),
+            RdpMonitorInfo::new(1920, 0, 1920, 1080, false),
+        ];
+        let result = super::validate_monitor_layout(&monitors);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("found none"));
+    }
+
+    #[test]
+    fn test_validate_monitor_layout_two_primaries() {
+        let monitors = vec![
+            RdpMonitorInfo::new(0, 0, 1920, 1080, true),
+            RdpMonitorInfo::new(1920, 0, 1920, 1080, true),
+        ];
+        let result = super::validate_monitor_layout(&monitors);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("found 2"));
+    }
+
+    #[test]
+    fn test_validate_monitor_layout_primary_not_at_origin() {
+        let monitors = vec![RdpMonitorInfo::new(100, 50, 1920, 1080, true)];
+        let result = super::validate_monitor_layout(&monitors);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("(0, 0)"));
+    }
+
+    #[test]
+    fn test_validate_monitor_layout_zero_dimensions() {
+        let monitors = vec![RdpMonitorInfo::new(0, 0, 0, 1080, true)];
+        let result = super::validate_monitor_layout(&monitors);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid dimensions"));
+    }
+
+    #[test]
+    fn test_rdp_monitor_info_is_position_valid() {
+        // Primary at origin is valid
+        let primary_valid = RdpMonitorInfo::new(0, 0, 1920, 1080, true);
+        assert!(primary_valid.is_position_valid());
+
+        // Primary not at origin is invalid
+        let primary_invalid = RdpMonitorInfo::new(100, 0, 1920, 1080, true);
+        assert!(!primary_invalid.is_position_valid());
+
+        // Secondary can be anywhere
+        let secondary = RdpMonitorInfo::new(1920, -500, 2560, 1440, false);
+        assert!(secondary.is_position_valid());
     }
 }
