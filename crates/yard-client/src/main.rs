@@ -525,6 +525,12 @@ fn run_event_loop(
                             debug!("Toggle fullscreen shortcut received");
                             window.toggle_fullscreen();
                         }
+                        KeyboardShortcut::Disconnect => {
+                            info!("Disconnect shortcut received (Ctrl+Alt+End)");
+                            // Request graceful disconnect - exit the event loop
+                            // The network thread will be notified when we drop the sender
+                            return Ok(exit_codes::SUCCESS);
+                        }
                     }
                 }
                 WindowEvent::KeyPressed { scancode } => {

@@ -85,6 +85,8 @@ mod linux {
     pub enum KeyboardShortcut {
         /// Toggle fullscreen mode (Ctrl+Alt+Enter).
         ToggleFullscreen,
+        /// Disconnect from remote session (Ctrl+Alt+End).
+        Disconnect,
     }
 
     /// Configuration for creating a Wayland window.
@@ -805,6 +807,15 @@ mod linux {
                 return; // Don't forward client shortcuts to remote
             }
 
+            // Ctrl+Alt+End disconnects (FR43, Story 2.8)
+            if self.modifiers.ctrl && self.modifiers.alt && event.keysym == Keysym::End {
+                tracing::debug!("Ctrl+Alt+End detected - requesting disconnect");
+                let _ = self
+                    .event_tx
+                    .send(WindowEvent::KeyboardShortcut(KeyboardShortcut::Disconnect));
+                return; // Don't forward client shortcuts to remote
+            }
+
             // Translate evdev keycode to RDP scancode and forward
             if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw_code) {
                 tracing::trace!(
@@ -1035,6 +1046,8 @@ mod stub {
     pub enum KeyboardShortcut {
         /// Toggle fullscreen mode (Ctrl+Alt+Enter).
         ToggleFullscreen,
+        /// Disconnect from remote session (Ctrl+Alt+End).
+        Disconnect,
     }
 
     /// Stub WindowConfig for non-Linux platforms.

@@ -94,6 +94,15 @@ pub fn wayland_to_rdp_scancode(raw_keycode: u32) -> Option<u16> {
         183 => Some(0x64), // KEY_F13
         184 => Some(0x65), // KEY_F14
         185 => Some(0x66), // KEY_F15
+        186 => Some(0x67), // KEY_F16
+        187 => Some(0x68), // KEY_F17
+        188 => Some(0x69), // KEY_F18
+        189 => Some(0x6A), // KEY_F19
+        190 => Some(0x6B), // KEY_F20
+        191 => Some(0x6C), // KEY_F21
+        192 => Some(0x6D), // KEY_F22
+        193 => Some(0x6E), // KEY_F23
+        194 => Some(0x6F), // KEY_F24
 
         // Number row
         2 => Some(0x02),  // KEY_1
@@ -195,19 +204,18 @@ pub fn wayland_to_rdp_scancode(raw_keycode: u32) -> Option<u16> {
 /// Checks if a scancode represents an extended key.
 ///
 /// Extended keys have the 0xE0 prefix in their high byte.
-///
-/// Note: Currently unused but kept for future mouse input handling (Story 2.7).
+/// Used in tests to verify correct scancode generation for extended keys
+/// like arrow keys, navigation cluster, and Windows keys.
 #[inline]
-#[allow(dead_code)]
 pub fn is_extended_scancode(scancode: u16) -> bool {
     (scancode & 0xFF00) == 0xE000
 }
 
 /// Gets the base scancode without the extended prefix.
 ///
-/// Note: Currently unused but kept for future mouse input handling (Story 2.7).
+/// Extracts the low byte from a scancode, removing the 0xE0 prefix if present.
+/// Useful for debugging and comparing scancodes.
 #[inline]
-#[allow(dead_code)]
 pub fn base_scancode(scancode: u16) -> u8 {
     (scancode & 0xFF) as u8
 }
@@ -240,6 +248,24 @@ mod tests {
         assert_eq!(wayland_to_rdp_scancode(68), Some(0x44)); // F10
         assert_eq!(wayland_to_rdp_scancode(87), Some(0x57)); // F11
         assert_eq!(wayland_to_rdp_scancode(88), Some(0x58)); // F12
+    }
+
+    #[test]
+    fn test_extended_function_keys() {
+        // F13-F15
+        assert_eq!(wayland_to_rdp_scancode(183), Some(0x64)); // F13
+        assert_eq!(wayland_to_rdp_scancode(184), Some(0x65)); // F14
+        assert_eq!(wayland_to_rdp_scancode(185), Some(0x66)); // F15
+        // F16-F24
+        assert_eq!(wayland_to_rdp_scancode(186), Some(0x67)); // F16
+        assert_eq!(wayland_to_rdp_scancode(187), Some(0x68)); // F17
+        assert_eq!(wayland_to_rdp_scancode(188), Some(0x69)); // F18
+        assert_eq!(wayland_to_rdp_scancode(189), Some(0x6A)); // F19
+        assert_eq!(wayland_to_rdp_scancode(190), Some(0x6B)); // F20
+        assert_eq!(wayland_to_rdp_scancode(191), Some(0x6C)); // F21
+        assert_eq!(wayland_to_rdp_scancode(192), Some(0x6D)); // F22
+        assert_eq!(wayland_to_rdp_scancode(193), Some(0x6E)); // F23
+        assert_eq!(wayland_to_rdp_scancode(194), Some(0x6F)); // F24
     }
 
     #[test]
@@ -308,5 +334,51 @@ mod tests {
         assert_eq!(base_scancode(0x1E), 0x1E);
         assert_eq!(base_scancode(0xE048), 0x48);
         assert_eq!(base_scancode(0xE01D), 0x1D);
+    }
+
+    #[test]
+    fn test_windows_keys() {
+        // Windows/Super keys are extended
+        assert_eq!(wayland_to_rdp_scancode(125), Some(0xE05B)); // Left Windows
+        assert_eq!(wayland_to_rdp_scancode(126), Some(0xE05C)); // Right Windows
+        assert_eq!(wayland_to_rdp_scancode(127), Some(0xE05D)); // Menu/Apps key
+
+        // Verify they are extended
+        assert!(is_extended_scancode(0xE05B));
+        assert!(is_extended_scancode(0xE05C));
+        assert!(is_extended_scancode(0xE05D));
+    }
+
+    #[test]
+    fn test_print_screen_and_pause() {
+        // Print Screen (SysRq) - extended
+        assert_eq!(wayland_to_rdp_scancode(99), Some(0xE037));
+        assert!(is_extended_scancode(0xE037));
+
+        // Pause/Break - extended (simplified mapping)
+        assert_eq!(wayland_to_rdp_scancode(119), Some(0xE046));
+        assert!(is_extended_scancode(0xE046));
+    }
+
+    #[test]
+    fn test_lock_keys() {
+        // Lock keys are NOT extended (standard scancodes)
+        assert_eq!(wayland_to_rdp_scancode(58), Some(0x3A)); // Caps Lock
+        assert_eq!(wayland_to_rdp_scancode(69), Some(0x45)); // Num Lock
+        assert_eq!(wayland_to_rdp_scancode(70), Some(0x46)); // Scroll Lock
+
+        assert!(!is_extended_scancode(0x3A));
+        assert!(!is_extended_scancode(0x45));
+        assert!(!is_extended_scancode(0x46));
+    }
+
+    #[test]
+    fn test_keypad_special_keys() {
+        // Keypad Enter and Keypad / are extended
+        assert_eq!(wayland_to_rdp_scancode(96), Some(0xE01C)); // Keypad Enter
+        assert_eq!(wayland_to_rdp_scancode(98), Some(0xE035)); // Keypad /
+
+        assert!(is_extended_scancode(0xE01C));
+        assert!(is_extended_scancode(0xE035));
     }
 }
