@@ -372,6 +372,18 @@ fn run_event_loop(
             Some(FromNetwork::Frame(_)) => {
                 // Frames received before window created are discarded
             }
+            Some(FromNetwork::MonitorLayoutAccepted { desktop_size: size }) => {
+                // Multi-monitor layout accepted - update desktop size
+                info!(
+                    "Multi-monitor layout accepted: {}x{}",
+                    size.width, size.height
+                );
+                desktop_size = Some(size);
+            }
+            Some(FromNetwork::MultiMonitorNotSupported) => {
+                // Server doesn't support multi-monitor, continue with single monitor
+                warn!("Server does not support multi-monitor mode");
+            }
             None => {
                 error!("Network thread terminated unexpectedly");
                 return Ok(exit_codes::CONNECTION_ERROR);
@@ -473,6 +485,14 @@ fn run_event_loop(
                 }
                 Ok(FromNetwork::Connected(_)) => {
                     // Already handled before window creation
+                }
+                Ok(FromNetwork::MonitorLayoutAccepted { .. }) => {
+                    // Monitor layout updates during session - could resize window
+                    // For now, log and continue
+                    debug!("Monitor layout updated during session");
+                }
+                Ok(FromNetwork::MultiMonitorNotSupported) => {
+                    // Already warned during connection
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -788,6 +808,18 @@ fn run_event_loop(
             }
             Some(FromNetwork::Frame(_)) => {
                 // Frames discarded on non-Linux (no window)
+            }
+            Some(FromNetwork::MonitorLayoutAccepted { desktop_size: size }) => {
+                // Multi-monitor layout accepted - update desktop size
+                info!(
+                    "Multi-monitor layout accepted: {}x{}",
+                    size.width, size.height
+                );
+                _desktop_size = Some(size);
+            }
+            Some(FromNetwork::MultiMonitorNotSupported) => {
+                // Server doesn't support multi-monitor, continue with single monitor
+                warn!("Server does not support multi-monitor mode");
             }
             None => {
                 error!("Network thread terminated unexpectedly");

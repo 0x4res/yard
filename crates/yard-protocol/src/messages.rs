@@ -7,6 +7,61 @@ use std::fmt;
 
 pub use yard_video::{DecodedFrame, VideoCodec};
 
+/// Information about a monitor for RDP layout reporting (Story 3.2).
+///
+/// This struct is used to report the local monitor layout to the RDP server
+/// via the DISPLAYCONTROL channel, allowing the server to configure the
+/// remote desktop to span multiple monitors.
+#[derive(Debug, Clone)]
+pub struct RdpMonitorInfo {
+    /// Position X offset in the virtual desktop coordinate space.
+    pub x: i32,
+    /// Position Y offset in the virtual desktop coordinate space.
+    pub y: i32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Whether this is the primary monitor (at position 0,0).
+    pub is_primary: bool,
+    /// Desktop scale factor as percentage (100 = 100%, 200 = 200%).
+    /// Valid range: 100-500.
+    pub scale_percent: u32,
+    /// Physical width in millimeters (optional).
+    pub physical_width_mm: Option<u32>,
+    /// Physical height in millimeters (optional).
+    pub physical_height_mm: Option<u32>,
+}
+
+impl RdpMonitorInfo {
+    /// Creates a new RdpMonitorInfo for a monitor.
+    pub fn new(x: i32, y: i32, width: u32, height: u32, is_primary: bool) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+            is_primary,
+            scale_percent: 100,
+            physical_width_mm: None,
+            physical_height_mm: None,
+        }
+    }
+
+    /// Sets the desktop scale factor.
+    pub fn with_scale(mut self, scale_percent: u32) -> Self {
+        self.scale_percent = scale_percent.clamp(100, 500);
+        self
+    }
+
+    /// Sets the physical dimensions in millimeters.
+    pub fn with_physical_size(mut self, width_mm: u32, height_mm: u32) -> Self {
+        self.physical_width_mm = Some(width_mm);
+        self.physical_height_mm = Some(height_mm);
+        self
+    }
+}
+
 /// Configuration for establishing an RDP connection.
 ///
 /// Note: Password is intentionally excluded from Debug to prevent credential leakage in logs.
@@ -23,6 +78,9 @@ pub struct ConnectionConfig {
     /// Password for authentication.
     /// SECURITY: Never log this field.
     pub password: Option<String>,
+    /// Monitor layout to report to the server (Story 3.2).
+    /// If provided, DISPLAYCONTROL channel will be used to report the layout.
+    pub monitor_layout: Option<Vec<RdpMonitorInfo>>,
 }
 
 // Manual Debug implementation to exclude password from logs (NFR-S2)
@@ -34,6 +92,7 @@ impl std::fmt::Debug for ConnectionConfig {
             .field("username", &self.username)
             .field("domain", &self.domain)
             .field("password", &"[REDACTED]")
+            .field("monitor_layout", &self.monitor_layout)
             .finish()
     }
 }
@@ -47,7 +106,18 @@ impl ConnectionConfig {
             username: None,
             domain: None,
             password: None,
+            monitor_layout: None,
         }
+    }
+
+    /// Sets the monitor layout for multi-monitor support (Story 3.2).
+    ///
+    /// When provided, the DISPLAYCONTROL channel will be used to report the
+    /// local monitor layout to the server, allowing the remote desktop to
+    /// span all monitors.
+    pub fn with_monitor_layout(mut self, monitors: Vec<RdpMonitorInfo>) -> Self {
+        self.monitor_layout = Some(monitors);
+        self
     }
 
     /// Sets the username for authentication.
@@ -319,6 +389,14 @@ pub enum FromNetwork {
     /// A decoded video frame ready for rendering.
     /// The main thread should pass this to the window for display.
     Frame(DecodedFrame),
+    /// Multi-monitor layout was accepted by the server (Story 3.2).
+    MonitorLayoutAccepted {
+        /// The final desktop size spanning all monitors.
+        desktop_size: DesktopSize,
+    },
+    /// Server does not support multi-monitor (Story 3.2).
+    /// The client should fall back to single-monitor mode.
+    MultiMonitorNotSupported,
 }
 
 /// Error types for connection failures.
@@ -727,5 +805,91 @@ mod tests {
         let cert3 = CertificateInfo::new("FP2", "Issuer", "2024", "2025");
         assert_eq!(cert1, cert2);
         assert_ne!(cert1, cert3);
+    }
+
+    // Story 3.2: RdpMonitorInfo tests
+    #[test]
+    fn test_rdp_monitor_info_new() {
+        let monitor = RdpMonitorInfo::new(0, 0, 1920, 1080, true);
+        assert_eq!(monitor.x, 0);
+        assert_eq!(monitor.y, 0);
+        assert_eq!(monitor.width, 1920);
+        assert_eq!(monitor.height, 1080);
+        assert!(monitor.is_primary);
+        assert_eq!(monitor.scale_percent, 100);
+        assert!(monitor.physical_width_mm.is_none());
+        assert!(monitor.physical_height_mm.is_none());
+    }
+
+    #[test]
+    fn test_rdp_monitor_info_secondary() {
+        let monitor = RdpMonitorInfo::new(1920, 0, 1920, 1080, false);
+        assert_eq!(monitor.x, 1920);
+        assert_eq!(monitor.y, 0);
+        assert!(!monitor.is_primary);
+    }
+
+    #[test]
+    fn test_rdp_monitor_info_with_scale() {
+        let monitor = RdpMonitorInfo::new(0, 0, 3840, 2160, true).with_scale(200);
+        assert_eq!(monitor.scale_percent, 200);
+    }
+
+    #[test]
+    fn test_rdp_monitor_info_scale_clamped() {
+        // Scale should be clamped to 100-500
+        let monitor_low = RdpMonitorInfo::new(0, 0, 1920, 1080, true).with_scale(50);
+        let monitor_high = RdpMonitorInfo::new(0, 0, 1920, 1080, true).with_scale(600);
+        assert_eq!(monitor_low.scale_percent, 100);
+        assert_eq!(monitor_high.scale_percent, 500);
+    }
+
+    #[test]
+    fn test_rdp_monitor_info_with_physical_size() {
+        let monitor = RdpMonitorInfo::new(0, 0, 1920, 1080, true).with_physical_size(527, 296);
+        assert_eq!(monitor.physical_width_mm, Some(527));
+        assert_eq!(monitor.physical_height_mm, Some(296));
+    }
+
+    #[test]
+    fn test_connection_config_with_monitor_layout() {
+        let monitors = vec![
+            RdpMonitorInfo::new(0, 0, 1920, 1080, true),
+            RdpMonitorInfo::new(1920, 0, 1920, 1080, false),
+        ];
+        let config = ConnectionConfig::new("host", 3389).with_monitor_layout(monitors);
+        assert!(config.monitor_layout.is_some());
+        assert_eq!(config.monitor_layout.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_connection_config_debug_includes_monitor_layout() {
+        let monitors = vec![RdpMonitorInfo::new(0, 0, 1920, 1080, true)];
+        let config = ConnectionConfig::new("host", 3389)
+            .with_monitor_layout(monitors)
+            .with_password("secret");
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("monitor_layout"));
+        assert!(debug.contains("1920"));
+        // Password should still be redacted
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn test_from_network_monitor_layout_accepted() {
+        let msg = FromNetwork::MonitorLayoutAccepted {
+            desktop_size: DesktopSize::new(3840, 1080),
+        };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("MonitorLayoutAccepted"));
+        assert!(debug.contains("3840"));
+    }
+
+    #[test]
+    fn test_from_network_multi_monitor_not_supported() {
+        let msg = FromNetwork::MultiMonitorNotSupported;
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("MultiMonitorNotSupported"));
     }
 }

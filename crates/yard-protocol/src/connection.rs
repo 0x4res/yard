@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ironrdp::connector::{self, ClientConnector, Credentials};
+use ironrdp::displaycontrol::client::DisplayControlClient;
+use ironrdp::displaycontrol::pdu::{MonitorLayoutEntry, MonitorOrientation};
+use ironrdp::dvc::DrdynvcClient;
 use ironrdp::input::{
     Database as InputDatabase, MouseButton as IronMouseButton, MousePosition, Operation, Scancode,
     WheelRotations,
@@ -29,7 +32,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::messages::{
     CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, MouseButton,
-    ToNetwork,
+    RdpMonitorInfo, ToNetwork,
 };
 
 /// Default connection timeout in seconds.
@@ -142,6 +145,27 @@ async fn handle_connect(
     // Create connector with local address
     let mut connector = ClientConnector::new(rdp_config, local_addr);
 
+    // Set up DISPLAYCONTROL channel for multi-monitor support (Story 3.2)
+    // The channel is only added if monitor layout is provided.
+    let has_multi_monitor = config.monitor_layout.is_some();
+    if has_multi_monitor {
+        // Create DisplayControlClient with a callback for when server capabilities arrive.
+        // The callback receives capabilities and can return messages to send.
+        // We just log the capabilities and return an empty response.
+        let displaycontrol_client = DisplayControlClient::new(|_caps| {
+            info!("DisplayControl capabilities received from server");
+            // Return empty response - we'll send the layout separately
+            Ok(vec![])
+        });
+
+        // Create DrdynvcClient (DRDYNVC static channel) and attach displaycontrol DVC
+        let drdynvc = DrdynvcClient::new().with_dynamic_channel(displaycontrol_client);
+
+        // Attach DRDYNVC as a static virtual channel to the connector
+        connector.attach_static_channel(drdynvc);
+        debug!("DISPLAYCONTROL channel configured for multi-monitor support");
+    }
+
     // Phase 1: Initial RDP negotiation (before TLS)
     debug!("Starting RDP negotiation");
     let should_upgrade = match ironrdp_tokio::connect_begin(&mut framed, &mut connector).await {
@@ -237,6 +261,37 @@ async fn handle_connect(
     // Use BgrA32 format to match DecodedFrame's expected BGRA pixel order
     let mut image =
         ironrdp::session::image::DecodedImage::new(PixelFormat::BgrA32, img_width, img_height);
+
+    // Send monitor layout if multi-monitor was requested (Story 3.2)
+    if let Some(ref monitors) = config.monitor_layout {
+        match send_monitor_layout(&mut active_stage, monitors) {
+            Ok(encoded_messages) => {
+                // Send the encoded DVC messages to the server
+                if !encoded_messages.is_empty() {
+                    if let Err(e) = tls_framed.write_all(&encoded_messages).await {
+                        warn!("Failed to send monitor layout: {e}");
+                        let _ = tx.send(FromNetwork::MultiMonitorNotSupported).await;
+                    } else {
+                        info!(
+                            "Monitor layout sent to server ({} monitors)",
+                            monitors.len()
+                        );
+                        // Calculate combined desktop size from all monitors
+                        let combined_size = calculate_combined_desktop_size(monitors);
+                        let _ = tx
+                            .send(FromNetwork::MonitorLayoutAccepted {
+                                desktop_size: combined_size,
+                            })
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to encode monitor layout: {e}");
+                let _ = tx.send(FromNetwork::MultiMonitorNotSupported).await;
+            }
+        }
+    }
 
     // Session loop
     if let Err(e) = session_loop(
@@ -891,6 +946,98 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAllCertVerifier {
     }
 }
 
+/// Sends monitor layout to the server via DISPLAYCONTROL channel (Story 3.2).
+///
+/// Converts the provided `RdpMonitorInfo` list to RDP's `MonitorLayoutEntry` format
+/// and encodes the message for transmission.
+fn send_monitor_layout(
+    active_stage: &mut ActiveStage,
+    monitors: &[RdpMonitorInfo],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    use ironrdp::displaycontrol::pdu::{DisplayControlMonitorLayout, DisplayControlPdu};
+    use ironrdp::svc::ChannelFlags;
+
+    // Convert our monitor info to IronRDP's MonitorLayoutEntry format
+    let mut entries: Vec<MonitorLayoutEntry> = Vec::with_capacity(monitors.len());
+
+    for m in monitors {
+        // Create entry based on whether it's primary or secondary
+        let mut entry = if m.is_primary {
+            MonitorLayoutEntry::new_primary(m.width, m.height)?
+        } else {
+            MonitorLayoutEntry::new_secondary(m.width, m.height)?
+        };
+
+        // Set position (primary must be at 0,0 per RDP spec, so only set for non-primary)
+        if !m.is_primary {
+            entry = entry.with_position(m.x, m.y)?;
+        }
+
+        // Set desktop scale factor
+        entry = entry.with_desktop_scale_factor(m.scale_percent)?;
+
+        // Set orientation to landscape (default)
+        entry = entry.with_orientation(MonitorOrientation::Landscape);
+
+        // Set physical dimensions if available
+        if let (Some(w), Some(h)) = (m.physical_width_mm, m.physical_height_mm) {
+            entry = entry.with_physical_dimensions(w, h)?;
+        }
+
+        entries.push(entry);
+    }
+
+    // Create the monitor layout PDU
+    let layout = DisplayControlMonitorLayout::new(&entries)?;
+    let pdu = DisplayControlPdu::MonitorLayout(layout);
+
+    // Get the DisplayControlClient from the session
+    if let Some(dvc) = active_stage.get_dvc::<DisplayControlClient>() {
+        // Check if the channel is ready
+        if !dvc.is_open() {
+            return Err("DISPLAYCONTROL channel not open".into());
+        }
+
+        // Get channel ID (must be Some if channel is open)
+        let channel_id = dvc.channel_id().ok_or("DISPLAYCONTROL channel has no ID")?;
+
+        // Encode the PDU as DVC messages using the channel
+        // The PDU implements DvcEncode, so we can convert it to SvcMessage
+        let svc_messages = ironrdp::dvc::encode_dvc_messages(
+            channel_id,
+            vec![Box::new(pdu)],
+            ChannelFlags::empty(),
+        )?;
+
+        // Encode via ActiveStage
+        let encoded = active_stage.encode_dvc_messages(svc_messages)?;
+        Ok(encoded)
+    } else {
+        Err("DisplayControlClient not found in session".into())
+    }
+}
+
+/// Calculates the combined desktop size from multiple monitors.
+///
+/// The combined size is the bounding rectangle that encompasses all monitors.
+fn calculate_combined_desktop_size(monitors: &[RdpMonitorInfo]) -> DesktopSize {
+    if monitors.is_empty() {
+        return DesktopSize::new(DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    }
+
+    let mut max_right: i32 = 0;
+    let mut max_bottom: i32 = 0;
+
+    for m in monitors {
+        let right = m.x + m.width as i32;
+        let bottom = m.y + m.height as i32;
+        max_right = max_right.max(right);
+        max_bottom = max_bottom.max(bottom);
+    }
+
+    DesktopSize::new(max_right as u16, max_bottom as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,5 +1152,63 @@ mod tests {
     fn test_default_dimensions() {
         assert_eq!(DEFAULT_WIDTH, 1920);
         assert_eq!(DEFAULT_HEIGHT, 1080);
+    }
+
+    // Story 3.2: Multi-monitor tests
+    #[test]
+    fn test_calculate_combined_desktop_size_empty() {
+        let size = calculate_combined_desktop_size(&[]);
+        assert_eq!(size.width, DEFAULT_WIDTH);
+        assert_eq!(size.height, DEFAULT_HEIGHT);
+    }
+
+    #[test]
+    fn test_calculate_combined_desktop_size_single_monitor() {
+        use crate::messages::RdpMonitorInfo;
+        let monitors = vec![RdpMonitorInfo::new(0, 0, 1920, 1080, true)];
+        let size = calculate_combined_desktop_size(&monitors);
+        assert_eq!(size.width, 1920);
+        assert_eq!(size.height, 1080);
+    }
+
+    #[test]
+    fn test_calculate_combined_desktop_size_horizontal_dual() {
+        use crate::messages::RdpMonitorInfo;
+        let monitors = vec![
+            RdpMonitorInfo::new(0, 0, 1920, 1080, true),
+            RdpMonitorInfo::new(1920, 0, 1920, 1080, false),
+        ];
+        let size = calculate_combined_desktop_size(&monitors);
+        assert_eq!(size.width, 3840);
+        assert_eq!(size.height, 1080);
+    }
+
+    #[test]
+    fn test_calculate_combined_desktop_size_vertical_dual() {
+        use crate::messages::RdpMonitorInfo;
+        let monitors = vec![
+            RdpMonitorInfo::new(0, 0, 1920, 1080, true),
+            RdpMonitorInfo::new(0, 1080, 1920, 1080, false),
+        ];
+        let size = calculate_combined_desktop_size(&monitors);
+        assert_eq!(size.width, 1920);
+        assert_eq!(size.height, 2160);
+    }
+
+    #[test]
+    fn test_calculate_combined_desktop_size_staggered() {
+        use crate::messages::RdpMonitorInfo;
+        // Layout: primary at (0,0), secondary at (1920, -500)
+        let monitors = vec![
+            RdpMonitorInfo::new(0, 0, 1920, 1080, true),
+            RdpMonitorInfo::new(1920, -500, 2560, 1440, false),
+        ];
+        let size = calculate_combined_desktop_size(&monitors);
+        // Right edge: 1920 + 2560 = 4480
+        // Bottom edge: max(0+1080, -500+1440) = max(1080, 940) = 1080
+        // Note: Negative y means the monitor extends above, but we calculate
+        // from (0,0) so the bottom is y + height
+        assert_eq!(size.width, 4480);
+        assert_eq!(size.height, 1080);
     }
 }

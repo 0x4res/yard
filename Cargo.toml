@@ -18,7 +18,7 @@ repository = "https://github.com/0x4res/yard"
 
 [workspace.dependencies]
 # RDP Protocol
-ironrdp = { version = "0.14", features = ["connector", "session", "graphics", "input", "pdu", "core"] }
+ironrdp = { version = "0.14", features = ["connector", "session", "graphics", "input", "pdu", "core", "dvc", "displaycontrol", "svc"] }
 ironrdp-graphics = "0.7"
 ironrdp-tls = { version = "0.2", features = ["rustls"] }
 ironrdp-tokio = "0.8"
