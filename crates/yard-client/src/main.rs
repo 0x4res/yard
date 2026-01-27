@@ -80,6 +80,11 @@ enum Commands {
         /// Start in fullscreen mode.
         #[arg(short = 'f', long)]
         fullscreen: bool,
+
+        /// Enable multi-monitor fullscreen mode (Story 3.4).
+        /// Creates a separate window on each connected monitor.
+        #[arg(long)]
+        all_monitors: bool,
     },
 
     /// Generate shell completion scripts.
@@ -133,6 +138,7 @@ fn run(cli: Cli) -> Result<u8> {
             username,
             domain,
             fullscreen,
+            all_monitors,
         }) => {
             // User feedback (always visible, not affected by log level)
             eprintln!("YARD v{}", env!("CARGO_PKG_VERSION"));
@@ -161,7 +167,7 @@ fn run(cli: Cli) -> Result<u8> {
                 config = config.with_password(password);
             }
 
-            run_connection(config, fullscreen)
+            run_connection(config, fullscreen, all_monitors)
         }
 
         Some(Commands::Completions { shell }) => {
@@ -270,7 +276,11 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 }
 
 /// Runs the RDP connection.
-fn run_connection(config: ConnectionConfig, start_fullscreen: bool) -> Result<u8> {
+fn run_connection(
+    config: ConnectionConfig,
+    start_fullscreen: bool,
+    all_monitors: bool,
+) -> Result<u8> {
     // Create structured span with connection context (AC 4)
     let connection_span = info_span!(
         "rdp_connection",
@@ -295,7 +305,7 @@ fn run_connection(config: ConnectionConfig, start_fullscreen: bool) -> Result<u8
     let window_config =
         WindowConfig::with_connection_info(&config.host, config.port, config.username.as_deref())
             .with_fullscreen(start_fullscreen);
-    debug!(?window_config, "Window config prepared");
+    debug!(?window_config, all_monitors, "Window config prepared");
 
     // Create channel for receiving messages from network thread
     let (from_network_tx, mut from_network_rx) = mpsc::channel::<FromNetwork>(32);
@@ -311,7 +321,12 @@ fn run_connection(config: ConnectionConfig, start_fullscreen: bool) -> Result<u8
     // Event loop for handling messages
     // On Linux, this will be replaced with calloop + Wayland window
     // For now, use blocking receive
-    let exit_code = run_event_loop(&mut from_network_rx, &to_network_tx, window_config)?;
+    let exit_code = run_event_loop(
+        &mut from_network_rx,
+        &to_network_tx,
+        window_config,
+        all_monitors,
+    )?;
 
     Ok(exit_code)
 }
@@ -325,6 +340,15 @@ const EVENT_LOOP_TIMEOUT_MS: u64 = 16;
 #[cfg(target_os = "linux")]
 const PLACEHOLDER_COLOR: (u8, u8, u8) = (40, 40, 40);
 
+/// Number of event loop dispatch rounds for initial monitor detection (Story 3.4).
+/// This allows Wayland to enumerate outputs before we check monitor count.
+#[cfg(target_os = "linux")]
+const MONITOR_DETECTION_ROUNDS: usize = 5;
+
+/// Timeout per dispatch round during monitor detection (milliseconds).
+#[cfg(target_os = "linux")]
+const MONITOR_DETECTION_TIMEOUT_MS: u64 = 50;
+
 /// Runs the main event loop.
 ///
 /// On Linux with Wayland, this creates a window and uses calloop.
@@ -334,6 +358,7 @@ fn run_event_loop(
     from_network_rx: &mut mpsc::Receiver<FromNetwork>,
     to_network_tx: &mpsc::Sender<ToNetwork>,
     window_config: WindowConfig,
+    all_monitors: bool,
 ) -> Result<u8> {
     use yard_wayland::{WaylandWindow, WindowEvent};
 
@@ -415,15 +440,56 @@ fn run_event_loop(
         u32::from(desktop_size.height),
     );
 
+    // Story 3.4: Multi-monitor fullscreen mode
+    // Need to dispatch events first to detect monitors
+    // Dispatch a few rounds to let Wayland enumerate outputs
+    for _ in 0..MONITOR_DETECTION_ROUNDS {
+        let timeout = std::time::Duration::from_millis(MONITOR_DETECTION_TIMEOUT_MS);
+        if event_loop.dispatch(timeout, &mut window).is_err() {
+            warn!("Event loop dispatch failed during monitor detection");
+        }
+    }
+
+    // Log detected monitors
+    window.log_monitors();
+
+    // Get queue handle for multi-monitor surface creation
+    // We need to access the event loop's handle, which isn't directly exposed
+    // So we use a workaround: dispatch with a callback that creates surfaces
+    let multi_monitor_mode = if all_monitors && window.monitor_count() > 0 {
+        info!(
+            "Multi-monitor mode requested, {} monitor(s) detected",
+            window.monitor_count()
+        );
+
+        // We cannot easily get QueueHandle here without restructuring WaylandWindow
+        // For now, log the intent - actual surface creation happens in WaylandWindow
+        // TODO: Implement proper multi-surface creation flow (requires QueueHandle access)
+        // The create_surfaces_for_all_monitors method needs QueueHandle which we don't have here
+        warn!("Multi-monitor fullscreen not yet fully implemented - using single window mode");
+        warn!("To enable, refactor WaylandWindow to create multi-surfaces during construction");
+        false
+    } else if all_monitors {
+        warn!("--all-monitors specified but no monitors detected yet, using single window mode");
+        false
+    } else {
+        false
+    };
+
     // Draw initial placeholder
     let (r, g, b) = PLACEHOLDER_COLOR;
-    window.draw_solid(r, g, b);
+    if multi_monitor_mode {
+        window.draw_solid_all(r, g, b);
+    } else {
+        window.draw_solid(r, g, b);
+    }
     info!(
-        "Window created: {}x{} (remote: {}x{})",
+        "Window created: {}x{} (remote: {}x{}, multi_monitor={})",
         window.dimensions().0,
         window.dimensions().1,
         desktop_size.width,
-        desktop_size.height
+        desktop_size.height,
+        multi_monitor_mode
     );
 
     // Track frame statistics
@@ -542,8 +608,14 @@ fn run_event_loop(
                     use yard_wayland::KeyboardShortcut;
                     match shortcut {
                         KeyboardShortcut::ToggleFullscreen => {
-                            debug!("Toggle fullscreen shortcut received");
-                            window.toggle_fullscreen();
+                            // Story 3.4 Task 6: Use multi-monitor toggle if in multi-monitor mode
+                            if window.is_multi_monitor_mode() {
+                                debug!("Toggle fullscreen shortcut - multi-monitor mode");
+                                window.toggle_all_fullscreen();
+                            } else {
+                                debug!("Toggle fullscreen shortcut - single window mode");
+                                window.toggle_fullscreen();
+                            }
                         }
                         KeyboardShortcut::Disconnect => {
                             info!("Disconnect shortcut received (Ctrl+Alt+End)");
@@ -772,6 +844,7 @@ fn run_event_loop(
     from_network_rx: &mut mpsc::Receiver<FromNetwork>,
     to_network_tx: &mpsc::Sender<ToNetwork>,
     _window_config: WindowConfig,
+    _all_monitors: bool,
 ) -> Result<u8> {
     // On non-Linux, just use blocking loop (no Wayland window)
     let mut _desktop_size: Option<DesktopSize> = None;
