@@ -9,6 +9,12 @@ ignore = [
     # No fix is available upstream. IronRDP issue tracking:
     # https://github.com/Devolutions/IronRDP/issues (monitor for updates)
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2023-0089: atomic-polyfill is unmaintained
+    # Transitive dependency via heapless (used by IronRDP)
+    "RUSTSEC-2023-0089",
+    # RUSTSEC-2024-0436: paste is unmaintained
+    # Transitive dependency used by multiple crates
+    "RUSTSEC-2024-0436",
 ]
 # Treat unmaintained crate warnings as allowed (not errors)
 informational_warnings = ["unmaintained"]

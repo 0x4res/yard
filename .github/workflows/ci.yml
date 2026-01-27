@@ -92,6 +92,9 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      checks: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
