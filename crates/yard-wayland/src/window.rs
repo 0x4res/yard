@@ -39,7 +39,42 @@ mod linux {
         delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
         registry_handlers,
     };
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    /// Information about a connected monitor (Story 3.1).
+    ///
+    /// This struct stores all relevant information about a Wayland output,
+    /// including resolution, position, and refresh rate.
+    #[derive(Debug, Clone)]
+    pub struct MonitorInfo {
+        /// Unique Wayland output ID.
+        pub id: u32,
+        /// Monitor name (e.g., "DP-1", "HDMI-A-1").
+        pub name: String,
+        /// Make/manufacturer if available.
+        pub make: Option<String>,
+        /// Model name if available.
+        pub model: Option<String>,
+        /// Current resolution width in pixels.
+        pub width: u32,
+        /// Current resolution height in pixels.
+        pub height: u32,
+        /// Physical position X offset in the compositor's coordinate space.
+        pub x: i32,
+        /// Physical position Y offset in the compositor's coordinate space.
+        pub y: i32,
+        /// Refresh rate in millihertz (e.g., 60000 = 60Hz).
+        pub refresh_mhz: u32,
+        /// Scale factor (1 = no scaling, 2 = HiDPI).
+        pub scale: i32,
+    }
+
+    impl MonitorInfo {
+        /// Returns the refresh rate in Hz (e.g., 60.0).
+        pub fn refresh_hz(&self) -> f64 {
+            self.refresh_mhz as f64 / 1000.0
+        }
+    }
 
     /// Messages sent from the Wayland window to the main application.
     #[derive(Debug)]
@@ -190,6 +225,12 @@ mod linux {
         unicode_keys_pressed: HashSet<u32>,
         /// Current XKB layout index (for logging layout changes).
         current_layout: u32,
+        /// Detected monitors (Story 3.1).
+        /// Maps WlOutput ID to MonitorInfo for quick lookup.
+        monitors: HashMap<u32, MonitorInfo>,
+        /// WlOutput references for fullscreen targeting.
+        /// Kept separate because WlOutput doesn't implement Clone.
+        outputs: HashMap<u32, WlOutput>,
     }
 
     impl WaylandWindow {
@@ -274,6 +315,8 @@ mod linux {
                 remote_height: config.height,
                 unicode_keys_pressed: HashSet::new(),
                 current_layout: 0,
+                monitors: HashMap::new(),
+                outputs: HashMap::new(),
             };
 
             Ok((event_loop, state, event_rx))
@@ -340,6 +383,96 @@ mod linux {
         /// to remote desktop coordinates.
         pub fn remote_resolution(&self) -> (u32, u32) {
             (self.remote_width, self.remote_height)
+        }
+
+        /// Returns information about all detected monitors (Story 3.1).
+        ///
+        /// This queries the OutputState for current monitor information.
+        /// Call this after the Wayland connection is established and outputs
+        /// have been enumerated.
+        pub fn get_monitors(&self) -> Vec<MonitorInfo> {
+            self.monitors.values().cloned().collect()
+        }
+
+        /// Returns the number of detected monitors.
+        pub fn monitor_count(&self) -> usize {
+            self.monitors.len()
+        }
+
+        /// Returns a reference to a specific WlOutput by its ID.
+        ///
+        /// Used for targeting fullscreen to a specific monitor.
+        pub fn get_output(&self, id: u32) -> Option<&WlOutput> {
+            self.outputs.get(&id)
+        }
+
+        /// Returns the primary monitor (the one at position 0,0).
+        ///
+        /// If no monitor is at 0,0, returns the first detected monitor.
+        pub fn primary_monitor(&self) -> Option<MonitorInfo> {
+            // Look for monitor at position (0, 0) - typically the primary
+            self.monitors
+                .values()
+                .find(|m| m.x == 0 && m.y == 0)
+                .cloned()
+                .or_else(|| self.monitors.values().next().cloned())
+        }
+
+        /// Logs information about all detected monitors.
+        ///
+        /// Call this after initialization to see what monitors were detected.
+        /// Useful for debugging multi-monitor setups.
+        pub fn log_monitors(&self) {
+            if self.monitors.is_empty() {
+                tracing::warn!("No monitors detected");
+                return;
+            }
+
+            tracing::info!("Detected {} monitor(s):", self.monitors.len());
+            for monitor in self.monitors.values() {
+                tracing::info!(
+                    "  {} ({}): {}x{}@{:.1}Hz at ({}, {}), scale={}",
+                    monitor.name,
+                    monitor.id,
+                    monitor.width,
+                    monitor.height,
+                    monitor.refresh_hz(),
+                    monitor.x,
+                    monitor.y,
+                    monitor.scale
+                );
+            }
+            // TODO(Story 3.1): Log warning if wlr-output-management is not available
+            // for enhanced multi-monitor support (AC 2). Currently using basic wl_output.
+        }
+
+        /// Creates a MonitorInfo from OutputState info.
+        ///
+        /// Helper to avoid code duplication between new_output and update_output.
+        fn create_monitor_info(
+            id: u32,
+            info: &smithay_client_toolkit::output::OutputInfo,
+        ) -> MonitorInfo {
+            MonitorInfo {
+                id,
+                name: info
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("Output-{}", id)),
+                make: info.make.clone(),
+                model: info.model.clone(),
+                width: info.logical_size.map(|(w, _)| w as u32).unwrap_or(0),
+                height: info.logical_size.map(|(_, h)| h as u32).unwrap_or(0),
+                x: info.location.0,
+                y: info.location.1,
+                refresh_mhz: info
+                    .modes
+                    .iter()
+                    .find(|m| m.current)
+                    .map(|m| m.refresh_rate as u32)
+                    .unwrap_or(60000),
+                scale: info.scale_factor,
+            }
         }
 
         /// Draws a solid color frame (placeholder until real frames arrive).
@@ -644,22 +777,96 @@ mod linux {
             &mut self.output_state
         }
 
-        fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: WlOutput) {}
+        fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: WlOutput) {
+            // Story 3.1: Detect new monitor
+            let id = output.id().protocol_id();
+            tracing::debug!("New output detected: id={}", id);
 
-        fn update_output(
-            &mut self,
-            _conn: &Connection,
-            _qh: &QueueHandle<Self>,
-            _output: WlOutput,
-        ) {
+            // Get output info from OutputState
+            if let Some(info) = self.output_state.info(&output) {
+                let monitor = Self::create_monitor_info(id, info);
+
+                tracing::info!(
+                    "Monitor detected: {} ({}x{} at {},{}, {:.1}Hz, scale={})",
+                    monitor.name,
+                    monitor.width,
+                    monitor.height,
+                    monitor.x,
+                    monitor.y,
+                    monitor.refresh_hz(),
+                    monitor.scale
+                );
+
+                // Store both the WlOutput and MonitorInfo together to keep them in sync
+                self.outputs.insert(id, output.clone());
+                self.monitors.insert(id, monitor);
+            } else {
+                // Don't store output without info - wait for update_output
+                tracing::warn!(
+                    "New output {} has no info available yet, waiting for update",
+                    id
+                );
+            }
+        }
+
+        fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: WlOutput) {
+            // Story 3.1: Update monitor info when properties change
+            let id = output.id().protocol_id();
+
+            if let Some(info) = self.output_state.info(&output) {
+                let monitor = Self::create_monitor_info(id, info);
+                let is_new = !self.monitors.contains_key(&id);
+
+                if is_new {
+                    tracing::info!(
+                        "Monitor detected (via update): {} ({}x{} at {},{}, {:.1}Hz, scale={})",
+                        monitor.name,
+                        monitor.width,
+                        monitor.height,
+                        monitor.x,
+                        monitor.y,
+                        monitor.refresh_hz(),
+                        monitor.scale
+                    );
+                    // Store the WlOutput now that we have info
+                    self.outputs.insert(id, output.clone());
+                } else {
+                    tracing::debug!(
+                        "Monitor updated: {} ({}x{} at {},{}, {:.1}Hz)",
+                        monitor.name,
+                        monitor.width,
+                        monitor.height,
+                        monitor.x,
+                        monitor.y,
+                        monitor.refresh_hz()
+                    );
+                }
+
+                self.monitors.insert(id, monitor);
+            }
         }
 
         fn output_destroyed(
             &mut self,
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
-            _output: WlOutput,
+            output: WlOutput,
         ) {
+            // Story 3.1: Handle monitor disconnect (hot-unplug)
+            let id = output.id().protocol_id();
+
+            if let Some(monitor) = self.monitors.remove(&id) {
+                tracing::info!("Monitor disconnected: {} ({})", monitor.name, id);
+            }
+            self.outputs.remove(&id);
+
+            // Log remaining monitors
+            if !self.monitors.is_empty() {
+                tracing::debug!(
+                    "Remaining monitors: {:?}",
+                    self.monitors.keys().collect::<Vec<_>>()
+                );
+            }
         }
     }
 
@@ -1103,6 +1310,27 @@ pub use linux::*;
 // Stub implementation for non-Linux platforms (for compilation only)
 #[cfg(not(target_os = "linux"))]
 mod stub {
+    /// Stub MonitorInfo for non-Linux platforms.
+    #[derive(Debug, Clone)]
+    pub struct MonitorInfo {
+        pub id: u32,
+        pub name: String,
+        pub make: Option<String>,
+        pub model: Option<String>,
+        pub width: u32,
+        pub height: u32,
+        pub x: i32,
+        pub y: i32,
+        pub refresh_mhz: u32,
+        pub scale: i32,
+    }
+
+    impl MonitorInfo {
+        pub fn refresh_hz(&self) -> f64 {
+            self.refresh_mhz as f64 / 1000.0
+        }
+    }
+
     /// Stub WindowEvent for non-Linux platforms.
     #[derive(Debug)]
     pub enum WindowEvent {
@@ -1254,6 +1482,22 @@ mod stub {
             _stride: u32,
         ) {
         }
+
+        pub fn get_monitors(&self) -> Vec<MonitorInfo> {
+            Vec::new()
+        }
+
+        pub fn monitor_count(&self) -> usize {
+            0
+        }
+
+        pub fn get_output(&self, _id: u32) -> Option<&()> {
+            None
+        }
+
+        pub fn primary_monitor(&self) -> Option<MonitorInfo> {
+            None
+        }
     }
 }
 
@@ -1335,5 +1579,61 @@ mod tests {
         assert_eq!(config.width, 1920);
         assert_eq!(config.height, 1080);
         assert!(config.fullscreen);
+    }
+
+    // Story 3.1: Monitor detection tests
+    #[test]
+    fn test_monitor_info_refresh_hz() {
+        let monitor = MonitorInfo {
+            id: 1,
+            name: "DP-1".to_string(),
+            make: Some("Dell".to_string()),
+            model: Some("U2723QE".to_string()),
+            width: 3840,
+            height: 2160,
+            x: 0,
+            y: 0,
+            refresh_mhz: 60000,
+            scale: 2,
+        };
+        assert!((monitor.refresh_hz() - 60.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_monitor_info_refresh_hz_144() {
+        let monitor = MonitorInfo {
+            id: 2,
+            name: "HDMI-A-1".to_string(),
+            make: None,
+            model: None,
+            width: 1920,
+            height: 1080,
+            x: 3840,
+            y: 0,
+            refresh_mhz: 144000,
+            scale: 1,
+        };
+        assert!((monitor.refresh_hz() - 144.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_monitor_info_clone() {
+        let monitor = MonitorInfo {
+            id: 1,
+            name: "DP-1".to_string(),
+            make: Some("Dell".to_string()),
+            model: Some("U2723QE".to_string()),
+            width: 3840,
+            height: 2160,
+            x: 0,
+            y: 0,
+            refresh_mhz: 60000,
+            scale: 2,
+        };
+        let cloned = monitor.clone();
+        assert_eq!(cloned.id, monitor.id);
+        assert_eq!(cloned.name, monitor.name);
+        assert_eq!(cloned.width, monitor.width);
+        assert_eq!(cloned.height, monitor.height);
     }
 }
