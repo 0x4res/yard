@@ -11,7 +11,6 @@ mod linux {
     use calloop::channel::Sender;
     use calloop_wayland_source::WaylandSource;
     use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
-    use smithay_client_toolkit::delegate_xdg_surface;
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
     use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
     use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard;
@@ -33,7 +32,6 @@ mod linux {
     use smithay_client_toolkit::shell::xdg::window::{
         Window, WindowConfigure, WindowDecorations, WindowHandler,
     };
-    use smithay_client_toolkit::shell::xdg::{XdgSurface, XdgSurfaceHandler};
     use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
     use smithay_client_toolkit::shm::{Shm, ShmHandler};
     use smithay_client_toolkit::{
@@ -78,6 +76,222 @@ mod linux {
         }
     }
 
+    /// A rectangle defined by position and dimensions (Story 3.5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Rect {
+        /// X position (can be negative for monitor offsets).
+        pub x: i32,
+        /// Y position (can be negative for monitor offsets).
+        pub y: i32,
+        /// Width in pixels.
+        pub width: u32,
+        /// Height in pixels.
+        pub height: u32,
+    }
+
+    impl Rect {
+        /// Creates a new rectangle.
+        pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+            Self {
+                x,
+                y,
+                width,
+                height,
+            }
+        }
+
+        /// Returns the right edge X coordinate.
+        pub fn right(&self) -> i32 {
+            self.x + self.width as i32
+        }
+
+        /// Returns the bottom edge Y coordinate.
+        pub fn bottom(&self) -> i32 {
+            self.y + self.height as i32
+        }
+
+        /// Checks if this rectangle intersects with another.
+        pub fn intersects(&self, other: &Rect) -> bool {
+            self.x < other.right()
+                && self.right() > other.x
+                && self.y < other.bottom()
+                && self.bottom() > other.y
+        }
+
+        /// Returns the intersection of this rectangle with another, if any.
+        pub fn intersection(&self, other: &Rect) -> Option<Rect> {
+            if !self.intersects(other) {
+                return None;
+            }
+
+            let x = self.x.max(other.x);
+            let y = self.y.max(other.y);
+            let right = self.right().min(other.right());
+            let bottom = self.bottom().min(other.bottom());
+
+            Some(Rect {
+                x,
+                y,
+                width: (right - x) as u32,
+                height: (bottom - y) as u32,
+            })
+        }
+    }
+
+    /// Describes a region mapping from frame coordinates to surface-local coordinates (Story 3.5).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SurfaceRegion {
+        /// The monitor ID this region maps to.
+        pub monitor_id: u32,
+        /// Source rectangle in frame coordinates (combined desktop space).
+        pub src_rect: Rect,
+        /// Destination rectangle in surface-local coordinates.
+        pub dst_rect: Rect,
+    }
+
+    /// Maps remote desktop regions to local monitor surfaces (Story 3.5).
+    ///
+    /// This struct handles the coordinate translation from the combined remote desktop
+    /// space to individual monitor surface coordinates. It supports:
+    /// - Horizontal, vertical, and L-shaped monitor arrangements
+    /// - Negative monitor coordinates (monitors to the left/above primary)
+    /// - Different resolutions per monitor
+    /// - Frames that span multiple monitors
+    #[derive(Debug, Clone)]
+    pub struct RegionMapper {
+        /// Monitor layouts indexed by monitor_id.
+        monitors: HashMap<u32, MonitorInfo>,
+        /// Combined desktop bounds (min_x, min_y, max_x, max_y).
+        bounds: (i32, i32, i32, i32),
+    }
+
+    impl RegionMapper {
+        /// Creates a new RegionMapper from monitor information.
+        pub fn new(monitors: &HashMap<u32, MonitorInfo>) -> Self {
+            let bounds = Self::calculate_bounds(monitors);
+            Self {
+                monitors: monitors.clone(),
+                bounds,
+            }
+        }
+
+        /// Calculates the bounding box of all monitors.
+        fn calculate_bounds(monitors: &HashMap<u32, MonitorInfo>) -> (i32, i32, i32, i32) {
+            if monitors.is_empty() {
+                return (0, 0, 0, 0);
+            }
+
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+
+            for mon in monitors.values() {
+                min_x = min_x.min(mon.x);
+                min_y = min_y.min(mon.y);
+                max_x = max_x.max(mon.x + mon.width as i32);
+                max_y = max_y.max(mon.y + mon.height as i32);
+            }
+
+            (min_x, min_y, max_x, max_y)
+        }
+
+        /// Updates the mapper with new monitor information.
+        pub fn update(&mut self, monitors: &HashMap<u32, MonitorInfo>) {
+            self.monitors = monitors.clone();
+            self.bounds = Self::calculate_bounds(&self.monitors);
+        }
+
+        /// Returns the combined desktop bounds.
+        pub fn bounds(&self) -> (i32, i32, i32, i32) {
+            self.bounds
+        }
+
+        /// Returns the combined desktop size (width, height).
+        pub fn combined_size(&self) -> (u32, u32) {
+            let (min_x, min_y, max_x, max_y) = self.bounds;
+            ((max_x - min_x) as u32, (max_y - min_y) as u32)
+        }
+
+        /// Maps a frame region to the surfaces it affects.
+        ///
+        /// Given a rectangle in the combined desktop coordinate space,
+        /// returns a list of SurfaceRegion describing which monitors are affected
+        /// and the local coordinates within each surface.
+        ///
+        /// # Arguments
+        /// * `frame_x` - X position in combined desktop coordinates
+        /// * `frame_y` - Y position in combined desktop coordinates
+        /// * `frame_width` - Width of the region
+        /// * `frame_height` - Height of the region
+        ///
+        /// # Returns
+        /// A vector of SurfaceRegion, one for each monitor that intersects the frame region.
+        pub fn map_region(
+            &self,
+            frame_x: i32,
+            frame_y: i32,
+            frame_width: u32,
+            frame_height: u32,
+        ) -> Vec<SurfaceRegion> {
+            let frame_rect = Rect::new(frame_x, frame_y, frame_width, frame_height);
+            let mut regions = Vec::new();
+
+            for (id, mon) in &self.monitors {
+                let mon_rect = Rect::new(mon.x, mon.y, mon.width, mon.height);
+
+                if let Some(intersection) = frame_rect.intersection(&mon_rect) {
+                    // Source rectangle: portion of the frame that applies to this monitor
+                    let src_rect = intersection;
+
+                    // Destination rectangle: where to draw in the surface (surface-local coords)
+                    // Surface-local means (0,0) is top-left of the surface
+                    let dst_rect = Rect::new(
+                        intersection.x - mon.x,
+                        intersection.y - mon.y,
+                        intersection.width,
+                        intersection.height,
+                    );
+
+                    regions.push(SurfaceRegion {
+                        monitor_id: *id,
+                        src_rect,
+                        dst_rect,
+                    });
+                }
+            }
+
+            regions
+        }
+
+        /// Checks if a frame region affects multiple monitors.
+        pub fn spans_multiple_monitors(
+            &self,
+            frame_x: i32,
+            frame_y: i32,
+            frame_width: u32,
+            frame_height: u32,
+        ) -> bool {
+            self.map_region(frame_x, frame_y, frame_width, frame_height)
+                .len()
+                > 1
+        }
+
+        /// Returns the monitor that contains a point, if any.
+        pub fn monitor_at_point(&self, x: i32, y: i32) -> Option<u32> {
+            for (id, mon) in &self.monitors {
+                if x >= mon.x
+                    && x < mon.x + mon.width as i32
+                    && y >= mon.y
+                    && y < mon.y + mon.height as i32
+                {
+                    return Some(*id);
+                }
+            }
+            None
+        }
+    }
+
     /// Per-monitor Wayland surface state (Story 3.3, extended in Story 3.4).
     ///
     /// Each monitor in multi-monitor mode gets its own MonitorSurface instance,
@@ -87,10 +301,9 @@ mod linux {
     pub struct MonitorSurface {
         /// The Wayland surface for this monitor.
         surface: WlSurface,
-        /// XDG surface wrapper for shell integration (Story 3.4).
-        xdg_surface: XdgSurface,
         /// XDG toplevel for window management (Story 3.4).
         /// Uses smithay-client-toolkit's Window type which wraps xdg_toplevel.
+        /// Access xdg_surface via xdg_toplevel.xdg_surface() when needed.
         xdg_toplevel: Window,
         /// Buffer pool for this surface (separate memory per monitor).
         pool: SlotPool,
@@ -144,9 +357,6 @@ mod linux {
             xdg_toplevel.set_app_id("yard");
             xdg_toplevel.commit();
 
-            // Get the xdg_surface from the toplevel
-            let xdg_surface = xdg_toplevel.xdg_surface().clone();
-
             // Calculate buffer size for this monitor
             let buffer_size = (monitor_info.width * monitor_info.height * 4) as usize;
 
@@ -168,7 +378,6 @@ mod linux {
 
             Ok(Self {
                 surface,
-                xdg_surface,
                 xdg_toplevel,
                 pool,
                 target_output: output,
@@ -598,6 +807,9 @@ mod linux {
         compositor: CompositorState,
         /// Reference to xdg_shell for window decoration.
         xdg_shell: XdgShell,
+        /// Region mapper for multi-monitor coordinate translation (Story 3.5).
+        /// Used to map frame regions to the correct monitor surfaces.
+        region_mapper: RegionMapper,
     }
 
     impl WaylandWindow {
@@ -689,6 +901,8 @@ mod linux {
                 multi_monitor_mode: false, // Default to single-surface mode
                 compositor,
                 xdg_shell,
+                // Story 3.5: Region mapper for multi-monitor coordinate translation
+                region_mapper: RegionMapper::new(&HashMap::new()),
             };
 
             Ok((event_loop, state, event_rx))
@@ -1056,22 +1270,20 @@ mod linux {
             }
         }
 
-        /// Draws a frame region to the appropriate surface(s).
+        /// Draws a frame region to the appropriate surface(s) (Story 3.5).
         ///
-        /// In multi-monitor mode, this determines which surface(s) the frame
-        /// region intersects and draws to each. The region coordinates are in
-        /// the combined desktop space (matching server's view).
+        /// This method handles the coordinate translation from combined desktop space
+        /// to individual monitor surfaces. It supports:
+        /// - Frames that span multiple monitors (splits at boundaries)
+        /// - Negative monitor coordinates (monitors to the left/above primary)
+        /// - Different resolutions per monitor
         ///
         /// # Arguments
-        /// * `data` - BGRA pixel data for the region
-        /// * `width` - Width of the region in pixels
-        /// * `height` - Height of the region in pixels
-        /// * `x` - X offset in combined desktop space
-        /// * `y` - Y offset in combined desktop space
-        ///
-        /// # Note
-        /// Monitor coordinates (x, y) can be negative (e.g., monitor to the left of primary).
-        /// This function handles negative coordinates correctly using i32 arithmetic.
+        /// * `data` - Pixel data in BGRA format for the entire frame region
+        /// * `width` - Width of the frame region
+        /// * `height` - Height of the frame region
+        /// * `x` - X position in combined desktop coordinates
+        /// * `y` - Y position in combined desktop coordinates
         pub fn draw_frame_to_surfaces(
             &mut self,
             data: &[u8],
@@ -1086,41 +1298,111 @@ mod linux {
                 return;
             }
 
-            // Multi-monitor mode: dispatch to appropriate surface(s)
-            // For now, find the surface that contains this region
-            // (Full implementation of region mapping will be in Story 3.5)
-
-            // Use i32 for frame coordinates to handle negative monitor positions
-            // Frame coordinates from RDP are always non-negative, but monitor positions can be negative
+            // Story 3.5: Use RegionMapper for proper coordinate translation
             let frame_x = x as i32;
             let frame_y = y as i32;
-            let frame_w = width as i32;
-            let frame_h = height as i32;
 
-            for (_id, surface) in self.multi_surfaces.iter_mut() {
-                let mon = surface.monitor_info();
-                // Monitor coordinates are already i32 (can be negative)
-                let mon_x = mon.x;
-                let mon_y = mon.y;
-                let mon_w = mon.width as i32;
-                let mon_h = mon.height as i32;
+            // Get the regions affected by this frame
+            let regions = self
+                .region_mapper
+                .map_region(frame_x, frame_y, width, height);
 
-                // Check if the frame region intersects this monitor (i32 arithmetic handles negatives)
-                let intersects = frame_x < mon_x + mon_w
-                    && frame_x + frame_w > mon_x
-                    && frame_y < mon_y + mon_h
-                    && frame_y + frame_h > mon_y;
+            if regions.is_empty() {
+                tracing::debug!(
+                    "Frame region ({},{} {}x{}) does not intersect any monitor",
+                    x,
+                    y,
+                    width,
+                    height
+                );
+                return;
+            }
 
-                if intersects {
-                    // Calculate local coordinates within this surface
-                    // saturating_sub handles case where frame starts before monitor
-                    let local_x = (frame_x - mon_x).max(0) as u32;
-                    let local_y = (frame_y - mon_y).max(0) as u32;
+            // Log if frame spans multiple monitors (useful for debugging)
+            if regions.len() > 1 {
+                tracing::debug!(
+                    "Frame region ({},{} {}x{}) spans {} monitors",
+                    x,
+                    y,
+                    width,
+                    height,
+                    regions.len()
+                );
+            }
 
-                    // For simplicity, pass the full region data
-                    // (Story 3.5 will implement proper region slicing)
-                    surface.draw_frame(data, width, height, local_x, local_y);
+            // Process each affected surface
+            let frame_stride = width * 4; // BGRA = 4 bytes per pixel
+
+            // Reusable buffer for region extraction (avoids allocation per region)
+            let mut region_data: Vec<u8> = Vec::new();
+
+            for region in &regions {
+                let surface = match self.multi_surfaces.get_mut(&region.monitor_id) {
+                    Some(s) => s,
+                    None => {
+                        tracing::warn!(
+                            "RegionMapper returned unknown monitor_id {}",
+                            region.monitor_id
+                        );
+                        continue;
+                    }
+                };
+
+                // Task 3.3/3.4: Check for resolution mismatch between frame and surface
+                let (surface_width, surface_height) = surface.dimensions();
+                let dst_right = region.dst_rect.x as u32 + region.dst_rect.width;
+                let dst_bottom = region.dst_rect.y as u32 + region.dst_rect.height;
+
+                if dst_right > surface_width || dst_bottom > surface_height {
+                    tracing::warn!(
+                        "Resolution mismatch: frame region ({},{} {}x{}) exceeds surface {} dimensions ({}x{})",
+                        region.dst_rect.x,
+                        region.dst_rect.y,
+                        region.dst_rect.width,
+                        region.dst_rect.height,
+                        region.monitor_id,
+                        surface_width,
+                        surface_height
+                    );
+                    // Continue anyway - MonitorSurface::draw_frame will handle bounds checking
                 }
+
+                // Extract the portion of the frame that applies to this surface
+                // src_rect is in combined desktop coordinates
+                // We need to calculate the offset within the incoming frame data
+                let src_offset_x = (region.src_rect.x - frame_x) as u32;
+                let src_offset_y = (region.src_rect.y - frame_y) as u32;
+                let region_width = region.src_rect.width;
+                let region_height = region.src_rect.height;
+
+                // Reuse buffer for region extraction (resize only when needed)
+                let region_stride = region_width * 4;
+                let region_size = (region_stride * region_height) as usize;
+                region_data.clear();
+                region_data.resize(region_size, 0);
+
+                // Copy row by row from source to region buffer
+                for row in 0..region_height {
+                    let src_row = src_offset_y + row;
+                    let src_start = (src_row * frame_stride + src_offset_x * 4) as usize;
+                    let src_end = src_start + region_stride as usize;
+
+                    let dst_start = (row * region_stride) as usize;
+                    let dst_end = dst_start + region_stride as usize;
+
+                    if src_end <= data.len() && dst_end <= region_data.len() {
+                        region_data[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+                    }
+                }
+
+                // Draw to the surface at the destination coordinates (surface-local)
+                surface.draw_frame(
+                    &region_data,
+                    region_width,
+                    region_height,
+                    region.dst_rect.x as u32,
+                    region.dst_rect.y as u32,
+                );
             }
         }
 
@@ -1478,6 +1760,8 @@ mod linux {
                 // Store both the WlOutput and MonitorInfo together to keep them in sync
                 self.outputs.insert(id, output.clone());
                 self.monitors.insert(id, monitor);
+                // Story 3.5: Update region mapper with new monitor layout
+                self.region_mapper.update(&self.monitors);
             } else {
                 // Don't store output without info - wait for update_output
                 tracing::warn!(
@@ -1521,6 +1805,8 @@ mod linux {
                 }
 
                 self.monitors.insert(id, monitor);
+                // Story 3.5: Update region mapper with new monitor layout
+                self.region_mapper.update(&self.monitors);
             }
         }
 
@@ -1537,6 +1823,8 @@ mod linux {
                 tracing::info!("Monitor disconnected: {} ({})", monitor.name, id);
             }
             self.outputs.remove(&id);
+            // Story 3.5: Update region mapper with new monitor layout
+            self.region_mapper.update(&self.monitors);
 
             // Log remaining monitors
             if !self.monitors.is_empty() {
@@ -2056,38 +2344,6 @@ mod linux {
         }
     }
 
-    // Story 3.4: Handle xdg_surface configure events for multi-monitor surfaces
-    impl XdgSurfaceHandler for WaylandWindow {
-        fn configure(
-            &mut self,
-            _conn: &Connection,
-            _qh: &QueueHandle<Self>,
-            xdg_surface: &XdgSurface,
-            serial: u32,
-        ) {
-            // Acknowledge the configure event (required by xdg_shell protocol)
-            xdg_surface.ack_configure(serial);
-
-            // Find which MonitorSurface this xdg_surface belongs to and mark it configured
-            // Then commit the surface to complete the configure sequence (Task 5.5)
-            for surface in self.multi_surfaces.values_mut() {
-                if surface.xdg_surface.wl_surface() == xdg_surface.wl_surface() {
-                    if !surface.is_configured() {
-                        tracing::debug!(
-                            "MonitorSurface {} received initial configure",
-                            surface.monitor_info().name
-                        );
-                        surface.mark_configured();
-                    }
-                    // Commit surface after configure acknowledgment (Task 5.5)
-                    // This completes the configure sequence per xdg_shell protocol
-                    surface.wl_surface().commit();
-                    break;
-                }
-            }
-        }
-    }
-
     delegate_compositor!(WaylandWindow);
     delegate_output!(WaylandWindow);
     delegate_seat!(WaylandWindow);
@@ -2095,7 +2351,6 @@ mod linux {
     delegate_pointer!(WaylandWindow);
     delegate_shm!(WaylandWindow);
     delegate_xdg_shell!(WaylandWindow);
-    delegate_xdg_surface!(WaylandWindow);
     delegate_xdg_window!(WaylandWindow);
     delegate_registry!(WaylandWindow);
 }
@@ -2124,6 +2379,169 @@ mod stub {
     impl MonitorInfo {
         pub fn refresh_hz(&self) -> f64 {
             self.refresh_mhz as f64 / 1000.0
+        }
+    }
+
+    /// Stub Rect for non-Linux platforms (Story 3.5).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Rect {
+        pub x: i32,
+        pub y: i32,
+        pub width: u32,
+        pub height: u32,
+    }
+
+    impl Rect {
+        pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+            Self {
+                x,
+                y,
+                width,
+                height,
+            }
+        }
+
+        pub fn right(&self) -> i32 {
+            self.x + self.width as i32
+        }
+
+        pub fn bottom(&self) -> i32 {
+            self.y + self.height as i32
+        }
+
+        pub fn intersects(&self, other: &Rect) -> bool {
+            self.x < other.right()
+                && self.right() > other.x
+                && self.y < other.bottom()
+                && self.bottom() > other.y
+        }
+
+        pub fn intersection(&self, other: &Rect) -> Option<Rect> {
+            if !self.intersects(other) {
+                return None;
+            }
+            let x = self.x.max(other.x);
+            let y = self.y.max(other.y);
+            let right = self.right().min(other.right());
+            let bottom = self.bottom().min(other.bottom());
+            Some(Rect {
+                x,
+                y,
+                width: (right - x) as u32,
+                height: (bottom - y) as u32,
+            })
+        }
+    }
+
+    /// Stub SurfaceRegion for non-Linux platforms (Story 3.5).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SurfaceRegion {
+        pub monitor_id: u32,
+        pub src_rect: Rect,
+        pub dst_rect: Rect,
+    }
+
+    /// Stub RegionMapper for non-Linux platforms (Story 3.5).
+    #[derive(Debug, Clone)]
+    pub struct RegionMapper {
+        monitors: std::collections::HashMap<u32, MonitorInfo>,
+        bounds: (i32, i32, i32, i32),
+    }
+
+    impl RegionMapper {
+        pub fn new(monitors: &std::collections::HashMap<u32, MonitorInfo>) -> Self {
+            let bounds = Self::calculate_bounds(monitors);
+            Self {
+                monitors: monitors.clone(),
+                bounds,
+            }
+        }
+
+        fn calculate_bounds(
+            monitors: &std::collections::HashMap<u32, MonitorInfo>,
+        ) -> (i32, i32, i32, i32) {
+            if monitors.is_empty() {
+                return (0, 0, 0, 0);
+            }
+            let mut min_x = i32::MAX;
+            let mut min_y = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut max_y = i32::MIN;
+            for mon in monitors.values() {
+                min_x = min_x.min(mon.x);
+                min_y = min_y.min(mon.y);
+                max_x = max_x.max(mon.x + mon.width as i32);
+                max_y = max_y.max(mon.y + mon.height as i32);
+            }
+            (min_x, min_y, max_x, max_y)
+        }
+
+        pub fn update(&mut self, monitors: &std::collections::HashMap<u32, MonitorInfo>) {
+            self.monitors = monitors.clone();
+            self.bounds = Self::calculate_bounds(&self.monitors);
+        }
+
+        pub fn bounds(&self) -> (i32, i32, i32, i32) {
+            self.bounds
+        }
+
+        pub fn combined_size(&self) -> (u32, u32) {
+            let (min_x, min_y, max_x, max_y) = self.bounds;
+            ((max_x - min_x) as u32, (max_y - min_y) as u32)
+        }
+
+        pub fn map_region(
+            &self,
+            frame_x: i32,
+            frame_y: i32,
+            frame_width: u32,
+            frame_height: u32,
+        ) -> Vec<SurfaceRegion> {
+            let frame_rect = Rect::new(frame_x, frame_y, frame_width, frame_height);
+            let mut regions = Vec::new();
+            for (id, mon) in &self.monitors {
+                let mon_rect = Rect::new(mon.x, mon.y, mon.width, mon.height);
+                if let Some(intersection) = frame_rect.intersection(&mon_rect) {
+                    let src_rect = intersection;
+                    let dst_rect = Rect::new(
+                        intersection.x - mon.x,
+                        intersection.y - mon.y,
+                        intersection.width,
+                        intersection.height,
+                    );
+                    regions.push(SurfaceRegion {
+                        monitor_id: *id,
+                        src_rect,
+                        dst_rect,
+                    });
+                }
+            }
+            regions
+        }
+
+        pub fn spans_multiple_monitors(
+            &self,
+            frame_x: i32,
+            frame_y: i32,
+            frame_width: u32,
+            frame_height: u32,
+        ) -> bool {
+            self.map_region(frame_x, frame_y, frame_width, frame_height)
+                .len()
+                > 1
+        }
+
+        pub fn monitor_at_point(&self, x: i32, y: i32) -> Option<u32> {
+            for (id, mon) in &self.monitors {
+                if x >= mon.x
+                    && x < mon.x + mon.width as i32
+                    && y >= mon.y
+                    && y < mon.y + mon.height as i32
+                {
+                    return Some(*id);
+                }
+            }
+            None
         }
     }
 
@@ -2427,6 +2845,7 @@ pub use stub::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_window_config_default() {
@@ -2930,5 +3349,291 @@ mod tests {
             assert_eq!(surface.monitor_id(), 1);
             assert_eq!(surface.monitor_info().name, "DP-1");
         }
+    }
+
+    // ============================================================
+    // Story 3.5: Region Mapper Tests
+    // ============================================================
+
+    #[test]
+    fn test_rect_intersection() {
+        let r1 = Rect::new(0, 0, 100, 100);
+        let r2 = Rect::new(50, 50, 100, 100);
+
+        assert!(r1.intersects(&r2));
+        let intersection = r1.intersection(&r2).unwrap();
+        assert_eq!(intersection.x, 50);
+        assert_eq!(intersection.y, 50);
+        assert_eq!(intersection.width, 50);
+        assert_eq!(intersection.height, 50);
+    }
+
+    #[test]
+    fn test_rect_no_intersection() {
+        let r1 = Rect::new(0, 0, 100, 100);
+        let r2 = Rect::new(200, 200, 100, 100);
+
+        assert!(!r1.intersects(&r2));
+        assert!(r1.intersection(&r2).is_none());
+    }
+
+    #[test]
+    fn test_rect_edge_touch_no_intersection() {
+        // Rectangles that touch at edge but don't overlap
+        let r1 = Rect::new(0, 0, 100, 100);
+        let r2 = Rect::new(100, 0, 100, 100); // Starts exactly where r1 ends
+
+        assert!(!r1.intersects(&r2));
+    }
+
+    #[test]
+    fn test_region_mapper_horizontal_dual_monitor() {
+        // Task 6.1: Test horizontal dual-monitor layout (side by side)
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 1920, 0));
+
+        let mapper = RegionMapper::new(&monitors);
+
+        // Combined size should be 3840x1080
+        let (width, height) = mapper.combined_size();
+        assert_eq!(width, 3840);
+        assert_eq!(height, 1080);
+
+        // Frame on first monitor only
+        let regions = mapper.map_region(100, 100, 200, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+        assert_eq!(regions[0].dst_rect.x, 100);
+        assert_eq!(regions[0].dst_rect.y, 100);
+
+        // Frame on second monitor only
+        let regions = mapper.map_region(2000, 100, 200, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 2);
+        assert_eq!(regions[0].dst_rect.x, 80); // 2000 - 1920
+        assert_eq!(regions[0].dst_rect.y, 100);
+    }
+
+    #[test]
+    fn test_region_mapper_vertical_dual_monitor() {
+        // Task 6.2: Test vertical dual-monitor layout (stacked)
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 0, 1080));
+
+        let mapper = RegionMapper::new(&monitors);
+
+        // Combined size should be 1920x2160
+        let (width, height) = mapper.combined_size();
+        assert_eq!(width, 1920);
+        assert_eq!(height, 2160);
+
+        // Frame on first (top) monitor
+        let regions = mapper.map_region(100, 100, 200, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+
+        // Frame on second (bottom) monitor
+        let regions = mapper.map_region(100, 1200, 200, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 2);
+        assert_eq!(regions[0].dst_rect.y, 120); // 1200 - 1080
+    }
+
+    #[test]
+    fn test_region_mapper_mixed_resolution() {
+        // Task 6.3: Test mixed resolution scenario (1080p + 4K)
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 3840, 2160, 0, 0)); // 4K
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 3840, 540)); // 1080p centered
+
+        let mapper = RegionMapper::new(&monitors);
+
+        // Combined size
+        let (width, height) = mapper.combined_size();
+        assert_eq!(width, 5760); // 3840 + 1920
+        assert_eq!(height, 2160); // 4K height
+
+        // Frame only on 4K monitor
+        let regions = mapper.map_region(100, 100, 200, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+
+        // Frame only on 1080p monitor (at y=540)
+        let regions = mapper.map_region(4000, 600, 200, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 2);
+        assert_eq!(regions[0].dst_rect.x, 160); // 4000 - 3840
+        assert_eq!(regions[0].dst_rect.y, 60); // 600 - 540
+    }
+
+    #[test]
+    fn test_region_mapper_frame_spanning_boundary() {
+        // Task 6.4: Test frame spanning monitor boundary
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 1920, 0));
+
+        let mapper = RegionMapper::new(&monitors);
+
+        // Frame spanning both monitors (x=1820 to x=2120)
+        let regions = mapper.map_region(1820, 100, 300, 200);
+        assert_eq!(regions.len(), 2);
+
+        // Find regions by monitor_id
+        let region1 = regions.iter().find(|r| r.monitor_id == 1).unwrap();
+        let region2 = regions.iter().find(|r| r.monitor_id == 2).unwrap();
+
+        // Monitor 1: should have x=1820 to x=1920, width=100
+        assert_eq!(region1.src_rect.x, 1820);
+        assert_eq!(region1.src_rect.width, 100);
+        assert_eq!(region1.dst_rect.x, 1820);
+        assert_eq!(region1.dst_rect.width, 100);
+
+        // Monitor 2: should have x=1920 to x=2120, width=200
+        assert_eq!(region2.src_rect.x, 1920);
+        assert_eq!(region2.src_rect.width, 200);
+        assert_eq!(region2.dst_rect.x, 0); // Starts at left edge of monitor 2
+        assert_eq!(region2.dst_rect.width, 200);
+
+        // Verify it spans multiple
+        assert!(mapper.spans_multiple_monitors(1820, 100, 300, 200));
+    }
+
+    #[test]
+    fn test_region_mapper_l_shape_three_monitor() {
+        // Task 6.5: Test L-shape three-monitor layout
+        // Layout:
+        //   [1][2]
+        //   [3]
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        monitors.insert(2, create_test_monitor(2, "DP-2", 1920, 1080, 1920, 0));
+        monitors.insert(3, create_test_monitor(3, "HDMI-A-1", 1920, 1080, 0, 1080));
+
+        let mapper = RegionMapper::new(&monitors);
+
+        // Combined size
+        let (width, height) = mapper.combined_size();
+        assert_eq!(width, 3840);
+        assert_eq!(height, 2160);
+
+        // Frame on monitor 1
+        let regions = mapper.map_region(100, 100, 100, 100);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+
+        // Frame on monitor 2
+        let regions = mapper.map_region(2000, 100, 100, 100);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 2);
+
+        // Frame on monitor 3
+        let regions = mapper.map_region(100, 1200, 100, 100);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 3);
+
+        // Frame spanning monitors 1 and 3 (vertical boundary at y=1080)
+        let regions = mapper.map_region(100, 1000, 100, 200);
+        assert_eq!(regions.len(), 2);
+    }
+
+    #[test]
+    fn test_region_mapper_negative_coordinates() {
+        // Task 1.4: Handle negative monitor coordinates
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, -1920, 0)); // Left of origin
+        monitors.insert(2, create_test_monitor(2, "DP-2", 1920, 1080, 0, 0)); // At origin
+
+        let mapper = RegionMapper::new(&monitors);
+
+        // Bounds should include negative coordinates
+        let (min_x, min_y, max_x, max_y) = mapper.bounds();
+        assert_eq!(min_x, -1920);
+        assert_eq!(min_y, 0);
+        assert_eq!(max_x, 1920);
+        assert_eq!(max_y, 1080);
+
+        // Frame on left monitor (negative x)
+        let regions = mapper.map_region(-1000, 100, 200, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+        assert_eq!(regions[0].dst_rect.x, 920); // -1000 - (-1920) = 920
+
+        // Frame on right monitor
+        let regions = mapper.map_region(100, 100, 200, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 2);
+    }
+
+    #[test]
+    fn test_region_mapper_monitor_at_point() {
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 1920, 0));
+
+        let mapper = RegionMapper::new(&monitors);
+
+        // Point on first monitor
+        assert_eq!(mapper.monitor_at_point(100, 100), Some(1));
+
+        // Point on second monitor
+        assert_eq!(mapper.monitor_at_point(2000, 100), Some(2));
+
+        // Point outside all monitors
+        assert_eq!(mapper.monitor_at_point(5000, 100), None);
+
+        // Point exactly at boundary (belongs to second monitor)
+        assert_eq!(mapper.monitor_at_point(1920, 100), Some(2));
+    }
+
+    #[test]
+    fn test_region_mapper_empty_monitors() {
+        let monitors: HashMap<u32, MonitorInfo> = HashMap::new();
+        let mapper = RegionMapper::new(&monitors);
+
+        let (width, height) = mapper.combined_size();
+        assert_eq!(width, 0);
+        assert_eq!(height, 0);
+
+        let regions = mapper.map_region(0, 0, 100, 100);
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn test_region_mapper_update() {
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+
+        let mut mapper = RegionMapper::new(&monitors);
+        assert_eq!(mapper.combined_size(), (1920, 1080));
+
+        // Add a second monitor
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 1920, 0));
+        mapper.update(&monitors);
+
+        assert_eq!(mapper.combined_size(), (3840, 1080));
+    }
+
+    #[test]
+    fn test_region_mapper_monitors_with_gaps() {
+        // Task 4.3: Test monitors with gaps
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 2500, 0)); // Gap of 580 pixels
+
+        let mapper = RegionMapper::new(&monitors);
+
+        // Frame in the gap (should not map to any monitor)
+        let regions = mapper.map_region(2000, 100, 400, 200);
+        assert_eq!(regions.len(), 0);
+
+        // Frame spanning from monitor 1 into the gap (partial coverage)
+        let regions = mapper.map_region(1800, 100, 300, 200);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+        // Should only cover the part on monitor 1 (1800 to 1920)
+        assert_eq!(regions[0].src_rect.width, 120);
     }
 }

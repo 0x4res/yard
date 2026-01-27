@@ -12,6 +12,7 @@ pub mod window;
 
 pub use input::wayland_to_rdp_scancode;
 pub use window::{
-    KeyboardShortcut, MonitorInfo, MonitorSurface, WaylandWindow, WindowConfig, WindowEvent,
+    KeyboardShortcut, MonitorInfo, MonitorSurface, Rect, RegionMapper, SurfaceRegion,
+    WaylandWindow, WindowConfig, WindowEvent,
 };
 pub use yard_core::prelude::*;
