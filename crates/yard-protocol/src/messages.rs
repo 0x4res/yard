@@ -81,7 +81,9 @@ pub fn validate_monitor_layout(monitors: &[RdpMonitorInfo]) -> Result<(), String
     // Count primary monitors
     let primary_count = monitors.iter().filter(|m| m.is_primary).count();
     if primary_count == 0 {
-        return Err("Monitor layout must have exactly one primary monitor (found none)".to_string());
+        return Err(
+            "Monitor layout must have exactly one primary monitor (found none)".to_string(),
+        );
     }
     if primary_count > 1 {
         return Err(format!(
@@ -91,13 +93,13 @@ pub fn validate_monitor_layout(monitors: &[RdpMonitorInfo]) -> Result<(), String
     }
 
     // Validate primary monitor position
-    if let Some(primary) = monitors.iter().find(|m| m.is_primary) {
-        if !primary.is_position_valid() {
-            return Err(format!(
-                "Primary monitor must be at position (0, 0), found ({}, {})",
-                primary.x, primary.y
-            ));
-        }
+    if let Some(primary) = monitors.iter().find(|m| m.is_primary)
+        && !primary.is_position_valid()
+    {
+        return Err(format!(
+            "Primary monitor must be at position (0, 0), found ({}, {})",
+            primary.x, primary.y
+        ));
     }
 
     // Validate dimensions

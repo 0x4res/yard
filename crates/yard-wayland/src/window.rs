@@ -76,6 +76,305 @@ mod linux {
         }
     }
 
+    /// Per-monitor Wayland surface state (Story 3.3).
+    ///
+    /// Each monitor in multi-monitor mode gets its own MonitorSurface instance,
+    /// containing the Wayland surface, buffer pool, and associated state.
+    /// This follows the critical rule: "One wl_surface per monitor - NEVER one surface spanning all monitors".
+    pub struct MonitorSurface {
+        /// The Wayland surface for this monitor.
+        surface: WlSurface,
+        /// Buffer pool for this surface (separate memory per monitor).
+        pool: SlotPool,
+        /// Target WlOutput for fullscreen targeting.
+        target_output: WlOutput,
+        /// Monitor info (resolution, position).
+        monitor_info: MonitorInfo,
+        /// Current buffer attached to this surface.
+        buffer: Option<Buffer>,
+        /// Retained frame content for partial updates.
+        retained_content: Vec<u8>,
+        /// Whether the surface needs redrawing.
+        dirty: bool,
+        /// Whether this surface is currently in fullscreen mode.
+        is_fullscreen: bool,
+        /// Whether the initial configure has been received.
+        configured: bool,
+    }
+
+    impl MonitorSurface {
+        /// Creates a new MonitorSurface for the specified monitor.
+        ///
+        /// # Arguments
+        /// * `compositor` - The compositor state for creating surfaces
+        /// * `shm` - The shared memory state for creating buffer pools
+        /// * `qh` - The queue handle for creating Wayland objects
+        /// * `output` - The target WlOutput for this surface
+        /// * `monitor_info` - Information about the monitor (resolution, position)
+        ///
+        /// # Errors
+        /// Returns an error if the buffer pool cannot be created.
+        pub fn new(
+            compositor: &CompositorState,
+            shm: &Shm,
+            qh: &QueueHandle<WaylandWindow>,
+            output: WlOutput,
+            monitor_info: MonitorInfo,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            // Create the Wayland surface
+            let surface = compositor.create_surface(qh);
+
+            // Calculate buffer size for this monitor
+            let buffer_size = (monitor_info.width * monitor_info.height * 4) as usize;
+
+            // Create dedicated buffer pool for this surface
+            let pool = SlotPool::new(buffer_size, shm)?;
+
+            // Initialize retained content buffer
+            let retained_content = vec![0u8; buffer_size];
+
+            tracing::debug!(
+                "Created MonitorSurface for {} ({}x{} at {},{}, id={})",
+                monitor_info.name,
+                monitor_info.width,
+                monitor_info.height,
+                monitor_info.x,
+                monitor_info.y,
+                monitor_info.id
+            );
+
+            Ok(Self {
+                surface,
+                pool,
+                target_output: output,
+                monitor_info,
+                buffer: None,
+                retained_content,
+                dirty: true,
+                is_fullscreen: false,
+                configured: false,
+            })
+        }
+
+        /// Returns a reference to the underlying WlSurface.
+        pub fn wl_surface(&self) -> &WlSurface {
+            &self.surface
+        }
+
+        /// Returns a reference to the target WlOutput.
+        pub fn target_output(&self) -> &WlOutput {
+            &self.target_output
+        }
+
+        /// Returns a reference to the monitor info.
+        pub fn monitor_info(&self) -> &MonitorInfo {
+            &self.monitor_info
+        }
+
+        /// Returns the monitor ID.
+        pub fn monitor_id(&self) -> u32 {
+            self.monitor_info.id
+        }
+
+        /// Returns the surface dimensions (width, height).
+        pub fn dimensions(&self) -> (u32, u32) {
+            (self.monitor_info.width, self.monitor_info.height)
+        }
+
+        /// Returns whether this surface is currently fullscreen.
+        pub fn is_fullscreen(&self) -> bool {
+            self.is_fullscreen
+        }
+
+        /// Sets the fullscreen state for this surface.
+        pub fn set_fullscreen_state(&mut self, fullscreen: bool) {
+            self.is_fullscreen = fullscreen;
+        }
+
+        /// Returns whether this surface needs redrawing.
+        pub fn is_dirty(&self) -> bool {
+            self.dirty
+        }
+
+        /// Marks this surface as needing redraw.
+        pub fn mark_dirty(&mut self) {
+            self.dirty = true;
+        }
+
+        /// Marks this surface as configured (initial configure received).
+        pub fn mark_configured(&mut self) {
+            self.configured = true;
+        }
+
+        /// Returns whether the surface has been configured.
+        pub fn is_configured(&self) -> bool {
+            self.configured
+        }
+
+        /// Draws a solid color to this surface.
+        pub fn draw_solid(&mut self, r: u8, g: u8, b: u8) {
+            if !self.dirty {
+                return;
+            }
+
+            let width = self.monitor_info.width;
+            let height = self.monitor_info.height;
+            let stride = width * 4;
+
+            let (buffer, canvas) = match self.pool.create_buffer(
+                width as i32,
+                height as i32,
+                stride as i32,
+                WlShmFormat::Argb8888,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create buffer for MonitorSurface {}: {}",
+                        self.monitor_info.name,
+                        e
+                    );
+                    return;
+                }
+            };
+
+            // Fill with solid color (ARGB format)
+            let color = [b, g, r, 255u8]; // BGRA order for ARGB8888
+            for chunk in canvas.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&color);
+            }
+
+            // Update retained content
+            for chunk in self.retained_content.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&color);
+            }
+
+            // Attach and commit
+            self.surface.attach(Some(buffer.wl_buffer()), 0, 0);
+            self.surface
+                .damage_buffer(0, 0, width as i32, height as i32);
+            self.surface.commit();
+
+            self.buffer = Some(buffer);
+            self.dirty = false;
+        }
+
+        /// Draws a frame region to this surface.
+        ///
+        /// The data should be BGRA pixel data for the region this monitor displays.
+        /// Position (x, y) is the offset within this surface (typically 0, 0 for full frame).
+        pub fn draw_frame(&mut self, data: &[u8], width: u32, height: u32, x: u32, y: u32) {
+            let mon_width = self.monitor_info.width;
+            let mon_height = self.monitor_info.height;
+            let stride = mon_width * 4;
+
+            // Create buffer
+            let (buffer, canvas) = match self.pool.create_buffer(
+                mon_width as i32,
+                mon_height as i32,
+                stride as i32,
+                WlShmFormat::Argb8888,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create buffer for MonitorSurface {}: {}",
+                        self.monitor_info.name,
+                        e
+                    );
+                    return;
+                }
+            };
+
+            // For full frame update
+            if x == 0 && y == 0 && width == mon_width && height == mon_height {
+                let copy_len = canvas.len().min(data.len());
+                canvas[..copy_len].copy_from_slice(&data[..copy_len]);
+                self.retained_content[..copy_len].copy_from_slice(&data[..copy_len]);
+            } else {
+                // Partial update: copy retained content first, then blit new data
+                let retain_len = canvas.len().min(self.retained_content.len());
+                canvas[..retain_len].copy_from_slice(&self.retained_content[..retain_len]);
+
+                // Blit partial data
+                let src_stride = width * 4;
+                for row in 0..height {
+                    let dest_y = y + row;
+                    if dest_y >= mon_height {
+                        break;
+                    }
+
+                    let src_start = (row as usize) * (src_stride as usize);
+                    let src_end = src_start + (width as usize) * 4;
+                    if src_end > data.len() {
+                        break;
+                    }
+
+                    let dest_start = (dest_y as usize) * (stride as usize) + (x as usize) * 4;
+                    let dest_end = dest_start + (width as usize) * 4;
+
+                    if dest_end <= canvas.len() {
+                        canvas[dest_start..dest_end].copy_from_slice(&data[src_start..src_end]);
+                        if dest_end <= self.retained_content.len() {
+                            self.retained_content[dest_start..dest_end]
+                                .copy_from_slice(&data[src_start..src_end]);
+                        }
+                    }
+                }
+            }
+
+            // Attach and commit
+            self.surface.attach(Some(buffer.wl_buffer()), 0, 0);
+            self.surface
+                .damage_buffer(x as i32, y as i32, width as i32, height as i32);
+            self.surface.commit();
+
+            self.buffer = Some(buffer);
+            self.dirty = false;
+        }
+
+        /// Resizes the buffer pool if the monitor resolution changed.
+        pub fn resize(
+            &mut self,
+            width: u32,
+            height: u32,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            if width == self.monitor_info.width && height == self.monitor_info.height {
+                return Ok(());
+            }
+
+            let buffer_size = (width * height * 4) as usize;
+            self.pool.resize(buffer_size)?;
+            self.retained_content.resize(buffer_size, 0);
+            self.monitor_info.width = width;
+            self.monitor_info.height = height;
+            self.dirty = true;
+
+            tracing::debug!(
+                "MonitorSurface {} resized to {}x{}",
+                self.monitor_info.name,
+                width,
+                height
+            );
+
+            Ok(())
+        }
+    }
+
+    impl Drop for MonitorSurface {
+        fn drop(&mut self) {
+            // Destroy the surface - this is critical for proper cleanup
+            // (project-context.md: "ALWAYS implement Drop for Wayland surfaces")
+            tracing::debug!(
+                "Destroying MonitorSurface for {} (id={})",
+                self.monitor_info.name,
+                self.monitor_info.id
+            );
+            self.surface.destroy();
+            // buffer and pool are dropped automatically by Rust
+        }
+    }
+
     /// Messages sent from the Wayland window to the main application.
     #[derive(Debug)]
     pub enum WindowEvent {
@@ -231,6 +530,18 @@ mod linux {
         /// WlOutput references for fullscreen targeting.
         /// Kept separate because WlOutput doesn't implement Clone.
         outputs: HashMap<u32, WlOutput>,
+        /// Multi-monitor surfaces (Story 3.3).
+        /// Maps monitor ID to MonitorSurface for per-monitor rendering.
+        /// Empty when in single-surface mode, populated when multi_monitor_mode is true.
+        multi_surfaces: HashMap<u32, MonitorSurface>,
+        /// Whether multi-monitor mode is active.
+        /// When false, uses the single `window` field (backward compatible).
+        /// When true, uses `multi_surfaces` for per-monitor rendering.
+        multi_monitor_mode: bool,
+        /// Reference to compositor state for creating surfaces.
+        compositor: CompositorState,
+        /// Reference to xdg_shell for window decoration.
+        xdg_shell: XdgShell,
     }
 
     impl WaylandWindow {
@@ -317,6 +628,11 @@ mod linux {
                 current_layout: 0,
                 monitors: HashMap::new(),
                 outputs: HashMap::new(),
+                // Story 3.3: Multi-monitor support
+                multi_surfaces: HashMap::new(),
+                multi_monitor_mode: false, // Default to single-surface mode
+                compositor,
+                xdg_shell,
             };
 
             Ok((event_loop, state, event_rx))
@@ -444,6 +760,238 @@ mod linux {
             }
             // TODO(Story 3.1): Log warning if wlr-output-management is not available
             // for enhanced multi-monitor support (AC 2). Currently using basic wl_output.
+        }
+
+        // =====================================================================
+        // Story 3.3: Multi-Monitor Surface Management
+        // =====================================================================
+
+        /// Returns whether multi-monitor mode is active.
+        pub fn is_multi_monitor_mode(&self) -> bool {
+            self.multi_monitor_mode
+        }
+
+        /// Creates a MonitorSurface for a specific monitor.
+        ///
+        /// # Arguments
+        /// * `qh` - The queue handle for creating Wayland objects
+        /// * `monitor_id` - The ID of the monitor to create a surface for
+        ///
+        /// # Returns
+        /// Ok(()) if the surface was created, Err if the monitor doesn't exist or creation failed.
+        pub fn create_surface_for_monitor(
+            &mut self,
+            qh: &QueueHandle<Self>,
+            monitor_id: u32,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            // Get monitor info
+            let monitor_info = self
+                .monitors
+                .get(&monitor_id)
+                .cloned()
+                .ok_or_else(|| format!("Monitor {} not found", monitor_id))?;
+
+            // Get WlOutput for this monitor
+            let output = self
+                .outputs
+                .get(&monitor_id)
+                .cloned()
+                .ok_or_else(|| format!("WlOutput for monitor {} not found", monitor_id))?;
+
+            // Create MonitorSurface
+            let surface = MonitorSurface::new(
+                &self.compositor,
+                &self.shm,
+                qh,
+                output,
+                monitor_info.clone(),
+            )?;
+
+            tracing::info!(
+                "Created surface for monitor {} ({}x{} at {}, {})",
+                monitor_info.name,
+                monitor_info.width,
+                monitor_info.height,
+                monitor_info.x,
+                monitor_info.y
+            );
+
+            self.multi_surfaces.insert(monitor_id, surface);
+            Ok(())
+        }
+
+        /// Creates MonitorSurfaces for all detected monitors.
+        ///
+        /// This enables multi-monitor mode by creating a separate Wayland surface
+        /// for each connected monitor. Each surface can be independently fullscreened
+        /// on its target output.
+        ///
+        /// # Arguments
+        /// * `qh` - The queue handle for creating Wayland objects
+        ///
+        /// # Returns
+        /// The number of surfaces created, or an error if creation failed.
+        pub fn create_surfaces_for_all_monitors(
+            &mut self,
+            qh: &QueueHandle<Self>,
+        ) -> Result<usize, Box<dyn std::error::Error>> {
+            if self.monitors.is_empty() {
+                return Err("No monitors detected".into());
+            }
+
+            // Clear any existing multi-surfaces
+            self.destroy_all_surfaces();
+
+            // Get monitor IDs (we can't iterate and mutate at the same time)
+            let monitor_ids: Vec<u32> = self.monitors.keys().cloned().collect();
+
+            let mut created_count = 0;
+            for monitor_id in monitor_ids {
+                match self.create_surface_for_monitor(qh, monitor_id) {
+                    Ok(()) => created_count += 1,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to create surface for monitor {}: {}",
+                            monitor_id,
+                            e
+                        );
+                    }
+                }
+            }
+
+            if created_count > 0 {
+                self.multi_monitor_mode = true;
+                tracing::info!(
+                    "Multi-monitor mode enabled: {} surface(s) created",
+                    created_count
+                );
+            } else {
+                return Err("Failed to create any surfaces".into());
+            }
+
+            Ok(created_count)
+        }
+
+        /// Destroys all multi-monitor surfaces and returns to single-surface mode.
+        ///
+        /// This properly cleans up all MonitorSurface instances, releasing Wayland
+        /// resources via their Drop implementations.
+        pub fn destroy_all_surfaces(&mut self) {
+            if !self.multi_surfaces.is_empty() {
+                tracing::info!(
+                    "Destroying {} multi-monitor surface(s)",
+                    self.multi_surfaces.len()
+                );
+                self.multi_surfaces.clear(); // Drop triggers cleanup
+            }
+            self.multi_monitor_mode = false;
+        }
+
+        /// Returns a reference to a specific MonitorSurface by monitor ID.
+        pub fn get_surface(&self, monitor_id: u32) -> Option<&MonitorSurface> {
+            self.multi_surfaces.get(&monitor_id)
+        }
+
+        /// Returns a mutable reference to a specific MonitorSurface by monitor ID.
+        pub fn get_surface_mut(&mut self, monitor_id: u32) -> Option<&mut MonitorSurface> {
+            self.multi_surfaces.get_mut(&monitor_id)
+        }
+
+        /// Returns an iterator over all MonitorSurfaces.
+        pub fn surfaces(&self) -> impl Iterator<Item = (&u32, &MonitorSurface)> {
+            self.multi_surfaces.iter()
+        }
+
+        /// Returns a mutable iterator over all MonitorSurfaces.
+        pub fn surfaces_mut(&mut self) -> impl Iterator<Item = (&u32, &mut MonitorSurface)> {
+            self.multi_surfaces.iter_mut()
+        }
+
+        /// Returns the number of active multi-monitor surfaces.
+        pub fn surface_count(&self) -> usize {
+            self.multi_surfaces.len()
+        }
+
+        /// Draws a solid color to all multi-monitor surfaces.
+        ///
+        /// In single-surface mode, uses the legacy draw_solid behavior.
+        /// In multi-monitor mode, draws to all MonitorSurfaces.
+        pub fn draw_solid_all(&mut self, r: u8, g: u8, b: u8) {
+            if self.multi_monitor_mode {
+                for surface in self.multi_surfaces.values_mut() {
+                    surface.draw_solid(r, g, b);
+                }
+            } else {
+                self.draw_solid(r, g, b);
+            }
+        }
+
+        /// Draws a frame region to the appropriate surface(s).
+        ///
+        /// In multi-monitor mode, this determines which surface(s) the frame
+        /// region intersects and draws to each. The region coordinates are in
+        /// the combined desktop space (matching server's view).
+        ///
+        /// # Arguments
+        /// * `data` - BGRA pixel data for the region
+        /// * `width` - Width of the region in pixels
+        /// * `height` - Height of the region in pixels
+        /// * `x` - X offset in combined desktop space
+        /// * `y` - Y offset in combined desktop space
+        ///
+        /// # Note
+        /// Monitor coordinates (x, y) can be negative (e.g., monitor to the left of primary).
+        /// This function handles negative coordinates correctly using i32 arithmetic.
+        pub fn draw_frame_to_surfaces(
+            &mut self,
+            data: &[u8],
+            width: u32,
+            height: u32,
+            x: u32,
+            y: u32,
+        ) {
+            if !self.multi_monitor_mode {
+                // Single-surface mode: use legacy behavior
+                self.draw_frame_at(data, width, height, x, y);
+                return;
+            }
+
+            // Multi-monitor mode: dispatch to appropriate surface(s)
+            // For now, find the surface that contains this region
+            // (Full implementation of region mapping will be in Story 3.5)
+
+            // Use i32 for frame coordinates to handle negative monitor positions
+            // Frame coordinates from RDP are always non-negative, but monitor positions can be negative
+            let frame_x = x as i32;
+            let frame_y = y as i32;
+            let frame_w = width as i32;
+            let frame_h = height as i32;
+
+            for (_id, surface) in self.multi_surfaces.iter_mut() {
+                let mon = surface.monitor_info();
+                // Monitor coordinates are already i32 (can be negative)
+                let mon_x = mon.x;
+                let mon_y = mon.y;
+                let mon_w = mon.width as i32;
+                let mon_h = mon.height as i32;
+
+                // Check if the frame region intersects this monitor (i32 arithmetic handles negatives)
+                let intersects = frame_x < mon_x + mon_w
+                    && frame_x + frame_w > mon_x
+                    && frame_y < mon_y + mon_h
+                    && frame_y + frame_h > mon_y;
+
+                if intersects {
+                    // Calculate local coordinates within this surface
+                    // saturating_sub handles case where frame starts before monitor
+                    let local_x = (frame_x - mon_x).max(0) as u32;
+                    let local_y = (frame_y - mon_y).max(0) as u32;
+
+                    // For simplicity, pass the full region data
+                    // (Story 3.5 will implement proper region slicing)
+                    surface.draw_frame(data, width, height, local_x, local_y);
+                }
+            }
         }
 
         /// Creates a MonitorInfo from OutputState info.
@@ -1331,6 +1879,64 @@ mod stub {
         }
     }
 
+    /// Stub MonitorSurface for non-Linux platforms (Story 3.3).
+    pub struct MonitorSurface {
+        /// Monitor info (public for testing).
+        pub monitor_info: MonitorInfo,
+    }
+
+    impl MonitorSurface {
+        pub fn wl_surface(&self) -> &() {
+            &()
+        }
+
+        pub fn target_output(&self) -> &() {
+            &()
+        }
+
+        pub fn monitor_info(&self) -> &MonitorInfo {
+            &self.monitor_info
+        }
+
+        pub fn monitor_id(&self) -> u32 {
+            self.monitor_info.id
+        }
+
+        pub fn dimensions(&self) -> (u32, u32) {
+            (self.monitor_info.width, self.monitor_info.height)
+        }
+
+        pub fn is_fullscreen(&self) -> bool {
+            false
+        }
+
+        pub fn set_fullscreen_state(&mut self, _fullscreen: bool) {}
+
+        pub fn is_dirty(&self) -> bool {
+            false
+        }
+
+        pub fn mark_dirty(&mut self) {}
+
+        pub fn mark_configured(&mut self) {}
+
+        pub fn is_configured(&self) -> bool {
+            false
+        }
+
+        pub fn draw_solid(&mut self, _r: u8, _g: u8, _b: u8) {}
+
+        pub fn draw_frame(&mut self, _data: &[u8], _width: u32, _height: u32, _x: u32, _y: u32) {}
+
+        pub fn resize(
+            &mut self,
+            _width: u32,
+            _height: u32,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            Ok(())
+        }
+    }
+
     /// Stub WindowEvent for non-Linux platforms.
     #[derive(Debug)]
     pub enum WindowEvent {
@@ -1498,6 +2104,52 @@ mod stub {
         pub fn primary_monitor(&self) -> Option<MonitorInfo> {
             None
         }
+
+        // Story 3.3: Multi-monitor stubs
+        pub fn is_multi_monitor_mode(&self) -> bool {
+            false
+        }
+
+        pub fn create_surface_for_monitor(
+            &mut self,
+            _qh: &(),
+            _monitor_id: u32,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            Err("Wayland is only supported on Linux".into())
+        }
+
+        pub fn create_surfaces_for_all_monitors(
+            &mut self,
+            _qh: &(),
+        ) -> Result<usize, Box<dyn std::error::Error>> {
+            Err("Wayland is only supported on Linux".into())
+        }
+
+        pub fn destroy_all_surfaces(&mut self) {}
+
+        pub fn get_surface(&self, _monitor_id: u32) -> Option<&MonitorSurface> {
+            None
+        }
+
+        pub fn get_surface_mut(&mut self, _monitor_id: u32) -> Option<&mut MonitorSurface> {
+            None
+        }
+
+        pub fn surface_count(&self) -> usize {
+            0
+        }
+
+        pub fn draw_solid_all(&mut self, _r: u8, _g: u8, _b: u8) {}
+
+        pub fn draw_frame_to_surfaces(
+            &mut self,
+            _data: &[u8],
+            _width: u32,
+            _height: u32,
+            _x: u32,
+            _y: u32,
+        ) {
+        }
     }
 }
 
@@ -1635,5 +2287,278 @@ mod tests {
         assert_eq!(cloned.name, monitor.name);
         assert_eq!(cloned.width, monitor.width);
         assert_eq!(cloned.height, monitor.height);
+    }
+
+    // Story 3.3: Multi-monitor surface tests
+
+    /// Helper to create a test MonitorInfo
+    fn create_test_monitor(
+        id: u32,
+        name: &str,
+        width: u32,
+        height: u32,
+        x: i32,
+        y: i32,
+    ) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            name: name.to_string(),
+            make: None,
+            model: None,
+            width,
+            height,
+            x,
+            y,
+            refresh_mhz: 60000,
+            scale: 1,
+        }
+    }
+
+    #[test]
+    fn test_monitor_surface_dimensions() {
+        let monitor = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+        // Using stub on non-Linux, which returns the stored monitor dimensions
+        #[cfg(not(target_os = "linux"))]
+        {
+            let surface = MonitorSurface {
+                monitor_info: monitor.clone(),
+            };
+            assert_eq!(surface.dimensions(), (1920, 1080));
+            assert_eq!(surface.monitor_id(), 1);
+        }
+        // On Linux, can't test without actual Wayland connection
+        #[cfg(target_os = "linux")]
+        {
+            // Just verify monitor info is correct
+            assert_eq!(monitor.width, 1920);
+            assert_eq!(monitor.height, 1080);
+        }
+    }
+
+    #[test]
+    fn test_monitor_surface_monitor_info() {
+        let monitor = create_test_monitor(2, "HDMI-A-1", 2560, 1440, 1920, 0);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let surface = MonitorSurface {
+                monitor_info: monitor.clone(),
+            };
+            let info = surface.monitor_info();
+            assert_eq!(info.id, 2);
+            assert_eq!(info.name, "HDMI-A-1");
+            assert_eq!(info.width, 2560);
+            assert_eq!(info.height, 1440);
+            assert_eq!(info.x, 1920);
+            assert_eq!(info.y, 0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(monitor.name, "HDMI-A-1");
+        }
+    }
+
+    #[test]
+    fn test_monitor_surface_stub_methods() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let monitor = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+            let mut surface = MonitorSurface {
+                monitor_info: monitor,
+            };
+
+            // Test stub methods don't panic
+            assert!(!surface.is_fullscreen());
+            surface.set_fullscreen_state(true);
+            assert!(!surface.is_fullscreen()); // Stub always returns false
+
+            assert!(!surface.is_dirty());
+            surface.mark_dirty();
+            assert!(!surface.is_dirty()); // Stub always returns false
+
+            assert!(!surface.is_configured());
+            surface.mark_configured();
+            assert!(!surface.is_configured()); // Stub always returns false
+
+            // Drawing methods should not panic
+            surface.draw_solid(255, 0, 0);
+            surface.draw_frame(&[0u8; 16], 2, 2, 0, 0);
+            assert!(surface.resize(800, 600).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_wayland_window_multi_monitor_stub() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut window = WaylandWindow;
+
+            // Multi-monitor mode defaults to false
+            assert!(!window.is_multi_monitor_mode());
+
+            // Surface operations should return None/0 in stub
+            assert_eq!(window.surface_count(), 0);
+            assert!(window.get_surface(1).is_none());
+            assert!(window.get_surface_mut(1).is_none());
+
+            // Creation should fail on non-Linux
+            assert!(window.create_surface_for_monitor(&(), 1).is_err());
+            assert!(window.create_surfaces_for_all_monitors(&()).is_err());
+
+            // Destroy should not panic
+            window.destroy_all_surfaces();
+
+            // Drawing methods should not panic
+            window.draw_solid_all(255, 255, 255);
+            window.draw_frame_to_surfaces(&[0u8; 16], 2, 2, 0, 0);
+        }
+    }
+
+    #[test]
+    fn test_monitor_layout_primary_at_origin() {
+        // Test that monitors at (0,0) are identified as primary
+        let primary = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+        let secondary = create_test_monitor(2, "HDMI-A-1", 1920, 1080, 1920, 0);
+
+        // Primary is at origin
+        assert_eq!(primary.x, 0);
+        assert_eq!(primary.y, 0);
+
+        // Secondary is offset
+        assert_eq!(secondary.x, 1920);
+        assert_eq!(secondary.y, 0);
+    }
+
+    #[test]
+    fn test_monitor_layout_vertical_arrangement() {
+        // Test vertical monitor arrangement (one above the other)
+        let top = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+        let bottom = create_test_monitor(2, "HDMI-A-1", 1920, 1080, 0, 1080);
+
+        // Top monitor at origin
+        assert_eq!(top.x, 0);
+        assert_eq!(top.y, 0);
+
+        // Bottom monitor below
+        assert_eq!(bottom.x, 0);
+        assert_eq!(bottom.y, 1080);
+
+        // Combined bounding box would be 1920x2160
+        let combined_width = top.width.max(bottom.width);
+        let combined_height =
+            (top.y + top.height as i32).max(bottom.y + bottom.height as i32) as u32;
+        assert_eq!(combined_width, 1920);
+        assert_eq!(combined_height, 2160);
+    }
+
+    #[test]
+    fn test_monitor_layout_different_resolutions() {
+        // Test monitors with different resolutions (4K + 1080p)
+        let monitor_4k = create_test_monitor(1, "DP-1", 3840, 2160, 0, 0);
+        let monitor_1080p = create_test_monitor(2, "HDMI-A-1", 1920, 1080, 3840, 540); // Vertically centered
+
+        // 4K at origin
+        assert_eq!(monitor_4k.width, 3840);
+        assert_eq!(monitor_4k.height, 2160);
+
+        // 1080p next to it, vertically centered
+        assert_eq!(monitor_1080p.x, 3840);
+        assert_eq!(monitor_1080p.y, 540);
+
+        // Combined bounding box
+        let combined_width = (monitor_1080p.x + monitor_1080p.width as i32) as u32;
+        let combined_height = monitor_4k.height; // 4K is taller
+        assert_eq!(combined_width, 5760); // 3840 + 1920
+        assert_eq!(combined_height, 2160);
+    }
+
+    #[test]
+    fn test_monitor_layout_negative_coordinates() {
+        // Test monitor to the LEFT of primary (negative x coordinate)
+        // Common setup: primary at center, secondary to the left
+        let left_monitor = create_test_monitor(1, "DP-1", 1920, 1080, -1920, 0);
+        let primary_monitor = create_test_monitor(2, "DP-2", 1920, 1080, 0, 0);
+
+        // Left monitor has negative x
+        assert_eq!(left_monitor.x, -1920);
+        assert_eq!(left_monitor.y, 0);
+
+        // Primary at origin
+        assert_eq!(primary_monitor.x, 0);
+        assert_eq!(primary_monitor.y, 0);
+
+        // Verify coordinate arithmetic works with negatives
+        // Combined desktop spans from -1920 to 1920 (total width 3840)
+        let min_x = left_monitor.x.min(primary_monitor.x);
+        let max_x = (left_monitor.x + left_monitor.width as i32)
+            .max(primary_monitor.x + primary_monitor.width as i32);
+        let combined_width = (max_x - min_x) as u32;
+
+        assert_eq!(min_x, -1920);
+        assert_eq!(max_x, 1920);
+        assert_eq!(combined_width, 3840);
+    }
+
+    #[test]
+    fn test_monitor_layout_negative_y_coordinate() {
+        // Test monitor ABOVE primary (negative y coordinate)
+        let top_monitor = create_test_monitor(1, "DP-1", 1920, 1080, 0, -1080);
+        let primary_monitor = create_test_monitor(2, "DP-2", 1920, 1080, 0, 0);
+
+        // Top monitor has negative y
+        assert_eq!(top_monitor.x, 0);
+        assert_eq!(top_monitor.y, -1080);
+
+        // Primary at origin
+        assert_eq!(primary_monitor.x, 0);
+        assert_eq!(primary_monitor.y, 0);
+
+        // Combined height spans from -1080 to 1080
+        let min_y = top_monitor.y.min(primary_monitor.y);
+        let max_y = (top_monitor.y + top_monitor.height as i32)
+            .max(primary_monitor.y + primary_monitor.height as i32);
+        let combined_height = (max_y - min_y) as u32;
+
+        assert_eq!(min_y, -1080);
+        assert_eq!(max_y, 1080);
+        assert_eq!(combined_height, 2160);
+    }
+
+    #[test]
+    fn test_frame_intersection_with_negative_monitor() {
+        // Test that frame intersection logic works with negative coordinates
+        let left_monitor = create_test_monitor(1, "DP-1", 1920, 1080, -1920, 0);
+
+        // A frame at desktop coordinates (0, 0) should NOT intersect left monitor
+        // because left monitor spans x: -1920 to 0
+        let frame_x: i32 = 0;
+        let frame_y: i32 = 0;
+        let frame_w: i32 = 100;
+        let frame_h: i32 = 100;
+
+        let mon_x = left_monitor.x;
+        let mon_y = left_monitor.y;
+        let mon_w = left_monitor.width as i32;
+        let mon_h = left_monitor.height as i32;
+
+        // Frame at (0,0) with size 100x100 should NOT intersect monitor at (-1920,0) to (0,1080)
+        // Because frame_x (0) is NOT < mon_x + mon_w (0), the first condition fails
+        let intersects = frame_x < mon_x + mon_w
+            && frame_x + frame_w > mon_x
+            && frame_y < mon_y + mon_h
+            && frame_y + frame_h > mon_y;
+
+        // frame_x (0) < mon_x + mon_w (-1920 + 1920 = 0) is FALSE (0 < 0 is false)
+        assert!(!intersects);
+
+        // A frame at (-100, 0) SHOULD intersect the left monitor
+        let frame_x2: i32 = -100;
+        let intersects2 = frame_x2 < mon_x + mon_w
+            && frame_x2 + frame_w > mon_x
+            && frame_y < mon_y + mon_h
+            && frame_y + frame_h > mon_y;
+
+        // frame_x2 (-100) < mon_x + mon_w (0) is TRUE
+        // frame_x2 + frame_w (-100 + 100 = 0) > mon_x (-1920) is TRUE
+        assert!(intersects2);
     }
 }
