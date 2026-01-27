@@ -181,6 +181,7 @@ mod linux {
         /// Creates a new Wayland window.
         ///
         /// Returns the window state, event loop, and a channel receiver for window events.
+        #[allow(clippy::type_complexity)]
         pub fn new(
             config: WindowConfig,
         ) -> Result<
