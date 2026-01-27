@@ -557,6 +557,30 @@ fn run_event_loop(
                         error!("Failed to send key release to network thread");
                     }
                 }
+                WindowEvent::UnicodeKeyPressed { character } => {
+                    // Story 2.9: Send Unicode character for international keyboard support
+                    if to_network_tx
+                        .blocking_send(ToNetwork::UnicodeInput {
+                            character,
+                            pressed: true,
+                        })
+                        .is_err()
+                    {
+                        error!("Failed to send Unicode key press to network thread");
+                    }
+                }
+                WindowEvent::UnicodeKeyReleased { character } => {
+                    // Story 2.9: Send Unicode character release
+                    if to_network_tx
+                        .blocking_send(ToNetwork::UnicodeInput {
+                            character,
+                            pressed: false,
+                        })
+                        .is_err()
+                    {
+                        error!("Failed to send Unicode key release to network thread");
+                    }
+                }
                 WindowEvent::MouseMove { x, y } => {
                     // Map window coordinates to remote desktop coordinates
                     let (remote_x, remote_y) =

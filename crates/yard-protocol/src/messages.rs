@@ -233,6 +233,17 @@ pub enum ToNetwork {
         /// True for key press, false for key release.
         pressed: bool,
     },
+    /// Unicode character input for international keyboard support (Story 2.9).
+    ///
+    /// Used when the user types a character that may not have a direct scancode
+    /// mapping, such as accented characters (é, ü, ñ) or characters from
+    /// non-US keyboard layouts (AZERTY, QWERTZ, etc.).
+    UnicodeInput {
+        /// The Unicode character to send.
+        character: char,
+        /// True for key press, false for key release.
+        pressed: bool,
+    },
     /// Mouse movement event to send to the remote server.
     ///
     /// Coordinates are absolute positions in the remote desktop coordinate space.

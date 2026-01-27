@@ -89,10 +89,10 @@ async fn network_loop(
                 // Certificate decisions should be received during handle_connect
                 warn!("Received unexpected CertificateDecision outside of connection");
             }
-            ToNetwork::KeyboardInput { .. } => {
+            ToNetwork::KeyboardInput { .. } | ToNetwork::UnicodeInput { .. } => {
                 // Keyboard input should be received during active session
                 // Ignore if received outside of session (no connection established)
-                warn!("Received KeyboardInput outside of active session");
+                warn!("Received keyboard input outside of active session");
             }
             ToNetwork::MouseMove { .. }
             | ToNetwork::MouseButton { .. }
@@ -385,6 +385,33 @@ where
                             }
                         }
                     }
+                    Some(ToNetwork::UnicodeInput { character, pressed }) => {
+                        // Story 2.9: Unicode input for international keyboards
+                        // Use IronRDP's UnicodeKeyPressed/Released for character input
+                        let operation = if pressed {
+                            Operation::UnicodeKeyPressed(character)
+                        } else {
+                            Operation::UnicodeKeyReleased(character)
+                        };
+
+                        // Apply to input database and send
+                        let events = input_database.apply([operation]);
+
+                        if !events.is_empty() {
+                            match active_stage.process_fastpath_input(image, &events) {
+                                Ok(outputs) => {
+                                    for output in outputs {
+                                        if let ActiveStageOutput::ResponseFrame(response) = output {
+                                            framed.write_all(&response).await?;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to process Unicode input: {e}");
+                                }
+                            }
+                        }
+                    }
                     Some(ToNetwork::MouseMove { x, y }) => {
                         // Create mouse move operation
                         let operation = Operation::MouseMove(MousePosition { x, y });
@@ -541,6 +568,9 @@ fn build_rdp_config(config: &ConnectionConfig) -> Result<connector::Config, Conn
         keyboard_type: KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
         keyboard_functional_keys_count: 12,
+        // TODO(Story 2.9): Detect XKB layout and map to RDP layout code.
+        // Currently hardcoded to US English. Unicode input bypasses most layout
+        // issues, but the server may still use this for function keys and shortcuts.
         keyboard_layout: 0x0409, // US English
         ime_file_name: String::new(),
         bitmap: Some(bitmap_config),

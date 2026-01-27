@@ -39,6 +39,7 @@ mod linux {
         delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
         registry_handlers,
     };
+    use std::collections::HashSet;
 
     /// Messages sent from the Wayland window to the main application.
     #[derive(Debug)]
@@ -53,12 +54,19 @@ mod linux {
         FullscreenChanged { is_fullscreen: bool },
         /// A keyboard shortcut was pressed.
         KeyboardShortcut(KeyboardShortcut),
-        /// A key was pressed.
+        /// A key was pressed (scancode-based input).
         /// The scancode is an RDP scancode (translated from evdev).
+        /// Used for special keys, function keys, and modifier combinations.
         KeyPressed { scancode: u16 },
-        /// A key was released.
+        /// A key was released (scancode-based input).
         /// The scancode is an RDP scancode (translated from evdev).
         KeyReleased { scancode: u16 },
+        /// A Unicode character was typed (character-based input).
+        /// Used for international keyboard layouts and special characters.
+        /// This bypasses scancode translation for better layout support.
+        UnicodeKeyPressed { character: char },
+        /// A Unicode character key was released.
+        UnicodeKeyReleased { character: char },
         /// Mouse pointer moved.
         /// Coordinates are in surface-local space (f64 for subpixel precision).
         MouseMove { x: f64, y: f64 },
@@ -177,6 +185,11 @@ mod linux {
         remote_width: u32,
         /// Remote desktop height (for coordinate mapping).
         remote_height: u32,
+        /// Keys currently pressed via Unicode input (tracked by raw_code).
+        /// Used to ensure release events match the input method of press events.
+        unicode_keys_pressed: HashSet<u32>,
+        /// Current XKB layout index (for logging layout changes).
+        current_layout: u32,
     }
 
     impl WaylandWindow {
@@ -259,6 +272,8 @@ mod linux {
                 pressed_buttons: Vec::new(),
                 remote_width: config.width, // Default to window size, updated by set_remote_resolution
                 remote_height: config.height,
+                unicode_keys_pressed: HashSet::new(),
+                current_layout: 0,
             };
 
             Ok((event_loop, state, event_rx))
@@ -816,7 +831,34 @@ mod linux {
                 return; // Don't forward client shortcuts to remote
             }
 
-            // Translate evdev keycode to RDP scancode and forward
+            // Story 2.9: International keyboard support
+            // Use Unicode input for printable characters when no Ctrl modifier is held
+            // This ensures correct character input for non-US layouts (AZERTY, QWERTZ, etc.)
+            // Note: Grapheme clusters (emoji with modifiers, combining diacritics) may have
+            // multiple chars - these fall back to scancode which may not work correctly.
+            if !self.modifiers.ctrl
+                && !self.modifiers.alt
+                && let Some(ref utf8) = event.utf8
+            {
+                // Get the first character if it's a single printable character
+                let chars: Vec<char> = utf8.chars().collect();
+                if chars.len() == 1 && !chars[0].is_control() {
+                    let character = chars[0];
+                    tracing::trace!(
+                        "Unicode key pressed: '{}' (U+{:04X})",
+                        character,
+                        character as u32
+                    );
+                    // Track this key as sent via Unicode for correct release handling
+                    self.unicode_keys_pressed.insert(event.raw_code);
+                    let _ = self
+                        .event_tx
+                        .send(WindowEvent::UnicodeKeyPressed { character });
+                    return;
+                }
+            }
+
+            // Fallback to scancode for special keys, modifiers, or when Unicode not available
             if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw_code) {
                 tracing::trace!(
                     "Key pressed: evdev {} -> RDP 0x{:04X}",
@@ -837,7 +879,35 @@ mod linux {
             _serial: u32,
             event: KeyEvent,
         ) {
-            // Translate evdev keycode to RDP scancode and forward
+            // Story 2.9: Check if this key was pressed via Unicode
+            // We must release via the same method to avoid stuck keys, even if
+            // modifiers changed between press and release.
+            if self.unicode_keys_pressed.remove(&event.raw_code) {
+                // Key was pressed via Unicode - release via Unicode
+                if let Some(ref utf8) = event.utf8 {
+                    let chars: Vec<char> = utf8.chars().collect();
+                    if chars.len() == 1 && !chars[0].is_control() {
+                        let character = chars[0];
+                        tracing::trace!(
+                            "Unicode key released: '{}' (U+{:04X})",
+                            character,
+                            character as u32
+                        );
+                        let _ = self
+                            .event_tx
+                            .send(WindowEvent::UnicodeKeyReleased { character });
+                        return;
+                    }
+                }
+                // Fallback: utf8 not available on release, send the last known character
+                // This shouldn't happen normally, but handle gracefully
+                tracing::warn!(
+                    "Unicode key release without utf8 for raw_code {}",
+                    event.raw_code
+                );
+            }
+
+            // Fallback to scancode release (key was pressed via scancode)
             if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw_code) {
                 tracing::trace!(
                     "Key released: evdev {} -> RDP 0x{:04X}",
@@ -856,9 +926,19 @@ mod linux {
             _serial: u32,
             modifiers: Modifiers,
             _raw_modifiers: RawModifiers,
-            _layout: u32,
+            layout: u32,
         ) {
             self.modifiers = modifiers;
+
+            // Story 2.9: Log keyboard layout changes (AC 3)
+            if layout != self.current_layout {
+                tracing::debug!(
+                    "Keyboard layout changed: {} -> {} (Unicode input handles this automatically)",
+                    self.current_layout,
+                    layout
+                );
+                self.current_layout = layout;
+            }
         }
 
         fn repeat_key(
@@ -869,7 +949,26 @@ mod linux {
             _serial: u32,
             event: KeyEvent,
         ) {
-            // Forward repeated keys to remote (same as press_key but for repeats)
+            // Story 2.9: Use Unicode for repeated character keys
+            // Note: Key repeat sends only press events (no release between repeats).
+            // The release comes from release_key when the user actually releases.
+            // We don't need to update unicode_keys_pressed since the original
+            // press_key already tracked it.
+            if !self.modifiers.ctrl
+                && !self.modifiers.alt
+                && let Some(ref utf8) = event.utf8
+            {
+                let chars: Vec<char> = utf8.chars().collect();
+                if chars.len() == 1 && !chars[0].is_control() {
+                    let character = chars[0];
+                    let _ = self
+                        .event_tx
+                        .send(WindowEvent::UnicodeKeyPressed { character });
+                    return;
+                }
+            }
+
+            // Fallback to scancode for repeated special keys
             if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw_code) {
                 let _ = self.event_tx.send(WindowEvent::KeyPressed { scancode });
             }
@@ -1022,6 +1121,12 @@ mod stub {
         },
         KeyReleased {
             scancode: u16,
+        },
+        UnicodeKeyPressed {
+            character: char,
+        },
+        UnicodeKeyReleased {
+            character: char,
         },
         MouseMove {
             x: f64,
