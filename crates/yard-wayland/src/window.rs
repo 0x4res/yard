@@ -7,29 +7,30 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::sync::Arc;
-
-    use calloop::channel::{Channel, Sender};
-    use calloop::{EventLoop, LoopHandle};
+    use calloop::channel::Sender;
+    use calloop::EventLoop;
     use calloop_wayland_source::WaylandSource;
     use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
     use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
     use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard;
-    use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
     use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
+    use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
     use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
+    use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format as WlShmFormat;
     use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
     use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
     use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-    use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers};
+    use smithay_client_toolkit::seat::keyboard::{
+        KeyEvent, KeyboardHandler, Keysym, Modifiers, RepeatInfo,
+    };
     use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
     use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
-    use smithay_client_toolkit::shell::WaylandSurface;
-    use smithay_client_toolkit::shell::xdg::XdgShell;
     use smithay_client_toolkit::shell::xdg::window::{
         Window, WindowConfigure, WindowDecorations, WindowHandler, WindowState,
     };
+    use smithay_client_toolkit::shell::xdg::XdgShell;
+    use smithay_client_toolkit::shell::WaylandSurface;
     use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
     use smithay_client_toolkit::shm::{Shm, ShmHandler};
     use smithay_client_toolkit::{
@@ -150,10 +151,10 @@ mod linux {
         is_fullscreen: bool,
         /// Current keyboard modifiers state.
         modifiers: Modifiers,
-        /// Reference to the keyboard object (if available).
-        keyboard: Option<WlKeyboard>,
-        /// Reference to the pointer object (if available).
-        pointer: Option<WlPointer>,
+        /// Whether a keyboard device is available.
+        has_keyboard: bool,
+        /// Whether a pointer device is available.
+        has_pointer: bool,
         /// Current pointer position (surface-local coordinates).
         pointer_position: (f64, f64),
         /// Currently pressed mouse buttons (evdev codes).
@@ -238,8 +239,8 @@ mod linux {
                 dirty: true,
                 is_fullscreen: false, // Will be updated when compositor confirms
                 modifiers: Modifiers::default(),
-                keyboard: None,
-                pointer: None,
+                has_keyboard: false,
+                has_pointer: false,
                 pointer_position: (0.0, 0.0),
                 pressed_buttons: Vec::new(),
                 remote_width: config.width,  // Default to window size, updated by set_remote_resolution
@@ -330,7 +331,7 @@ mod linux {
                 width as i32,
                 height as i32,
                 stride as i32,
-                smithay_client_toolkit::shm::wl_shm::Format::Argb8888,
+                WlShmFormat::Argb8888,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -439,7 +440,7 @@ mod linux {
                 width as i32,
                 height as i32,
                 stride as i32,
-                smithay_client_toolkit::shm::wl_shm::Format::Argb8888,
+                WlShmFormat::Argb8888,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -490,7 +491,7 @@ mod linux {
                 self.width as i32,
                 self.height as i32,
                 window_stride as i32,
-                smithay_client_toolkit::shm::wl_shm::Format::Argb8888,
+                WlShmFormat::Argb8888,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -710,15 +711,17 @@ mod linux {
             seat: WlSeat,
             capability: Capability,
         ) {
-            if capability == Capability::Keyboard && self.keyboard.is_none() {
+            if capability == Capability::Keyboard && !self.has_keyboard {
                 tracing::debug!("Keyboard capability available, requesting keyboard");
-                let keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
-                self.keyboard = keyboard.map(|k| k.wl_keyboard().clone());
+                if self.seat_state.get_keyboard(qh, &seat, None).is_ok() {
+                    self.has_keyboard = true;
+                }
             }
-            if capability == Capability::Pointer && self.pointer.is_none() {
+            if capability == Capability::Pointer && !self.has_pointer {
                 tracing::debug!("Pointer capability available, requesting pointer");
-                let pointer = self.seat_state.get_pointer(qh, &seat).ok();
-                self.pointer = pointer.map(|p| p.wl_pointer().clone());
+                if self.seat_state.get_pointer(qh, &seat).is_ok() {
+                    self.has_pointer = true;
+                }
             }
         }
 
@@ -731,11 +734,11 @@ mod linux {
         ) {
             if capability == Capability::Keyboard {
                 tracing::debug!("Keyboard capability removed");
-                self.keyboard = None;
+                self.has_keyboard = false;
             }
             if capability == Capability::Pointer {
                 tracing::debug!("Pointer capability removed");
-                self.pointer = None;
+                self.has_pointer = false;
             }
         }
 
@@ -791,11 +794,11 @@ mod linux {
             }
 
             // Translate evdev keycode to RDP scancode and forward
-            if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw) {
-                tracing::trace!("Key pressed: evdev {} -> RDP 0x{:04X}", event.raw, scancode);
+            if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw_code) {
+                tracing::trace!("Key pressed: evdev {} -> RDP 0x{:04X}", event.raw_code, scancode);
                 let _ = self.event_tx.send(WindowEvent::KeyPressed { scancode });
             } else {
-                tracing::trace!("Unknown key pressed: evdev {}", event.raw);
+                tracing::trace!("Unknown key pressed: evdev {}", event.raw_code);
             }
         }
 
@@ -808,10 +811,10 @@ mod linux {
             event: KeyEvent,
         ) {
             // Translate evdev keycode to RDP scancode and forward
-            if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw) {
+            if let Some(scancode) = crate::input::wayland_to_rdp_scancode(event.raw_code) {
                 tracing::trace!(
                     "Key released: evdev {} -> RDP 0x{:04X}",
-                    event.raw,
+                    event.raw_code,
                     scancode
                 );
                 let _ = self.event_tx.send(WindowEvent::KeyReleased { scancode });
@@ -825,9 +828,13 @@ mod linux {
             _keyboard: &WlKeyboard,
             _serial: u32,
             modifiers: Modifiers,
-            _layout: u32,
+            _raw_modifiers: u32,
         ) {
             self.modifiers = modifiers;
+        }
+
+        fn repeat_info(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _keyboard: &WlKeyboard, _repeat_info: RepeatInfo) {
+            // Key repeat is handled by the compositor
         }
     }
 
@@ -911,11 +918,11 @@ mod linux {
                     } => {
                         let (x, y) = event.position;
                         // Handle vertical scroll (most common)
-                        if let Some(value) = vertical.discrete {
+                        if vertical.discrete != 0 {
                             // Discrete scroll (wheel notches)
                             let _ = self.event_tx.send(WindowEvent::MouseAxis {
                                 horizontal: false,
-                                value: value as f64,
+                                value: vertical.discrete as f64,
                                 x,
                                 y,
                             });
@@ -929,10 +936,10 @@ mod linux {
                             });
                         }
                         // Handle horizontal scroll
-                        if let Some(value) = horizontal.discrete {
+                        if horizontal.discrete != 0 {
                             let _ = self.event_tx.send(WindowEvent::MouseAxis {
                                 horizontal: true,
-                                value: value as f64,
+                                value: horizontal.discrete as f64,
                                 x,
                                 y,
                             });
