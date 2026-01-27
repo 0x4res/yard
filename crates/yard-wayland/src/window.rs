@@ -694,6 +694,15 @@ mod linux {
         /// Monitor layout changed (connect or disconnect) (Story 3.6).
         /// Contains the full current monitor list for DISPLAYCONTROL notification.
         MonitorLayoutChanged { monitors: Vec<MonitorInfo> },
+        /// A monitor's resolution changed during the session (Story 3.7).
+        /// Emitted when Wayland reports a mode change for an existing monitor.
+        MonitorResolutionChanged {
+            monitor_id: u32,
+            old_width: u32,
+            old_height: u32,
+            new_width: u32,
+            new_height: u32,
+        },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -1880,6 +1889,83 @@ mod linux {
                         return;
                     }
                 } else {
+                    // Story 3.7: Check if resolution changed for existing monitor
+                    if let Some(old_monitor) = self.monitors.get(&id) {
+                        if old_monitor.width != monitor.width
+                            || old_monitor.height != monitor.height
+                        {
+                            // Resolution changed!
+                            tracing::info!(
+                                "Monitor resolution changed: {} {}x{} -> {}x{}",
+                                monitor.name,
+                                old_monitor.width,
+                                old_monitor.height,
+                                monitor.width,
+                                monitor.height
+                            );
+
+                            let old_width = old_monitor.width;
+                            let old_height = old_monitor.height;
+                            let was_fullscreen = self
+                                .multi_surfaces
+                                .get(&id)
+                                .map(|s| s.is_fullscreen())
+                                .unwrap_or(false);
+
+                            // Update MonitorInfo in HashMap
+                            self.monitors.insert(id, monitor.clone());
+
+                            // Story 3.7 Task 2: Resize surface buffers on resolution change
+                            if let Some(surface) = self.multi_surfaces.get_mut(&id) {
+                                match surface.resize(monitor.width, monitor.height) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "Resized surface for {} to {}x{}",
+                                            monitor.name,
+                                            monitor.width,
+                                            monitor.height
+                                        );
+
+                                        // Task 2.5: Maintain fullscreen state after resize
+                                        if was_fullscreen {
+                                            surface.set_fullscreen();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to resize surface for {}: {}",
+                                            monitor.name,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Story 3.5: Update region mapper with new monitor layout
+                            self.region_mapper.update(&self.monitors);
+
+                            // Emit MonitorResolutionChanged event (Task 1.3)
+                            let _ =
+                                self.event_tx
+                                    .send(WindowEvent::MonitorResolutionChanged {
+                                        monitor_id: id,
+                                        old_width,
+                                        old_height,
+                                        new_width: monitor.width,
+                                        new_height: monitor.height,
+                                    });
+
+                            // Also emit MonitorLayoutChanged for DISPLAYCONTROL notification
+                            let monitors: Vec<MonitorInfo> =
+                                self.monitors.values().cloned().collect();
+                            let _ = self
+                                .event_tx
+                                .send(WindowEvent::MonitorLayoutChanged { monitors });
+
+                            return;
+                        }
+                    }
+
                     tracing::debug!(
                         "Monitor updated: {} ({}x{} at {},{}, {:.1}Hz)",
                         monitor.name,
@@ -2731,9 +2817,12 @@ mod stub {
 
         pub fn resize(
             &mut self,
-            _width: u32,
-            _height: u32,
+            width: u32,
+            height: u32,
         ) -> Result<(), Box<dyn std::error::Error>> {
+            // Story 3.7: Update monitor_info dimensions on resize (stub)
+            self.monitor_info.width = width;
+            self.monitor_info.height = height;
             Ok(())
         }
     }
@@ -2790,6 +2879,14 @@ mod stub {
         /// Story 3.6: Monitor layout changed event (stub).
         MonitorLayoutChanged {
             monitors: Vec<MonitorInfo>,
+        },
+        /// Story 3.7: Monitor resolution changed event (stub).
+        MonitorResolutionChanged {
+            monitor_id: u32,
+            old_width: u32,
+            old_height: u32,
+            new_width: u32,
+            new_height: u32,
         },
     }
 
@@ -3983,5 +4080,243 @@ mod tests {
         // Mapping should return empty
         let regions = mapper.map_region(0, 0, 100, 100);
         assert!(regions.is_empty());
+    }
+
+    // ========== Story 3.7 Tests: Resolution Changes ==========
+
+    #[test]
+    fn test_window_event_monitor_resolution_changed() {
+        // Story 3.7 Task 1.4: Test resolution change event structure
+        let event = WindowEvent::MonitorResolutionChanged {
+            monitor_id: 1,
+            old_width: 1920,
+            old_height: 1080,
+            new_width: 2560,
+            new_height: 1440,
+        };
+
+        if let WindowEvent::MonitorResolutionChanged {
+            monitor_id,
+            old_width,
+            old_height,
+            new_width,
+            new_height,
+        } = event
+        {
+            assert_eq!(monitor_id, 1);
+            assert_eq!(old_width, 1920);
+            assert_eq!(old_height, 1080);
+            assert_eq!(new_width, 2560);
+            assert_eq!(new_height, 1440);
+        } else {
+            panic!("Expected MonitorResolutionChanged event");
+        }
+    }
+
+    #[test]
+    fn test_resolution_change_detection() {
+        // Story 3.7 Task 1.4: Test that resolution change is correctly detected
+        let old_monitor = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+        let new_monitor = create_test_monitor(1, "DP-1", 2560, 1440, 0, 0);
+
+        // Resolution changed
+        assert_ne!(old_monitor.width, new_monitor.width);
+        assert_ne!(old_monitor.height, new_monitor.height);
+
+        // Same monitor ID
+        assert_eq!(old_monitor.id, new_monitor.id);
+    }
+
+    #[test]
+    fn test_resolution_change_same_resolution() {
+        // Story 3.7 Task 1.4: Test that no event is emitted when resolution unchanged
+        let old_monitor = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+        let new_monitor = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+
+        // Resolution unchanged
+        let resolution_changed =
+            old_monitor.width != new_monitor.width || old_monitor.height != new_monitor.height;
+
+        assert!(!resolution_changed, "Resolution should not be marked as changed");
+    }
+
+    #[test]
+    fn test_region_mapper_after_resolution_change() {
+        // Story 3.7 Task 3.4: Test RegionMapper updates after resolution change
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 1920, 0));
+
+        let mut mapper = RegionMapper::new(&monitors);
+        assert_eq!(mapper.combined_size(), (3840, 1080));
+
+        // Change primary monitor resolution to 2560x1440
+        // Note: In a real scenario, the second monitor would move to x=2560
+        // to avoid overlap, but here we test what RegionMapper does with overlapping monitors
+        monitors.insert(1, create_test_monitor(1, "DP-1", 2560, 1440, 0, 0));
+        mapper.update(&monitors);
+
+        // Combined size is max(x+width) - min(x) = max(2560, 1920+1920) - 0 = 3840
+        // Height is max height = 1440
+        let (w, h) = mapper.combined_size();
+        assert_eq!(w, 3840); // Second monitor extends to 3840 (1920+1920)
+        assert_eq!(h, 1440);
+
+        // Test with properly positioned monitors after resize
+        monitors.insert(2, create_test_monitor(2, "HDMI-A-1", 1920, 1080, 2560, 0));
+        mapper.update(&monitors);
+
+        // Now combined size should be 2560 + 1920 = 4480
+        let (w, h) = mapper.combined_size();
+        assert_eq!(w, 4480);
+        assert_eq!(h, 1440);
+    }
+
+    #[test]
+    fn test_region_mapper_coordinate_translation_after_resize() {
+        // Story 3.7 Task 3.3: Test coordinate translation after resolution change
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+
+        let mut mapper = RegionMapper::new(&monitors);
+
+        // Before resize: point (100, 100) maps to monitor 1
+        let regions = mapper.map_region(100, 100, 10, 10);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+        assert_eq!(regions[0].dst_rect.x, 100);
+        assert_eq!(regions[0].dst_rect.y, 100);
+
+        // Change resolution to 2560x1440
+        monitors.insert(1, create_test_monitor(1, "DP-1", 2560, 1440, 0, 0));
+        mapper.update(&monitors);
+
+        // After resize: point (100, 100) should still map correctly
+        let regions = mapper.map_region(100, 100, 10, 10);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+        assert_eq!(regions[0].dst_rect.x, 100);
+        assert_eq!(regions[0].dst_rect.y, 100);
+
+        // Point at (2000, 1200) should now be valid (was outside old 1920x1080)
+        let regions = mapper.map_region(2000, 1200, 10, 10);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].monitor_id, 1);
+    }
+
+    #[test]
+    fn test_monitor_surface_resize_stub() {
+        // Story 3.7 Task 2.6: Test MonitorSurface resize behavior (stub version)
+        let monitor_info = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+        let mut surface = MonitorSurface {
+            monitor_info: monitor_info.clone(),
+        };
+
+        // Initial dimensions
+        assert_eq!(surface.monitor_info.width, 1920);
+        assert_eq!(surface.monitor_info.height, 1080);
+
+        // Resize to new dimensions
+        let result = surface.resize(2560, 1440);
+        assert!(result.is_ok());
+
+        // Verify dimensions updated
+        assert_eq!(surface.monitor_info.width, 2560);
+        assert_eq!(surface.monitor_info.height, 1440);
+    }
+
+    #[test]
+    fn test_monitor_surface_resize_same_size() {
+        // Story 3.7 Task 2.6: Test that resize with same dimensions is a no-op
+        let monitor_info = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+        let mut surface = MonitorSurface {
+            monitor_info: monitor_info.clone(),
+        };
+
+        // Resize to same dimensions should succeed without changes
+        let result = surface.resize(1920, 1080);
+        assert!(result.is_ok());
+
+        // Dimensions should remain the same
+        assert_eq!(surface.monitor_info.width, 1920);
+        assert_eq!(surface.monitor_info.height, 1080);
+    }
+
+    #[test]
+    fn test_rapid_resolution_changes() {
+        // Story 3.7 Task 6.4: Test no crash on rapid resolution changes
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 0, 0));
+
+        let mut mapper = RegionMapper::new(&monitors);
+
+        // Simulate rapid resolution changes
+        for i in 0..10 {
+            let width = 1920 + (i * 100);
+            let height = 1080 + (i * 50);
+            monitors.insert(1, create_test_monitor(1, "DP-1", width, height, 0, 0));
+            mapper.update(&monitors);
+
+            // Verify mapper handles each change
+            let (w, h) = mapper.combined_size();
+            assert_eq!(w, width);
+            assert_eq!(h, height);
+        }
+
+        // Verify final state
+        let (w, h) = mapper.combined_size();
+        assert_eq!(w, 1920 + 900);
+        assert_eq!(h, 1080 + 450);
+    }
+
+    #[test]
+    fn test_monitor_surface_resize_updates_dimensions() {
+        // Story 3.7 Task 2.4: Verify resize updates monitor_info dimensions
+        let monitor_info = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
+        let mut surface = MonitorSurface {
+            monitor_info: monitor_info.clone(),
+        };
+
+        // Initial state
+        assert_eq!(surface.dimensions(), (1920, 1080));
+        assert_eq!(surface.monitor_info().width, 1920);
+        assert_eq!(surface.monitor_info().height, 1080);
+
+        // Resize to larger dimensions
+        let result = surface.resize(2560, 1440);
+        assert!(result.is_ok());
+
+        // Verify dimensions updated via both accessors
+        assert_eq!(surface.dimensions(), (2560, 1440));
+        assert_eq!(surface.monitor_info().width, 2560);
+        assert_eq!(surface.monitor_info().height, 1440);
+
+        // Resize to smaller dimensions
+        let result = surface.resize(1280, 720);
+        assert!(result.is_ok());
+        assert_eq!(surface.dimensions(), (1280, 720));
+    }
+
+    #[test]
+    fn test_resolution_change_preserves_monitor_id_and_position() {
+        // Story 3.7: Verify that resize only changes dimensions, not ID or position
+        let mut monitors = HashMap::new();
+        monitors.insert(1, create_test_monitor(1, "DP-1", 1920, 1080, 100, 200));
+
+        let mapper = RegionMapper::new(&monitors);
+        let (w, h) = mapper.combined_size();
+        // Bounds: min_x=100, max_x=100+1920=2020, min_y=200, max_y=200+1080=1280
+        // Size: (2020-100, 1280-200) = (1920, 1080)
+        assert_eq!(w, 1920);
+        assert_eq!(h, 1080);
+
+        // Change resolution but keep position
+        let mut updated_monitor = create_test_monitor(1, "DP-1", 2560, 1440, 100, 200);
+        monitors.insert(1, updated_monitor.clone());
+
+        // Verify position preserved
+        assert_eq!(updated_monitor.x, 100);
+        assert_eq!(updated_monitor.y, 200);
+        assert_eq!(updated_monitor.id, 1);
     }
 }

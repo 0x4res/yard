@@ -805,6 +805,22 @@ fn run_event_loop(
                         error!("Failed to send monitor layout update to network thread");
                     }
                 }
+                // Story 3.7: Handle monitor resolution change events
+                WindowEvent::MonitorResolutionChanged {
+                    monitor_id,
+                    old_width,
+                    old_height,
+                    new_width,
+                    new_height,
+                } => {
+                    // Log the resolution change
+                    info!(
+                        "Monitor {} resolution changed: {}x{} -> {}x{}",
+                        monitor_id, old_width, old_height, new_width, new_height
+                    );
+                    // Note: MonitorLayoutChanged event is emitted separately and will
+                    // trigger DISPLAYCONTROL notification to server
+                }
             }
         }
     }
