@@ -31,12 +31,13 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
+use crate::audin::create_audin_client;
 use crate::messages::{
     CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, MouseButton,
     RdpMonitorInfo, ToNetwork,
 };
 use crate::rdpsnd::create_rdpsnd_client;
-use yard_audio::ToAudio;
+use yard_audio::{FromAudio, ToAudio};
 
 /// Default connection timeout in seconds.
 const CONNECTION_TIMEOUT_SECS: u64 = 10;
@@ -55,7 +56,8 @@ const DEFAULT_HEIGHT: u16 = 1080;
 /// # Arguments
 ///
 /// * `from_network_tx` - Channel to send messages back to the main thread.
-/// * `audio_tx` - Optional sender to the audio thread for RDPSND audio output.
+/// * `audio_tx` - Optional sender to the audio thread for RDPSND audio output and AUDIN capture.
+/// * `capture_rx` - Optional receiver for captured audio data from the audio thread (for AUDIN).
 ///
 /// # Returns
 ///
@@ -63,6 +65,7 @@ const DEFAULT_HEIGHT: u16 = 1080;
 pub fn spawn_network_thread(
     from_network_tx: mpsc::Sender<FromNetwork>,
     audio_tx: Option<StdSender<ToAudio>>,
+    capture_rx: Option<std::sync::mpsc::Receiver<FromAudio>>,
 ) -> mpsc::Sender<ToNetwork> {
     let (to_network_tx, to_network_rx) = mpsc::channel::<ToNetwork>(32);
 
@@ -74,7 +77,12 @@ pub fn spawn_network_thread(
                 .build()
                 .expect("Failed to create Tokio runtime");
 
-            rt.block_on(network_loop(to_network_rx, from_network_tx, audio_tx));
+            rt.block_on(network_loop(
+                to_network_rx,
+                from_network_tx,
+                audio_tx,
+                capture_rx,
+            ));
         })
         .expect("Failed to spawn network thread");
 
@@ -86,7 +94,11 @@ async fn network_loop(
     mut to_network_rx: mpsc::Receiver<ToNetwork>,
     from_network_tx: mpsc::Sender<FromNetwork>,
     audio_tx: Option<StdSender<ToAudio>>,
+    capture_rx: Option<std::sync::mpsc::Receiver<FromAudio>>,
 ) {
+    // Store capture_rx in an Option that can be taken for the first connection
+    let mut capture_rx = capture_rx;
+
     while let Some(msg) = to_network_rx.recv().await {
         match msg {
             ToNetwork::Connect(config) => {
@@ -95,6 +107,7 @@ async fn network_loop(
                     &mut to_network_rx,
                     &from_network_tx,
                     audio_tx.clone(),
+                    capture_rx.take(), // Take capture_rx for this connection
                 )
                 .await;
             }
@@ -133,6 +146,7 @@ async fn handle_connect(
     to_network_rx: &mut mpsc::Receiver<ToNetwork>,
     tx: &mpsc::Sender<FromNetwork>,
     audio_tx: Option<StdSender<ToAudio>>,
+    capture_rx: Option<std::sync::mpsc::Receiver<FromAudio>>,
 ) {
     // Notify main thread that we're connecting
     if tx.send(FromNetwork::Connecting).await.is_err() {
@@ -188,12 +202,40 @@ async fn handle_connect(
 
     // Set up RDPSND channel for audio output (Story 4.2)
     // Only attach if audio is enabled (audio_tx is Some)
-    if audio_tx.is_some() {
-        let rdpsnd = create_rdpsnd_client(audio_tx);
+    if let Some(ref tx) = audio_tx {
+        let rdpsnd = create_rdpsnd_client(Some(tx.clone()));
         connector.attach_static_channel(rdpsnd);
         debug!("RDPSND channel configured for audio output");
     } else {
         debug!("Audio disabled, skipping RDPSND channel");
+    }
+
+    // Set up AUDIN channel for microphone input (Story 4.3)
+    // Only attach if capture_rx is provided (microphone enabled)
+    if capture_rx.is_some() {
+        // Create AUDIN handler with audio_tx for sending StartCapture/StopCapture
+        // and capture_rx for receiving captured audio data
+        let audin = create_audin_client(audio_tx.clone(), capture_rx);
+
+        // AUDIN is a Dynamic Virtual Channel - attach to DrdynvcClient
+        // If we already have a DrdynvcClient (from DISPLAYCONTROL), we need to get it
+        // Otherwise create a new one
+        if has_multi_monitor {
+            // DrdynvcClient already attached, we need to add AUDIN to it
+            // Unfortunately IronRDP doesn't support adding channels after connector creation
+            // For now, AUDIN will work without DISPLAYCONTROL in same session
+            warn!(
+                "AUDIN with DISPLAYCONTROL in same session not yet supported, microphone may not work"
+            );
+            // TODO: Refactor to build DrdynvcClient with all channels at once
+        } else {
+            // No DISPLAYCONTROL, create DrdynvcClient just for AUDIN
+            let drdynvc = DrdynvcClient::new().with_dynamic_channel(audin);
+            connector.attach_static_channel(drdynvc);
+            debug!("AUDIN channel configured for microphone input");
+        }
+    } else {
+        debug!("Microphone disabled, skipping AUDIN channel");
     }
 
     // Phase 1: Initial RDP negotiation (before TLS)

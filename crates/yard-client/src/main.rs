@@ -302,7 +302,7 @@ fn run_connection(
     start_fullscreen: bool,
     all_monitors: bool,
     audio_enabled: bool,
-    _microphone_enabled: bool, // Will be used in Story 4.3
+    microphone_enabled: bool,
 ) -> Result<u8> {
     // Create structured span with connection context (AC 4)
     let connection_span = info_span!(
@@ -335,7 +335,7 @@ fn run_connection(
 
     // Initialize audio thread (Story 4.1)
     // Audio is spawned early but runs independently - doesn't block connection
-    let audio_thread: Option<AudioThread> = if audio_enabled {
+    let mut audio_thread: Option<AudioThread> = if audio_enabled {
         match AudioThread::spawn() {
             Ok(audio) => {
                 info!("Audio thread initialized");
@@ -357,11 +357,22 @@ fn run_connection(
     // The sender is cloned so the audio thread retains ownership for shutdown
     let audio_tx = audio_thread.as_ref().map(|a| a.sender());
 
+    // Get capture receiver for AUDIN microphone input (Story 4.3)
+    // Only take the receiver if microphone is enabled
+    let capture_rx = if microphone_enabled {
+        audio_thread
+            .as_mut()
+            .and_then(|a| a.take_capture_receiver())
+    } else {
+        debug!("Microphone disabled by configuration");
+        None
+    };
+
     // Create channel for receiving messages from network thread
     let (from_network_tx, mut from_network_rx) = mpsc::channel::<FromNetwork>(32);
 
-    // Spawn network thread with audio sender
-    let to_network_tx = spawn_network_thread(from_network_tx, audio_tx);
+    // Spawn network thread with audio sender and capture receiver
+    let to_network_tx = spawn_network_thread(from_network_tx, audio_tx, capture_rx);
 
     // Keep audio thread alive for the duration of the connection
     // It will be dropped when this function returns

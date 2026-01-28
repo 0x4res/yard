@@ -5,7 +5,7 @@
 //!
 //! Audio data flow:
 //! 1. Server sends `Open PDU` requesting audio capture
-//! 2. `YardAudinHandler` signals audio thread to start capture
+//! 2. `YardAudinHandler` signals audio thread to start capture via `ToAudio::StartCapture`
 //! 3. Audio thread captures via PipeWire, sends `FromAudio::CapturedData`
 //! 4. `YardAudinHandler::poll()` packages data into `Data PDU`
 //! 5. Data PDU sent to server via DVC channel
@@ -20,7 +20,7 @@ use ironrdp::dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
 use ironrdp::pdu::PduResult;
 use tracing::{debug, trace, warn};
 
-use yard_audio::AudioFormat;
+use yard_audio::{AudioFormat, FromAudio, ToAudio};
 
 use crate::audin::pdu::{
     AUDIN_VERSION, AudinDvcMessage, AudinPdu, ClientSoundFormats, DataIncoming, DataPdu, OpenReply,
@@ -56,36 +56,6 @@ const SUPPORTED_FORMATS: &[AudioFormat] = &[
     },
 ];
 
-/// Messages sent from the audio thread back to the network thread.
-#[derive(Debug, Clone)]
-pub enum FromAudio {
-    /// Captured audio data ready to be sent to server.
-    CapturedData {
-        /// Raw audio sample data.
-        data: Vec<u8>,
-        /// Format of the captured audio.
-        format: AudioFormat,
-    },
-    /// Error during capture (e.g., permission denied).
-    CaptureError(String),
-    /// Capture stopped (device disconnected, etc.).
-    CaptureStopped,
-}
-
-/// Messages sent to the audio thread to control capture.
-#[derive(Debug, Clone)]
-pub enum CaptureCommand {
-    /// Start capturing audio with the specified format.
-    Start {
-        /// Required audio format for capture.
-        format: AudioFormat,
-        /// Number of frames per packet to capture.
-        frames_per_packet: u32,
-    },
-    /// Stop capturing audio.
-    Stop,
-}
-
 /// AUDIN protocol state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudinState {
@@ -109,8 +79,8 @@ enum AudinState {
 pub struct YardAudinHandler {
     /// Current protocol state.
     state: AudinState,
-    /// Sender to control audio capture.
-    capture_tx: Option<Sender<CaptureCommand>>,
+    /// Sender to control audio capture (sends ToAudio messages).
+    audio_tx: Option<Sender<ToAudio>>,
     /// Receiver for captured audio data.
     capture_rx: Option<Receiver<FromAudio>>,
     /// Current audio format being used.
@@ -126,15 +96,12 @@ impl YardAudinHandler {
     ///
     /// # Arguments
     ///
-    /// * `capture_tx` - Sender to control audio capture in audio thread.
+    /// * `audio_tx` - Sender to control audio capture in audio thread (via ToAudio messages).
     /// * `capture_rx` - Receiver for captured audio data from audio thread.
-    pub fn new(
-        capture_tx: Option<Sender<CaptureCommand>>,
-        capture_rx: Option<Receiver<FromAudio>>,
-    ) -> Self {
+    pub fn new(audio_tx: Option<Sender<ToAudio>>, capture_rx: Option<Receiver<FromAudio>>) -> Self {
         Self {
             state: AudinState::Initial,
-            capture_tx,
+            audio_tx,
             capture_rx,
             current_format: None,
             frames_per_packet: 0,
@@ -268,13 +235,13 @@ impl YardAudinHandler {
         self.current_format = Some(*format);
         self.frames_per_packet = frames_per_packet;
 
-        // Start audio capture in audio thread
-        if let Some(ref tx) = self.capture_tx {
-            let cmd = CaptureCommand::Start {
+        // Start audio capture in audio thread via ToAudio message
+        if let Some(ref tx) = self.audio_tx {
+            let msg = ToAudio::StartCapture {
                 format: *format,
                 frames_per_packet,
             };
-            if let Err(e) = tx.send(cmd) {
+            if let Err(e) = tx.send(msg) {
                 warn!("Failed to start audio capture: {}", e);
             }
         }
@@ -348,9 +315,9 @@ impl DvcProcessor for YardAudinHandler {
     fn close(&mut self, _channel_id: u32) {
         debug!("AUDIN channel closed");
 
-        // Stop audio capture
-        if let Some(ref tx) = self.capture_tx {
-            let _ = tx.send(CaptureCommand::Stop);
+        // Stop audio capture via ToAudio message
+        if let Some(ref tx) = self.audio_tx {
+            let _ = tx.send(ToAudio::StopCapture);
         }
 
         self.state = AudinState::Closed;
@@ -377,18 +344,18 @@ impl AsAny for YardAudinHandler {
 ///
 /// # Arguments
 ///
-/// * `capture_tx` - Optional sender to control capture in audio thread.
+/// * `audio_tx` - Optional sender to control capture in audio thread (via ToAudio).
 /// * `capture_rx` - Optional receiver for captured audio from audio thread.
 ///
 /// # Returns
 ///
 /// A `YardAudinHandler` instance ready to be attached to the DVC manager.
 pub fn create_audin_client(
-    capture_tx: Option<Sender<CaptureCommand>>,
+    audio_tx: Option<Sender<ToAudio>>,
     capture_rx: Option<Receiver<FromAudio>>,
 ) -> YardAudinHandler {
     debug!("Creating AUDIN client for microphone redirection");
-    YardAudinHandler::new(capture_tx, capture_rx)
+    YardAudinHandler::new(audio_tx, capture_rx)
 }
 
 #[cfg(test)]
@@ -440,21 +407,21 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_command_start() {
-        let cmd = CaptureCommand::Start {
+    fn test_to_audio_start_capture() {
+        let msg = ToAudio::StartCapture {
             format: AudioFormat::new(48000, 1, 16),
             frames_per_packet: 480,
         };
-        if let CaptureCommand::Start {
+        if let ToAudio::StartCapture {
             format,
             frames_per_packet,
-        } = cmd
+        } = msg
         {
             assert_eq!(format.sample_rate, 48000);
             assert_eq!(format.channels, 1);
             assert_eq!(frames_per_packet, 480);
         } else {
-            panic!("Expected Start variant");
+            panic!("Expected StartCapture variant");
         }
     }
 
@@ -500,9 +467,9 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_command_stop() {
-        let cmd = CaptureCommand::Stop;
-        assert!(matches!(cmd, CaptureCommand::Stop));
+    fn test_to_audio_stop_capture() {
+        let msg = ToAudio::StopCapture;
+        assert!(matches!(msg, ToAudio::StopCapture));
     }
 
     #[test]

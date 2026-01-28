@@ -8,7 +8,7 @@ pub mod connection;
 pub mod messages;
 pub mod rdpsnd;
 
-pub use audin::{CaptureCommand, FromAudio, YardAudinHandler, create_audin_client};
+pub use audin::{YardAudinHandler, create_audin_client};
 pub use connection::spawn_network_thread;
 pub use messages::{
     CertificateInfo, ConnectionConfig, ConnectionError, DecodedFrame, DesktopSize, FromNetwork,
