@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 yard-core = { path = "../yard-core" }
 yard-video = { path = "../yard-video" }
+yard-audio = { path = "../yard-audio" }
 
 ironrdp.workspace = true
 ironrdp-graphics.workspace = true
@@ -19,3 +20,4 @@ rustls.workspace = true
 x509-cert.workspace = true
 sha2.workspace = true
 tracing.workspace = true
+thiserror.workspace = true

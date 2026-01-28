@@ -1387,6 +1387,7 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
+ "ironrdp-rdpsnd",
  "ironrdp-session",
  "ironrdp-svc",
 ]
@@ -1514,6 +1515,19 @@ dependencies = [
  "tap",
  "thiserror",
  "x509-cert",
+]
+
+[[package]]
+name = "ironrdp-rdpsnd"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29897b54e358d7ad309937832dbcc71cff310dc223fa70cfc5d66db8c61b3a6b"
+dependencies = [
+ "bitflags 2.10.0",
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
 ]
 
 [[package]]
@@ -3972,6 +3986,8 @@ name = "yard-audio"
 version = "0.1.0"
 dependencies = [
  "pipewire",
+ "thiserror",
+ "tracing",
  "yard-core",
 ]
 
@@ -4013,10 +4029,12 @@ dependencies = [
  "ironrdp-tokio",
  "rustls",
  "sha2 0.10.9",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",
  "x509-cert",
+ "yard-audio",
  "yard-core",
  "yard-video",
 ]

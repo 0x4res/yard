@@ -12,6 +12,7 @@ mod linux {
     use calloop_wayland_source::WaylandSource;
     use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
+    use smithay_client_toolkit::reexports::client::Proxy;
     use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
     use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard;
     use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
@@ -1437,8 +1438,8 @@ mod linux {
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("Output-{}", id)),
-                make: info.make.clone(),
-                model: info.model.clone(),
+                make: Some(info.make.clone()),
+                model: Some(info.model.clone()),
                 width: info.logical_size.map(|(w, _)| w as u32).unwrap_or(0),
                 height: info.logical_size.map(|(_, h)| h as u32).unwrap_or(0),
                 x: info.location.0,
@@ -1762,7 +1763,7 @@ mod linux {
 
             // Get output info from OutputState
             if let Some(info) = self.output_state.info(&output) {
-                let monitor = Self::create_monitor_info(id, info);
+                let monitor = Self::create_monitor_info(id, &info);
 
                 tracing::info!(
                     "Monitor detected: {} ({}x{} at {},{}, {:.1}Hz, scale={})",
@@ -1792,14 +1793,14 @@ mod linux {
                             );
 
                             // If currently in fullscreen, request fullscreen for the new surface
-                            if self.is_fullscreen {
-                                if let Some(surface) = self.multi_surfaces.get(&id) {
-                                    surface.set_fullscreen();
-                                    tracing::debug!(
-                                        "Requested fullscreen for hot-plugged monitor {}",
-                                        monitor.name
-                                    );
-                                }
+                            if self.is_fullscreen
+                                && let Some(surface) = self.multi_surfaces.get(&id)
+                            {
+                                surface.set_fullscreen();
+                                tracing::debug!(
+                                    "Requested fullscreen for hot-plugged monitor {}",
+                                    monitor.name
+                                );
                             }
 
                             // Emit MonitorConnected event
@@ -1818,7 +1819,9 @@ mod linux {
 
                     // Emit MonitorLayoutChanged event for DISPLAYCONTROL notification
                     let monitors: Vec<MonitorInfo> = self.monitors.values().cloned().collect();
-                    let _ = self.event_tx.send(WindowEvent::MonitorLayoutChanged { monitors });
+                    let _ = self
+                        .event_tx
+                        .send(WindowEvent::MonitorLayoutChanged { monitors });
                 }
             } else {
                 // Don't store output without info - wait for update_output
@@ -1834,7 +1837,7 @@ mod linux {
             let id = output.id().protocol_id();
 
             if let Some(info) = self.output_state.info(&output) {
-                let monitor = Self::create_monitor_info(id, info);
+                let monitor = Self::create_monitor_info(id, &info);
                 let is_new = !self.monitors.contains_key(&id);
 
                 if is_new {
@@ -1863,10 +1866,10 @@ mod linux {
                                 );
 
                                 // If currently in fullscreen, request fullscreen for the new surface
-                                if self.is_fullscreen {
-                                    if let Some(surface) = self.multi_surfaces.get(&id) {
-                                        surface.set_fullscreen();
-                                    }
+                                if self.is_fullscreen
+                                    && let Some(surface) = self.multi_surfaces.get(&id)
+                                {
+                                    surface.set_fullscreen();
                                 }
 
                                 // Emit MonitorConnected event
@@ -1885,87 +1888,82 @@ mod linux {
 
                         // Emit MonitorLayoutChanged event for DISPLAYCONTROL notification
                         let monitors: Vec<MonitorInfo> = self.monitors.values().cloned().collect();
-                        let _ = self.event_tx.send(WindowEvent::MonitorLayoutChanged { monitors });
+                        let _ = self
+                            .event_tx
+                            .send(WindowEvent::MonitorLayoutChanged { monitors });
                         return;
                     }
-                } else {
+                } else if let Some(old_monitor) = self.monitors.get(&id)
+                    && (old_monitor.width != monitor.width || old_monitor.height != monitor.height)
+                {
                     // Story 3.7: Check if resolution changed for existing monitor
-                    if let Some(old_monitor) = self.monitors.get(&id) {
-                        if old_monitor.width != monitor.width
-                            || old_monitor.height != monitor.height
-                        {
-                            // Resolution changed!
-                            tracing::info!(
-                                "Monitor resolution changed: {} {}x{} -> {}x{}",
-                                monitor.name,
-                                old_monitor.width,
-                                old_monitor.height,
-                                monitor.width,
-                                monitor.height
-                            );
+                    // Resolution changed!
+                    tracing::info!(
+                        "Monitor resolution changed: {} {}x{} -> {}x{}",
+                        monitor.name,
+                        old_monitor.width,
+                        old_monitor.height,
+                        monitor.width,
+                        monitor.height
+                    );
 
-                            let old_width = old_monitor.width;
-                            let old_height = old_monitor.height;
-                            let was_fullscreen = self
-                                .multi_surfaces
-                                .get(&id)
-                                .map(|s| s.is_fullscreen())
-                                .unwrap_or(false);
+                    let old_width = old_monitor.width;
+                    let old_height = old_monitor.height;
+                    let was_fullscreen = self
+                        .multi_surfaces
+                        .get(&id)
+                        .map(|s| s.is_fullscreen())
+                        .unwrap_or(false);
 
-                            // Update MonitorInfo in HashMap
-                            self.monitors.insert(id, monitor.clone());
+                    // Update MonitorInfo in HashMap
+                    self.monitors.insert(id, monitor.clone());
 
-                            // Story 3.7 Task 2: Resize surface buffers on resolution change
-                            if let Some(surface) = self.multi_surfaces.get_mut(&id) {
-                                match surface.resize(monitor.width, monitor.height) {
-                                    Ok(()) => {
-                                        tracing::info!(
-                                            "Resized surface for {} to {}x{}",
-                                            monitor.name,
-                                            monitor.width,
-                                            monitor.height
-                                        );
+                    // Story 3.7 Task 2: Resize surface buffers on resolution change
+                    if let Some(surface) = self.multi_surfaces.get_mut(&id) {
+                        match surface.resize(monitor.width, monitor.height) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "Resized surface for {} to {}x{}",
+                                    monitor.name,
+                                    monitor.width,
+                                    monitor.height
+                                );
 
-                                        // Task 2.5: Maintain fullscreen state after resize
-                                        if was_fullscreen {
-                                            surface.set_fullscreen();
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Failed to resize surface for {}: {}",
-                                            monitor.name,
-                                            e
-                                        );
-                                    }
+                                // Task 2.5: Maintain fullscreen state after resize
+                                if was_fullscreen {
+                                    surface.set_fullscreen();
                                 }
                             }
-
-                            // Story 3.5: Update region mapper with new monitor layout
-                            self.region_mapper.update(&self.monitors);
-
-                            // Emit MonitorResolutionChanged event (Task 1.3)
-                            let _ =
-                                self.event_tx
-                                    .send(WindowEvent::MonitorResolutionChanged {
-                                        monitor_id: id,
-                                        old_width,
-                                        old_height,
-                                        new_width: monitor.width,
-                                        new_height: monitor.height,
-                                    });
-
-                            // Also emit MonitorLayoutChanged for DISPLAYCONTROL notification
-                            let monitors: Vec<MonitorInfo> =
-                                self.monitors.values().cloned().collect();
-                            let _ = self
-                                .event_tx
-                                .send(WindowEvent::MonitorLayoutChanged { monitors });
-
-                            return;
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to resize surface for {}: {}",
+                                    monitor.name,
+                                    e
+                                );
+                            }
                         }
                     }
 
+                    // Story 3.5: Update region mapper with new monitor layout
+                    self.region_mapper.update(&self.monitors);
+
+                    // Emit MonitorResolutionChanged event (Task 1.3)
+                    let _ = self.event_tx.send(WindowEvent::MonitorResolutionChanged {
+                        monitor_id: id,
+                        old_width,
+                        old_height,
+                        new_width: monitor.width,
+                        new_height: monitor.height,
+                    });
+
+                    // Also emit MonitorLayoutChanged for DISPLAYCONTROL notification
+                    let monitors: Vec<MonitorInfo> = self.monitors.values().cloned().collect();
+                    let _ = self
+                        .event_tx
+                        .send(WindowEvent::MonitorLayoutChanged { monitors });
+
+                    return;
+                } else {
                     tracing::debug!(
                         "Monitor updated: {} ({}x{} at {},{}, {:.1}Hz)",
                         monitor.name,
@@ -2013,7 +2011,9 @@ mod linux {
                 }
 
                 // Emit MonitorDisconnected event
-                let _ = self.event_tx.send(WindowEvent::MonitorDisconnected { monitor_id: id });
+                let _ = self
+                    .event_tx
+                    .send(WindowEvent::MonitorDisconnected { monitor_id: id });
             }
 
             if let Some(monitor) = self.monitors.remove(&id) {
@@ -2035,7 +2035,9 @@ mod linux {
             // Story 3.6: Emit MonitorLayoutChanged for DISPLAYCONTROL notification
             if self.multi_monitor_mode {
                 let monitors: Vec<MonitorInfo> = self.monitors.values().cloned().collect();
-                let _ = self.event_tx.send(WindowEvent::MonitorLayoutChanged { monitors });
+                let _ = self
+                    .event_tx
+                    .send(WindowEvent::MonitorLayoutChanged { monitors });
             }
 
             // Log remaining monitors
@@ -2102,14 +2104,14 @@ mod linux {
                             let new_width = w.get();
                             let new_height = h.get();
                             let (cur_w, cur_h) = surface.dimensions();
-                            if new_width != cur_w || new_height != cur_h {
-                                if let Err(e) = surface.resize(new_width, new_height) {
-                                    tracing::error!(
-                                        "Failed to resize MonitorSurface {}: {}",
-                                        surface.monitor_info().name,
-                                        e
-                                    );
-                                }
+                            if (new_width != cur_w || new_height != cur_h)
+                                && let Err(e) = surface.resize(new_width, new_height)
+                            {
+                                tracing::error!(
+                                    "Failed to resize MonitorSurface {}: {}",
+                                    surface.monitor_info().name,
+                                    e
+                                );
                             }
                         }
 
@@ -3992,7 +3994,10 @@ mod tests {
         };
 
         // Primary is at (0, 0)
-        assert!(primary.x == 0 && primary.y == 0, "Primary should be at origin");
+        assert!(
+            primary.x == 0 && primary.y == 0,
+            "Primary should be at origin"
+        );
         // Secondary is not at origin
         assert!(
             !(secondary.x == 0 && secondary.y == 0),
@@ -4137,7 +4142,10 @@ mod tests {
         let resolution_changed =
             old_monitor.width != new_monitor.width || old_monitor.height != new_monitor.height;
 
-        assert!(!resolution_changed, "Resolution should not be marked as changed");
+        assert!(
+            !resolution_changed,
+            "Resolution should not be marked as changed"
+        );
     }
 
     #[test]
@@ -4205,6 +4213,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn test_monitor_surface_resize_stub() {
         // Story 3.7 Task 2.6: Test MonitorSurface resize behavior (stub version)
         let monitor_info = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
@@ -4226,6 +4235,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn test_monitor_surface_resize_same_size() {
         // Story 3.7 Task 2.6: Test that resize with same dimensions is a no-op
         let monitor_info = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);
@@ -4270,6 +4280,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn test_monitor_surface_resize_updates_dimensions() {
         // Story 3.7 Task 2.4: Verify resize updates monitor_info dimensions
         let monitor_info = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);

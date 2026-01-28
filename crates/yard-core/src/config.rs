@@ -24,6 +24,27 @@ const APP_DIR_NAME: &str = "yard";
 pub struct Config {
     /// Default connection settings.
     pub defaults: ConnectionDefaults,
+    /// Audio settings.
+    pub audio: AudioConfig,
+}
+
+/// Audio configuration settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Enable audio output (default: true).
+    pub enabled: bool,
+    /// Enable microphone input (default: true).
+    pub microphone: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            microphone: true,
+        }
+    }
 }
 
 /// Default connection settings from config file.
@@ -312,5 +333,43 @@ foo = "bar"
             ..Default::default()
         };
         assert_eq!(defaults.effective_port(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn test_audio_config_default() {
+        let config = AudioConfig::default();
+        assert!(config.enabled);
+        assert!(config.microphone);
+    }
+
+    #[test]
+    fn test_config_parse_audio_section() {
+        let toml = r#"
+[audio]
+enabled = false
+microphone = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(!config.audio.enabled);
+        assert!(!config.audio.microphone);
+    }
+
+    #[test]
+    fn test_config_parse_audio_partial() {
+        let toml = r#"
+[audio]
+microphone = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        // enabled defaults to true
+        assert!(config.audio.enabled);
+        assert!(!config.audio.microphone);
+    }
+
+    #[test]
+    fn test_config_defaults_include_audio() {
+        let config = Config::default();
+        assert!(config.audio.enabled);
+        assert!(config.audio.microphone);
     }
 }

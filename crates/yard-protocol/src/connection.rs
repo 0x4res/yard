@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::mpsc::Sender as StdSender;
 use std::time::Duration;
 
 use ironrdp::connector::{self, ClientConnector, Credentials};
@@ -34,6 +35,8 @@ use crate::messages::{
     CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, MouseButton,
     RdpMonitorInfo, ToNetwork,
 };
+use crate::rdpsnd::create_rdpsnd_client;
+use yard_audio::ToAudio;
 
 /// Default connection timeout in seconds.
 const CONNECTION_TIMEOUT_SECS: u64 = 10;
@@ -52,11 +55,15 @@ const DEFAULT_HEIGHT: u16 = 1080;
 /// # Arguments
 ///
 /// * `from_network_tx` - Channel to send messages back to the main thread.
+/// * `audio_tx` - Optional sender to the audio thread for RDPSND audio output.
 ///
 /// # Returns
 ///
 /// A sender for sending commands to the network thread.
-pub fn spawn_network_thread(from_network_tx: mpsc::Sender<FromNetwork>) -> mpsc::Sender<ToNetwork> {
+pub fn spawn_network_thread(
+    from_network_tx: mpsc::Sender<FromNetwork>,
+    audio_tx: Option<StdSender<ToAudio>>,
+) -> mpsc::Sender<ToNetwork> {
     let (to_network_tx, to_network_rx) = mpsc::channel::<ToNetwork>(32);
 
     std::thread::Builder::new()
@@ -67,7 +74,7 @@ pub fn spawn_network_thread(from_network_tx: mpsc::Sender<FromNetwork>) -> mpsc:
                 .build()
                 .expect("Failed to create Tokio runtime");
 
-            rt.block_on(network_loop(to_network_rx, from_network_tx));
+            rt.block_on(network_loop(to_network_rx, from_network_tx, audio_tx));
         })
         .expect("Failed to spawn network thread");
 
@@ -78,11 +85,18 @@ pub fn spawn_network_thread(from_network_tx: mpsc::Sender<FromNetwork>) -> mpsc:
 async fn network_loop(
     mut to_network_rx: mpsc::Receiver<ToNetwork>,
     from_network_tx: mpsc::Sender<FromNetwork>,
+    audio_tx: Option<StdSender<ToAudio>>,
 ) {
     while let Some(msg) = to_network_rx.recv().await {
         match msg {
             ToNetwork::Connect(config) => {
-                handle_connect(config, &mut to_network_rx, &from_network_tx).await;
+                handle_connect(
+                    config,
+                    &mut to_network_rx,
+                    &from_network_tx,
+                    audio_tx.clone(),
+                )
+                .await;
             }
             ToNetwork::Disconnect => {
                 let _ = from_network_tx.send(FromNetwork::Disconnected).await;
@@ -118,6 +132,7 @@ async fn handle_connect(
     config: ConnectionConfig,
     to_network_rx: &mut mpsc::Receiver<ToNetwork>,
     tx: &mpsc::Sender<FromNetwork>,
+    audio_tx: Option<StdSender<ToAudio>>,
 ) {
     // Notify main thread that we're connecting
     if tx.send(FromNetwork::Connecting).await.is_err() {
@@ -169,6 +184,16 @@ async fn handle_connect(
         // Attach DRDYNVC as a static virtual channel to the connector
         connector.attach_static_channel(drdynvc);
         debug!("DISPLAYCONTROL channel configured for multi-monitor support");
+    }
+
+    // Set up RDPSND channel for audio output (Story 4.2)
+    // Only attach if audio is enabled (audio_tx is Some)
+    if audio_tx.is_some() {
+        let rdpsnd = create_rdpsnd_client(audio_tx);
+        connector.attach_static_channel(rdpsnd);
+        debug!("RDPSND channel configured for audio output");
+    } else {
+        debug!("Audio disabled, skipping RDPSND channel");
     }
 
     // Phase 1: Initial RDP negotiation (before TLS)
@@ -655,7 +680,7 @@ fn build_rdp_config(config: &ConnectionConfig) -> Result<connector::Config, Conn
         hardware_id: None,
         request_data: None,
         autologon: false,
-        enable_audio_playback: false,
+        enable_audio_playback: true,
         performance_flags: PerformanceFlags::default(),
         license_cache: None,
         timezone_info: Default::default(),
@@ -1302,7 +1327,7 @@ mod tests {
         use crate::messages::RdpMonitorInfo;
 
         // Valid: one primary
-        let monitors = vec![
+        let monitors = [
             RdpMonitorInfo::new(0, 0, 1920, 1080, true),
             RdpMonitorInfo::new(1920, 0, 1920, 1080, false),
         ];
@@ -1310,7 +1335,7 @@ mod tests {
         assert_eq!(primary_count, 1);
 
         // Invalid: no primary
-        let monitors_no_primary = vec![
+        let monitors_no_primary = [
             RdpMonitorInfo::new(0, 0, 1920, 1080, false),
             RdpMonitorInfo::new(1920, 0, 1920, 1080, false),
         ];
@@ -1318,7 +1343,7 @@ mod tests {
         assert_eq!(count, 0);
 
         // Invalid: two primaries
-        let monitors_two_primary = vec![
+        let monitors_two_primary = [
             RdpMonitorInfo::new(0, 0, 1920, 1080, true),
             RdpMonitorInfo::new(1920, 0, 1920, 1080, true),
         ];
@@ -1331,13 +1356,13 @@ mod tests {
         use crate::messages::RdpMonitorInfo;
 
         // Valid: primary at (0,0)
-        let monitors = vec![RdpMonitorInfo::new(0, 0, 1920, 1080, true)];
+        let monitors = [RdpMonitorInfo::new(0, 0, 1920, 1080, true)];
         let primary = monitors.iter().find(|m| m.is_primary).unwrap();
         assert_eq!(primary.x, 0);
         assert_eq!(primary.y, 0);
 
         // Invalid: primary not at origin
-        let monitors_bad = vec![RdpMonitorInfo::new(100, 50, 1920, 1080, true)];
+        let monitors_bad = [RdpMonitorInfo::new(100, 50, 1920, 1080, true)];
         let primary = monitors_bad.iter().find(|m| m.is_primary).unwrap();
         assert_ne!(primary.x, 0); // This would trigger a warning in send_monitor_layout
     }

@@ -19,6 +19,7 @@ use yard_protocol::{
 #[cfg(target_os = "linux")]
 use yard_protocol::MouseButton;
 
+use yard_audio::AudioThread;
 use yard_wayland::WindowConfig;
 
 /// Exit codes for YARD.
@@ -85,6 +86,14 @@ enum Commands {
         /// Creates a separate window on each connected monitor.
         #[arg(long)]
         all_monitors: bool,
+
+        /// Disable audio output and input.
+        #[arg(long)]
+        no_audio: bool,
+
+        /// Disable microphone input only.
+        #[arg(long)]
+        no_microphone: bool,
     },
 
     /// Generate shell completion scripts.
@@ -139,6 +148,8 @@ fn run(cli: Cli) -> Result<u8> {
             domain,
             fullscreen,
             all_monitors,
+            no_audio,
+            no_microphone,
         }) => {
             // User feedback (always visible, not affected by log level)
             eprintln!("YARD v{}", env!("CARGO_PKG_VERSION"));
@@ -167,7 +178,17 @@ fn run(cli: Cli) -> Result<u8> {
                 config = config.with_password(password);
             }
 
-            run_connection(config, fullscreen, all_monitors)
+            // Determine audio settings: CLI flags override config file
+            let audio_enabled = !no_audio && app_config.audio.enabled;
+            let microphone_enabled = !no_microphone && app_config.audio.microphone;
+
+            run_connection(
+                config,
+                fullscreen,
+                all_monitors,
+                audio_enabled,
+                microphone_enabled,
+            )
         }
 
         Some(Commands::Completions { shell }) => {
@@ -280,6 +301,8 @@ fn run_connection(
     config: ConnectionConfig,
     start_fullscreen: bool,
     all_monitors: bool,
+    audio_enabled: bool,
+    _microphone_enabled: bool, // Will be used in Story 4.3
 ) -> Result<u8> {
     // Create structured span with connection context (AC 4)
     let connection_span = info_span!(
@@ -305,13 +328,44 @@ fn run_connection(
     let window_config =
         WindowConfig::with_connection_info(&config.host, config.port, config.username.as_deref())
             .with_fullscreen(start_fullscreen);
-    debug!(?window_config, all_monitors, "Window config prepared");
+    debug!(
+        ?window_config,
+        all_monitors, audio_enabled, "Window config prepared"
+    );
+
+    // Initialize audio thread (Story 4.1)
+    // Audio is spawned early but runs independently - doesn't block connection
+    let audio_thread: Option<AudioThread> = if audio_enabled {
+        match AudioThread::spawn() {
+            Ok(audio) => {
+                info!("Audio thread initialized");
+                Some(audio)
+            }
+            Err(e) => {
+                // Graceful degradation: continue without audio
+                warn!("Audio unavailable: {}. Continuing without audio.", e);
+                eprintln!("⚠ Audio unavailable: {}", e);
+                None
+            }
+        }
+    } else {
+        debug!("Audio disabled by configuration");
+        None
+    };
+
+    // Get audio sender for network thread (Story 4.2)
+    // The sender is cloned so the audio thread retains ownership for shutdown
+    let audio_tx = audio_thread.as_ref().map(|a| a.sender());
 
     // Create channel for receiving messages from network thread
     let (from_network_tx, mut from_network_rx) = mpsc::channel::<FromNetwork>(32);
 
-    // Spawn network thread
-    let to_network_tx = spawn_network_thread(from_network_tx);
+    // Spawn network thread with audio sender
+    let to_network_tx = spawn_network_thread(from_network_tx, audio_tx);
+
+    // Keep audio thread alive for the duration of the connection
+    // It will be dropped when this function returns
+    let _audio_thread = audio_thread;
 
     // Send connect command
     to_network_tx
@@ -782,10 +836,7 @@ fn run_event_loop(
                 }
                 WindowEvent::MonitorLayoutChanged { monitors } => {
                     // Story 3.6: Notify server of monitor layout change via DISPLAYCONTROL
-                    info!(
-                        "Monitor layout changed: {} monitor(s)",
-                        monitors.len()
-                    );
+                    info!("Monitor layout changed: {} monitor(s)", monitors.len());
                     // Convert MonitorInfo to RdpMonitorLayout
                     let rdp_monitors: Vec<yard_protocol::RdpMonitorLayout> = monitors
                         .iter()
@@ -799,7 +850,9 @@ fn run_event_loop(
                         })
                         .collect();
                     if to_network_tx
-                        .blocking_send(ToNetwork::UpdateMonitorLayout { monitors: rdp_monitors })
+                        .blocking_send(ToNetwork::UpdateMonitorLayout {
+                            monitors: rdp_monitors,
+                        })
                         .is_err()
                     {
                         error!("Failed to send monitor layout update to network thread");
@@ -965,10 +1018,76 @@ fn map_error_to_exit_code(err: &yard_protocol::ConnectionError) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn test_truncate_string_short() {
         assert_eq!(truncate_string("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_cli_no_audio_flag() {
+        let cli =
+            Cli::try_parse_from(["yard", "connect", "server.example.com", "--no-audio"]).unwrap();
+
+        if let Some(Commands::Connect { no_audio, .. }) = cli.command {
+            assert!(no_audio);
+        } else {
+            panic!("Expected Connect command");
+        }
+    }
+
+    #[test]
+    fn test_cli_no_microphone_flag() {
+        let cli = Cli::try_parse_from(["yard", "connect", "server.example.com", "--no-microphone"])
+            .unwrap();
+
+        if let Some(Commands::Connect { no_microphone, .. }) = cli.command {
+            assert!(no_microphone);
+        } else {
+            panic!("Expected Connect command");
+        }
+    }
+
+    #[test]
+    fn test_cli_audio_flags_default_false() {
+        let cli = Cli::try_parse_from(["yard", "connect", "server.example.com"]).unwrap();
+
+        if let Some(Commands::Connect {
+            no_audio,
+            no_microphone,
+            ..
+        }) = cli.command
+        {
+            assert!(!no_audio);
+            assert!(!no_microphone);
+        } else {
+            panic!("Expected Connect command");
+        }
+    }
+
+    #[test]
+    fn test_cli_both_audio_flags() {
+        let cli = Cli::try_parse_from([
+            "yard",
+            "connect",
+            "server.example.com",
+            "--no-audio",
+            "--no-microphone",
+        ])
+        .unwrap();
+
+        if let Some(Commands::Connect {
+            no_audio,
+            no_microphone,
+            ..
+        }) = cli.command
+        {
+            assert!(no_audio);
+            assert!(no_microphone);
+        } else {
+            panic!("Expected Connect command");
+        }
     }
 
     #[test]
