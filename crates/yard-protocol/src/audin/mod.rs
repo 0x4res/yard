@@ -155,6 +155,9 @@ impl YardAudinHandler {
                     debug!("Audio capture stopped");
                     self.state = AudinState::FormatsNegotiated;
                 }
+                Ok(FromAudio::BufferStats(_)) => {
+                    // Buffer stats are for playback, not capture - ignore here
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     warn!("Audio capture channel disconnected");

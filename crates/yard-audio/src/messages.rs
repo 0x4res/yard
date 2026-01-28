@@ -83,6 +83,16 @@ pub enum ToAudio {
     ///
     /// The audio thread will close the PipeWire capture stream.
     StopCapture,
+
+    /// Request current ring buffer statistics.
+    ///
+    /// The audio thread will respond with `FromAudio::BufferStats`.
+    GetBufferStats,
+
+    /// Clear the audio ring buffer.
+    ///
+    /// Useful when audio format changes or to recover from desync.
+    ClearBuffer,
 }
 
 /// Messages sent from the audio thread back to caller.
@@ -102,6 +112,8 @@ pub enum FromAudio {
     CaptureError(String),
     /// Capture stopped (device disconnected, stream closed).
     CaptureStopped,
+    /// Ring buffer statistics response.
+    BufferStats(crate::ring_buffer::RingBufferStats),
 }
 
 #[cfg(test)]
@@ -222,5 +234,25 @@ mod tests {
     fn test_from_audio_capture_stopped() {
         let msg = FromAudio::CaptureStopped;
         assert!(matches!(msg, FromAudio::CaptureStopped));
+    }
+
+    #[test]
+    fn test_to_audio_get_buffer_stats() {
+        let msg = ToAudio::GetBufferStats;
+        assert!(matches!(msg, ToAudio::GetBufferStats));
+    }
+
+    #[test]
+    fn test_to_audio_clear_buffer() {
+        let msg = ToAudio::ClearBuffer;
+        assert!(matches!(msg, ToAudio::ClearBuffer));
+    }
+
+    #[test]
+    fn test_from_audio_buffer_stats() {
+        use crate::ring_buffer::RingBufferStats;
+        let stats = RingBufferStats::default();
+        let msg = FromAudio::BufferStats(stats);
+        assert!(matches!(msg, FromAudio::BufferStats(_)));
     }
 }

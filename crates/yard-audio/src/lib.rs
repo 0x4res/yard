@@ -44,8 +44,10 @@
 
 mod error;
 mod messages;
+mod ring_buffer;
 mod thread;
 
 pub use error::AudioError;
 pub use messages::{AudioFormat, FromAudio, ToAudio};
+pub use ring_buffer::{AudioRingBuffer, DEFAULT_BUFFER_CAPACITY, RingBufferStats};
 pub use thread::AudioThread;

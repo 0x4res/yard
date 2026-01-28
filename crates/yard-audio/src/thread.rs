@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::AudioError;
 use crate::messages::{AudioFormat, FromAudio, ToAudio};
+use crate::ring_buffer::AudioRingBuffer;
 
 /// Timeout for graceful shutdown (seconds).
 const SHUTDOWN_TIMEOUT_SECS: u64 = 2;
@@ -220,6 +221,25 @@ struct CaptureState {
     frames_per_packet: u32,
 }
 
+/// State for audio playback.
+#[cfg(target_os = "linux")]
+struct PlaybackState {
+    /// Ring buffer for audio data.
+    buffer: AudioRingBuffer,
+    /// Current playback format.
+    format: Option<AudioFormat>,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self {
+            buffer: AudioRingBuffer::with_default_capacity(),
+            format: None,
+        }
+    }
+}
+
 /// Runs the PipeWire main loop in the audio thread.
 ///
 /// Uses a polling approach with short iteration timeouts to handle
@@ -241,6 +261,7 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
     };
 
     let mut capture_state = CaptureState::default();
+    let mut playback_state = PlaybackState::default();
     let mut running = true;
 
     // Polling loop: iterate PipeWire with short timeout, then check messages
@@ -259,17 +280,49 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
                         capture_state.active = false;
                         let _ = capture_tx.send(FromAudio::CaptureStopped);
                     }
+                    // Log final buffer stats
+                    let stats = playback_state.buffer.stats();
+                    debug!(
+                        "Audio shutdown - buffer stats: {} overflows, {} underruns, {} bytes written",
+                        stats.overflows, stats.underruns, stats.bytes_written
+                    );
                     running = false;
                     break;
                 }
                 Ok(ToAudio::PlayAudio { data, format }) => {
-                    debug!(
-                        "PlayAudio received: {} bytes, {}Hz {}ch {}bit (not yet implemented)",
-                        data.len(),
-                        format.sample_rate,
-                        format.channels,
-                        format.bits_per_sample
-                    );
+                    // Check for format change
+                    if playback_state.format.as_ref() != Some(&format) {
+                        debug!(
+                            "Audio format changed to {}Hz {}ch {}bit, clearing buffer",
+                            format.sample_rate, format.channels, format.bits_per_sample
+                        );
+                        playback_state.buffer.clear();
+                        playback_state.format = Some(format);
+                    }
+
+                    // Push audio data to ring buffer
+                    let written = playback_state.buffer.push(&data);
+                    if written < data.len() {
+                        // This shouldn't happen with overflow handling, but log if it does
+                        warn!(
+                            "Ring buffer overflow: only wrote {} of {} bytes",
+                            written,
+                            data.len()
+                        );
+                    }
+
+                    // Log stats periodically (every ~100 pushes based on buffer fill)
+                    let stats = playback_state.buffer.stats();
+                    if stats.bytes_written % 100_000 < data.len() as u64 {
+                        debug!(
+                            "Ring buffer: {:.1}% full, {} overflows, {} underruns",
+                            stats.fill_percentage() * 100.0,
+                            stats.overflows,
+                            stats.underruns
+                        );
+                    }
+
+                    // TODO: Create PipeWire playback stream that reads from ring buffer
                 }
                 Ok(ToAudio::SetVolume(vol)) => {
                     debug!("SetVolume received: {} (not yet implemented)", vol);
@@ -304,6 +357,21 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
                         let _ = capture_tx.send(FromAudio::CaptureStopped);
                         info!("Microphone capture stopped");
                     }
+                }
+                Ok(ToAudio::GetBufferStats) => {
+                    let stats = playback_state.buffer.stats();
+                    debug!(
+                        "Buffer stats requested: {:.1}% full, {} overflows, {} underruns",
+                        stats.fill_percentage() * 100.0,
+                        stats.overflows,
+                        stats.underruns
+                    );
+                    let _ = capture_tx.send(FromAudio::BufferStats(stats));
+                }
+                Ok(ToAudio::ClearBuffer) => {
+                    debug!("ClearBuffer received");
+                    playback_state.buffer.clear();
+                    playback_state.buffer.reset_stats();
                 }
                 Err(TryRecvError::Empty) => {
                     // No more messages, continue with PipeWire iteration
