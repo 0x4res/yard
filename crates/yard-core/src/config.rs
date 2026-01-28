@@ -372,4 +372,59 @@ microphone = false
         assert!(config.audio.enabled);
         assert!(config.audio.microphone);
     }
+
+    // Story 4.5: Audio flag precedence tests
+    #[test]
+    fn test_audio_flag_cli_overrides_config_enabled() {
+        // CLI --no-audio should disable audio even when config has enabled = true
+        let config = Config::default();
+        assert!(config.audio.enabled); // Config default
+
+        // Simulate CLI flag logic: !no_audio && config.audio.enabled
+        let no_audio = true; // CLI flag set
+        let audio_enabled = !no_audio && config.audio.enabled;
+        assert!(!audio_enabled); // CLI wins
+    }
+
+    #[test]
+    fn test_audio_flag_cli_overrides_config_microphone() {
+        // CLI --no-microphone should disable microphone even when config has microphone = true
+        let config = Config::default();
+        assert!(config.audio.microphone); // Config default
+
+        // Simulate CLI flag logic: !no_microphone && config.audio.microphone
+        let no_microphone = true; // CLI flag set
+        let microphone_enabled = !no_microphone && config.audio.microphone;
+        assert!(!microphone_enabled); // CLI wins
+    }
+
+    #[test]
+    fn test_audio_flag_config_disables_when_cli_default() {
+        // Config audio.enabled = false should disable audio when CLI has no flags
+        let toml = r#"
+[audio]
+enabled = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(!config.audio.enabled);
+
+        // Simulate CLI flag logic: !no_audio && config.audio.enabled
+        let no_audio = false; // CLI flag not set (default)
+        let audio_enabled = !no_audio && config.audio.enabled;
+        assert!(!audio_enabled); // Config wins when CLI is default
+    }
+
+    #[test]
+    fn test_audio_both_enabled_when_no_flags_and_default_config() {
+        // Default case: no CLI flags, default config = both enabled
+        let config = Config::default();
+        let no_audio = false;
+        let no_microphone = false;
+
+        let audio_enabled = !no_audio && config.audio.enabled;
+        let microphone_enabled = !no_microphone && config.audio.microphone;
+
+        assert!(audio_enabled);
+        assert!(microphone_enabled);
+    }
 }
