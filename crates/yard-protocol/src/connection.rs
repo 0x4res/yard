@@ -179,29 +179,8 @@ async fn handle_connect(
     // Create connector with local address
     let mut connector = ClientConnector::new(rdp_config, local_addr);
 
-    // Set up DISPLAYCONTROL channel for multi-monitor support (Story 3.2)
-    // The channel is only added if monitor layout is provided.
-    let has_multi_monitor = config.monitor_layout.is_some();
-    if has_multi_monitor {
-        // Create DisplayControlClient with a callback for when server capabilities arrive.
-        // The callback receives capabilities and can return messages to send.
-        // We just log the capabilities and return an empty response.
-        let displaycontrol_client = DisplayControlClient::new(|_caps| {
-            info!("DisplayControl capabilities received from server");
-            // Return empty response - we'll send the layout separately
-            Ok(vec![])
-        });
-
-        // Create DrdynvcClient (DRDYNVC static channel) and attach displaycontrol DVC
-        let drdynvc = DrdynvcClient::new().with_dynamic_channel(displaycontrol_client);
-
-        // Attach DRDYNVC as a static virtual channel to the connector
-        connector.attach_static_channel(drdynvc);
-        debug!("DISPLAYCONTROL channel configured for multi-monitor support");
-    }
-
     // Set up RDPSND channel for audio output (Story 4.2)
-    // Only attach if audio is enabled (audio_tx is Some)
+    // RDPSND is a Static Virtual Channel, attached directly to connector
     if let Some(ref tx) = audio_tx {
         let rdpsnd = create_rdpsnd_client(Some(tx.clone()));
         connector.attach_static_channel(rdpsnd);
@@ -210,32 +189,34 @@ async fn handle_connect(
         debug!("Audio disabled, skipping RDPSND channel");
     }
 
-    // Set up AUDIN channel for microphone input (Story 4.3)
-    // Only attach if capture_rx is provided (microphone enabled)
-    if capture_rx.is_some() {
-        // Create AUDIN handler with audio_tx for sending StartCapture/StopCapture
-        // and capture_rx for receiving captured audio data
-        let audin = create_audin_client(audio_tx.clone(), capture_rx);
+    // Set up Dynamic Virtual Channels (DVC) via single DrdynvcClient
+    // Both DISPLAYCONTROL and AUDIN are DVCs and must be attached to the same DrdynvcClient
+    let has_multi_monitor = config.monitor_layout.is_some();
+    let has_microphone = capture_rx.is_some();
 
-        // AUDIN is a Dynamic Virtual Channel - attach to DrdynvcClient
-        // If we already have a DrdynvcClient (from DISPLAYCONTROL), we need to get it
-        // Otherwise create a new one
+    if has_multi_monitor || has_microphone {
+        // Start building the DrdynvcClient
+        let mut drdynvc = DrdynvcClient::new();
+
+        // Add DISPLAYCONTROL for multi-monitor support (Story 3.2)
         if has_multi_monitor {
-            // DrdynvcClient already attached, we need to add AUDIN to it
-            // Unfortunately IronRDP doesn't support adding channels after connector creation
-            // For now, AUDIN will work without DISPLAYCONTROL in same session
-            warn!(
-                "AUDIN with DISPLAYCONTROL in same session not yet supported, microphone may not work"
-            );
-            // TODO: Refactor to build DrdynvcClient with all channels at once
-        } else {
-            // No DISPLAYCONTROL, create DrdynvcClient just for AUDIN
-            let drdynvc = DrdynvcClient::new().with_dynamic_channel(audin);
-            connector.attach_static_channel(drdynvc);
+            let displaycontrol_client = DisplayControlClient::new(|_caps| {
+                info!("DisplayControl capabilities received from server");
+                Ok(vec![])
+            });
+            drdynvc = drdynvc.with_dynamic_channel(displaycontrol_client);
+            debug!("DISPLAYCONTROL channel configured for multi-monitor support");
+        }
+
+        // Add AUDIN for microphone input (Story 4.3)
+        if has_microphone {
+            let audin = create_audin_client(audio_tx.clone(), capture_rx);
+            drdynvc = drdynvc.with_dynamic_channel(audin);
             debug!("AUDIN channel configured for microphone input");
         }
-    } else {
-        debug!("Microphone disabled, skipping AUDIN channel");
+
+        // Attach the single DrdynvcClient with all DVC channels
+        connector.attach_static_channel(drdynvc);
     }
 
     // Phase 1: Initial RDP negotiation (before TLS)
