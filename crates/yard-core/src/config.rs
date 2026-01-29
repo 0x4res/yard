@@ -26,6 +26,8 @@ pub struct Config {
     pub defaults: ConnectionDefaults,
     /// Audio settings.
     pub audio: AudioConfig,
+    /// Clipboard settings (Story 5.1).
+    pub clipboard: ClipboardConfig,
 }
 
 /// Audio configuration settings.
@@ -44,6 +46,20 @@ impl Default for AudioConfig {
             enabled: true,
             microphone: true,
         }
+    }
+}
+
+/// Clipboard configuration settings (Story 5.1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    /// Enable clipboard synchronization (default: true).
+    pub enabled: bool,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -526,5 +542,55 @@ microphone = false
 
         assert!(audio_tx_exists, "RDPSND should be enabled");
         assert!(!capture_rx_exists, "AUDIN should be disabled");
+    }
+
+    // Story 5.1: Clipboard config tests
+    #[test]
+    fn test_clipboard_config_default() {
+        let config = ClipboardConfig::default();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_config_defaults_include_clipboard() {
+        let config = Config::default();
+        assert!(config.clipboard.enabled);
+    }
+
+    #[test]
+    fn test_config_parse_clipboard_section() {
+        let toml = r#"
+[clipboard]
+enabled = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(!config.clipboard.enabled);
+    }
+
+    #[test]
+    fn test_clipboard_flag_cli_overrides_config() {
+        // CLI --no-clipboard should disable clipboard even when config has enabled = true
+        let config = Config::default();
+        assert!(config.clipboard.enabled); // Config default
+
+        // Simulate CLI flag logic: !no_clipboard && config.clipboard.enabled
+        let no_clipboard = true; // CLI flag set
+        let clipboard_enabled = !no_clipboard && config.clipboard.enabled;
+        assert!(!clipboard_enabled); // CLI wins
+    }
+
+    #[test]
+    fn test_clipboard_config_disables_when_cli_default() {
+        // Config clipboard.enabled = false should disable clipboard when CLI has no flags
+        let toml = r#"
+[clipboard]
+enabled = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(!config.clipboard.enabled);
+
+        let no_clipboard = false; // CLI flag not set (default)
+        let clipboard_enabled = !no_clipboard && config.clipboard.enabled;
+        assert!(!clipboard_enabled); // Config wins when CLI is default
     }
 }

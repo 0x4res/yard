@@ -607,9 +607,10 @@ fn create_playback_stream(
                         let chunk = data.chunk_mut();
                         *chunk.size_mut() = read as u32;
                         *chunk.offset_mut() = 0;
-                        *chunk.stride_mut() = (ps.format.as_ref().map_or(4, |f| {
-                            (f.channels as i32) * (f.bits_per_sample as i32 / 8)
-                        })) as i32;
+                        *chunk.stride_mut() =
+                            (ps.format.as_ref().map_or(4, |f| {
+                                (f.channels as i32) * (f.bits_per_sample as i32 / 8)
+                            })) as i32;
                     }
                 }
                 None => {
@@ -729,8 +730,7 @@ fn create_capture_stream(
 
     // Clone state for callback
     let format_clone = format.clone();
-    let bytes_per_frame =
-        (format.channels as usize) * (format.bits_per_sample as usize / 8);
+    let bytes_per_frame = (format.channels as usize) * (format.bits_per_sample as usize / 8);
     let bytes_per_packet = (frames_per_packet as usize) * bytes_per_frame;
     let capture_tx_err = capture_tx.clone();
 

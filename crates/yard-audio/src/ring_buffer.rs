@@ -597,8 +597,8 @@ mod tests {
 
     #[test]
     fn test_concurrent_access() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
         let buf = Arc::new(AudioRingBuffer::new(65536));

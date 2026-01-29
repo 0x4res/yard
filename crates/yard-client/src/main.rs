@@ -94,6 +94,10 @@ enum Commands {
         /// Disable microphone input only.
         #[arg(long)]
         no_microphone: bool,
+
+        /// Disable clipboard synchronization (Story 5.1).
+        #[arg(long)]
+        no_clipboard: bool,
     },
 
     /// Generate shell completion scripts.
@@ -150,6 +154,7 @@ fn run(cli: Cli) -> Result<u8> {
             all_monitors,
             no_audio,
             no_microphone,
+            no_clipboard,
         }) => {
             // User feedback (always visible, not affected by log level)
             eprintln!("YARD v{}", env!("CARGO_PKG_VERSION"));
@@ -181,6 +186,12 @@ fn run(cli: Cli) -> Result<u8> {
             // Determine audio settings: CLI flags override config file
             let audio_enabled = !no_audio && app_config.audio.enabled;
             let microphone_enabled = !no_microphone && app_config.audio.microphone;
+
+            // Determine clipboard setting: CLI flag overrides config file (Story 5.1)
+            let clipboard_enabled = !no_clipboard && app_config.clipboard.enabled;
+            if !clipboard_enabled {
+                config = config.without_clipboard();
+            }
 
             run_connection(
                 config,
@@ -1096,6 +1107,30 @@ mod tests {
         {
             assert!(no_audio);
             assert!(no_microphone);
+        } else {
+            panic!("Expected Connect command");
+        }
+    }
+
+    // Story 5.1: Clipboard flag tests
+    #[test]
+    fn test_cli_no_clipboard_flag() {
+        let cli = Cli::try_parse_from(["yard", "connect", "server.example.com", "--no-clipboard"])
+            .unwrap();
+
+        if let Some(Commands::Connect { no_clipboard, .. }) = cli.command {
+            assert!(no_clipboard);
+        } else {
+            panic!("Expected Connect command");
+        }
+    }
+
+    #[test]
+    fn test_cli_clipboard_flag_default_false() {
+        let cli = Cli::try_parse_from(["yard", "connect", "server.example.com"]).unwrap();
+
+        if let Some(Commands::Connect { no_clipboard, .. }) = cli.command {
+            assert!(!no_clipboard);
         } else {
             panic!("Expected Connect command");
         }

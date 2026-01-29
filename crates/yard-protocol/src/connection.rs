@@ -32,6 +32,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 use crate::audin::create_audin_client;
+use crate::cliprdr::create_cliprdr_client;
 use crate::messages::{
     CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, MouseButton,
     RdpMonitorInfo, ToNetwork,
@@ -187,6 +188,16 @@ async fn handle_connect(
         debug!("RDPSND channel configured for audio output");
     } else {
         debug!("Audio disabled, skipping RDPSND channel");
+    }
+
+    // Set up CLIPRDR channel for clipboard synchronization (Story 5.1)
+    // CLIPRDR is a Static Virtual Channel
+    if config.clipboard_enabled {
+        let cliprdr = create_cliprdr_client(true);
+        connector.attach_static_channel(cliprdr);
+        debug!("CLIPRDR channel configured for clipboard synchronization");
+    } else {
+        debug!("Clipboard disabled, skipping CLIPRDR channel");
     }
 
     // Set up Dynamic Virtual Channels (DVC) via single DrdynvcClient

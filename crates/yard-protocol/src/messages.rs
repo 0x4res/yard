@@ -134,6 +134,9 @@ pub struct ConnectionConfig {
     /// Monitor layout to report to the server (Story 3.2).
     /// If provided, DISPLAYCONTROL channel will be used to report the layout.
     pub monitor_layout: Option<Vec<RdpMonitorInfo>>,
+    /// Whether clipboard synchronization is enabled (Story 5.1).
+    /// Default: true
+    pub clipboard_enabled: bool,
 }
 
 // Manual Debug implementation to exclude password from logs (NFR-S2)
@@ -146,6 +149,7 @@ impl std::fmt::Debug for ConnectionConfig {
             .field("domain", &self.domain)
             .field("password", &"[REDACTED]")
             .field("monitor_layout", &self.monitor_layout)
+            .field("clipboard_enabled", &self.clipboard_enabled)
             .finish()
     }
 }
@@ -160,7 +164,14 @@ impl ConnectionConfig {
             domain: None,
             password: None,
             monitor_layout: None,
+            clipboard_enabled: true, // Enabled by default
         }
+    }
+
+    /// Disables clipboard synchronization (Story 5.1).
+    pub fn without_clipboard(mut self) -> Self {
+        self.clipboard_enabled = false;
+        self
     }
 
     /// Sets the monitor layout for multi-monitor support (Story 3.2).
