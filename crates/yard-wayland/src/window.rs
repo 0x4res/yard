@@ -4322,7 +4322,7 @@ mod tests {
         assert_eq!(h, 1080);
 
         // Change resolution but keep position
-        let mut updated_monitor = create_test_monitor(1, "DP-1", 2560, 1440, 100, 200);
+        let updated_monitor = create_test_monitor(1, "DP-1", 2560, 1440, 100, 200);
         monitors.insert(1, updated_monitor.clone());
 
         // Verify position preserved

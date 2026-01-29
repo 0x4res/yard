@@ -13,6 +13,8 @@
 //! Device hot-plug is handled automatically by PipeWire when streams are
 //! connected with `AUTOCONNECT` flag and no specific target node.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -245,21 +247,12 @@ impl Default for CaptureState {
 
 /// State for audio playback.
 #[cfg(target_os = "linux")]
+#[derive(Default)]
 struct PlaybackState {
     /// Ring buffer for audio data.
     buffer: AudioRingBuffer,
     /// Current playback format.
     format: Option<AudioFormat>,
-}
-
-#[cfg(target_os = "linux")]
-impl Default for PlaybackState {
-    fn default() -> Self {
-        Self {
-            buffer: AudioRingBuffer::with_default_capacity(),
-            format: None,
-        }
-    }
 }
 
 /// Runs the PipeWire main loop in the audio thread.
@@ -268,18 +261,15 @@ impl Default for PlaybackState {
 /// handling via PipeWire's AUTOCONNECT mechanism.
 #[cfg(target_os = "linux")]
 fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
-    use pipewire::context::Context;
-    use pipewire::main_loop::MainLoop;
-    use pipewire::spa::utils::Direction;
-    use pipewire::stream::{Stream, StreamFlags, StreamListener};
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use pipewire::context::ContextRc;
+    use pipewire::main_loop::MainLoopRc;
+    use pipewire::stream::{StreamBox, StreamListener};
     use std::sync::mpsc::TryRecvError;
 
     debug!("Audio thread starting PipeWire main loop");
 
-    // Create PipeWire main loop (not Rc variant - we need ownership)
-    let main_loop = match MainLoop::new(None) {
+    // Create PipeWire main loop
+    let main_loop = match MainLoopRc::new(None) {
         Ok(ml) => ml,
         Err(e) => {
             error!("Failed to create PipeWire MainLoop: {}", e);
@@ -288,7 +278,7 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
     };
 
     // Create context
-    let context = match Context::new(&main_loop) {
+    let context = match ContextRc::new(&main_loop, None) {
         Ok(ctx) => ctx,
         Err(e) => {
             error!("Failed to create PipeWire Context: {}", e);
@@ -297,7 +287,7 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
     };
 
     // Connect to PipeWire
-    let core = match context.connect(None) {
+    let core = match context.connect_rc(None) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to connect to PipeWire: {}", e);
@@ -307,6 +297,13 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
 
     info!("Connected to PipeWire daemon");
 
+    // Leak the core to get a 'static reference - this is safe because the core
+    // is kept alive for the entire duration of the audio thread, and we need
+    // 'static lifetime for StreamBox to be stored in RefCells.
+    // The leaked memory is small (just an Rc wrapper) and the audio thread
+    // typically lives for the entire session.
+    let core: &'static pipewire::core::CoreRc = Box::leak(Box::new(core));
+
     // Shared state wrapped in RefCell for interior mutability in callbacks
     let capture_state = Rc::new(RefCell::new(CaptureState::default()));
     let playback_state = Rc::new(RefCell::new(PlaybackState::default()));
@@ -314,11 +311,11 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
 
     // Playback stream and listener (created lazily when first audio data arrives)
     // Both must be kept alive for callbacks to work
-    let playback_stream: Rc<RefCell<Option<Stream>>> = Rc::new(RefCell::new(None));
+    let playback_stream: Rc<RefCell<Option<StreamBox<'static>>>> = Rc::new(RefCell::new(None));
     let playback_listener: Rc<RefCell<Option<StreamListener<()>>>> = Rc::new(RefCell::new(None));
 
     // Capture stream and listener (created when StartCapture is received)
-    let capture_stream: Rc<RefCell<Option<Stream>>> = Rc::new(RefCell::new(None));
+    let capture_stream: Rc<RefCell<Option<StreamBox<'static>>>> = Rc::new(RefCell::new(None));
     let capture_listener: Rc<RefCell<Option<StreamListener<()>>>> = Rc::new(RefCell::new(None));
 
     let running = Rc::new(RefCell::new(true));
@@ -333,7 +330,7 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
     let playback_listener_msg = playback_listener.clone();
     let capture_stream_msg = capture_stream.clone();
     let capture_listener_msg = capture_listener.clone();
-    let core_clone = core.clone();
+    // core is &'static CoreRc, so we can use it directly in the closure
     let main_loop_weak = main_loop.downgrade();
 
     // Add a timer source to poll for messages
@@ -391,12 +388,12 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
                             format.sample_rate, format.channels, format.bits_per_sample
                         );
                         ps.buffer.clear();
-                        ps.format = Some(format.clone());
+                        ps.format = Some(format);
 
                         // Create or recreate playback stream with new format
                         drop(ps); // Release borrow before creating stream
                         create_playback_stream(
-                            &core_clone,
+                            core,
                             &format,
                             playback_stream_msg.clone(),
                             playback_listener_msg.clone(),
@@ -443,7 +440,7 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
 
                     {
                         let mut cs = capture_state_msg.borrow_mut();
-                        cs.format = Some(format.clone());
+                        cs.format = Some(format);
                         cs.frames_per_packet = frames_per_packet;
                         cs.active = true;
                         cs.frame_accumulator.clear();
@@ -451,7 +448,7 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
 
                     // Create capture stream
                     create_capture_stream(
-                        &core_clone,
+                        core,
                         &format,
                         frames_per_packet,
                         capture_stream_msg.clone(),
@@ -496,7 +493,7 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
 
                 Ok(ToAudio::ClearBuffer) => {
                     debug!("ClearBuffer received");
-                    let mut ps = playback_state_msg.borrow_mut();
+                    let ps = playback_state_msg.borrow_mut();
                     ps.buffer.clear();
                     ps.buffer.reset_stats();
                 }
@@ -508,7 +505,7 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
 
                 Err(TryRecvError::Disconnected) => {
                     debug!("Audio message channel closed");
-                    let mut cs = capture_state_msg.borrow_mut();
+                    let cs = capture_state_msg.borrow_mut();
                     if cs.active {
                         let _ = capture_tx_msg.send(FromAudio::CaptureStopped);
                     }
@@ -523,12 +520,10 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
     });
 
     // Enable timer with 10ms interval for message polling
-    if let Some(timer) = _timer {
-        timer.update_timer(
-            Some(Duration::from_millis(10)),
-            Some(Duration::from_millis(10)),
-        );
-    }
+    _timer.update_timer(
+        Some(Duration::from_millis(10)),
+        Some(Duration::from_millis(10)),
+    );
 
     // Run the main loop until shutdown
     debug!("Starting PipeWire main loop");
@@ -546,17 +541,19 @@ fn run_audio_loop(rx: Receiver<ToAudio>, capture_tx: Sender<FromAudio>) {
 /// the callbacks alive for the lifetime of the stream.
 #[cfg(target_os = "linux")]
 fn create_playback_stream(
-    core: &pipewire::core::Core,
+    core: &'static pipewire::core::CoreRc,
     format: &AudioFormat,
-    stream_holder: Rc<RefCell<Option<pipewire::stream::Stream>>>,
+    stream_holder: Rc<RefCell<Option<pipewire::stream::StreamBox<'static>>>>,
     listener_holder: Rc<RefCell<Option<pipewire::stream::StreamListener<()>>>>,
     playback_state: Rc<RefCell<PlaybackState>>,
 ) {
     use pipewire::properties::properties;
     use pipewire::spa::param::audio::{AudioFormat as SpaAudioFormat, AudioInfoRaw};
     use pipewire::spa::pod::serialize::PodSerializer;
+    use pipewire::spa::pod::{Object, Pod, Property, Value};
+    use pipewire::spa::sys::{SPA_PARAM_EnumFormat, SPA_TYPE_OBJECT_Format};
     use pipewire::spa::utils::Direction;
-    use pipewire::stream::{Stream, StreamFlags};
+    use pipewire::stream::{StreamBox, StreamFlags};
 
     // Disconnect existing stream and drop old listener
     listener_holder.borrow_mut().take();
@@ -574,7 +571,7 @@ fn create_playback_stream(
     };
 
     // Create the stream
-    let stream = match Stream::new(core, "yard-playback", props) {
+    let stream = match StreamBox::new(core, "yard-playback", props) {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create playback stream: {}", e);
@@ -600,17 +597,17 @@ fn create_playback_stream(
                     let data = &mut datas[0];
                     if let Some(slice) = data.data() {
                         // Read from ring buffer into PipeWire buffer
-                        let mut ps = playback_state_cb.borrow_mut();
+                        let ps = playback_state_cb.borrow_mut();
                         let read = ps.buffer.pop(slice);
 
                         // Set the chunk size to how much we actually wrote
                         let chunk = data.chunk_mut();
                         *chunk.size_mut() = read as u32;
                         *chunk.offset_mut() = 0;
-                        *chunk.stride_mut() =
-                            (ps.format.as_ref().map_or(4, |f| {
-                                (f.channels as i32) * (f.bits_per_sample as i32 / 8)
-                            })) as i32;
+                        *chunk.stride_mut() = ps
+                            .format
+                            .as_ref()
+                            .map_or(4, |f| (f.channels as i32) * (f.bits_per_sample as i32 / 8));
                     }
                 }
                 None => {
@@ -618,7 +615,7 @@ fn create_playback_stream(
                 }
             }
         })
-        .state_changed(|_old, new| {
+        .state_changed(|_stream, _user_data, _old, new| {
             debug!("Playback stream state changed to {:?}", new);
         })
         .register();
@@ -640,19 +637,34 @@ fn create_playback_stream(
         _ => SpaAudioFormat::S16LE, // Default to 16-bit
     };
 
-    let audio_info = AudioInfoRaw::new()
-        .set_format(spa_format)
-        .set_rate(format.sample_rate)
-        .set_channels(format.channels as u32);
+    let mut audio_info = AudioInfoRaw::new();
+    audio_info.set_format(spa_format);
+    audio_info.set_rate(format.sample_rate);
+    audio_info.set_channels(format.channels as u32);
 
-    let mut params_buffer = [0u8; 1024];
-    let pod = match PodSerializer::serialize(
-        std::io::Cursor::new(&mut params_buffer[..]),
-        &pipewire::spa::param::audio::AudioInfoRaw::build(&audio_info),
-    ) {
-        Ok((_, pod)) => pod,
-        Err(e) => {
-            error!("Failed to serialize audio format pod: {:?}", e);
+    // Convert AudioInfoRaw to properties and wrap in Object for serialization
+    let props_vec: Vec<Property> = audio_info.into();
+    let obj = Object {
+        type_: SPA_TYPE_OBJECT_Format,
+        id: SPA_PARAM_EnumFormat,
+        properties: props_vec,
+    };
+
+    // Serialize to a Vec<u8> as shown in pipewire examples
+    let values: Vec<u8> =
+        match PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj)) {
+            Ok((cursor, _len)) => cursor.into_inner(),
+            Err(e) => {
+                error!("Failed to serialize audio format pod: {:?}", e);
+                return;
+            }
+        };
+
+    // Create Pod from serialized bytes
+    let mut params = match Pod::from_bytes(&values) {
+        Some(pod) => [pod],
+        None => {
+            error!("Failed to create Pod from serialized bytes");
             return;
         }
     };
@@ -662,7 +674,7 @@ fn create_playback_stream(
     // No target ID (None) means follow the default sink - enables hot-plug
     let flags = StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
 
-    if let Err(e) = stream.connect(Direction::Output, None, flags, &mut [&pod]) {
+    if let Err(e) = stream.connect(Direction::Output, None, flags, &mut params) {
         error!("Failed to connect playback stream: {}", e);
         return;
     }
@@ -686,10 +698,10 @@ fn create_playback_stream(
 /// the callbacks alive for the lifetime of the stream.
 #[cfg(target_os = "linux")]
 fn create_capture_stream(
-    core: &pipewire::core::Core,
+    core: &'static pipewire::core::CoreRc,
     format: &AudioFormat,
     frames_per_packet: u32,
-    stream_holder: Rc<RefCell<Option<pipewire::stream::Stream>>>,
+    stream_holder: Rc<RefCell<Option<pipewire::stream::StreamBox<'static>>>>,
     listener_holder: Rc<RefCell<Option<pipewire::stream::StreamListener<()>>>>,
     capture_state: Rc<RefCell<CaptureState>>,
     capture_tx: Rc<Sender<FromAudio>>,
@@ -697,8 +709,10 @@ fn create_capture_stream(
     use pipewire::properties::properties;
     use pipewire::spa::param::audio::{AudioFormat as SpaAudioFormat, AudioInfoRaw};
     use pipewire::spa::pod::serialize::PodSerializer;
+    use pipewire::spa::pod::{Object, Pod, Property, Value};
+    use pipewire::spa::sys::{SPA_PARAM_EnumFormat, SPA_TYPE_OBJECT_Format};
     use pipewire::spa::utils::Direction;
-    use pipewire::stream::{Stream, StreamFlags};
+    use pipewire::stream::{StreamBox, StreamFlags};
 
     // Disconnect existing stream and drop old listener
     listener_holder.borrow_mut().take();
@@ -716,7 +730,7 @@ fn create_capture_stream(
     };
 
     // Create the stream
-    let stream = match Stream::new(core, "yard-capture", props) {
+    let stream = match StreamBox::new(core, "yard-capture", props) {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create capture stream: {}", e);
@@ -728,8 +742,8 @@ fn create_capture_stream(
         }
     };
 
-    // Clone state for callback
-    let format_clone = format.clone();
+    // Copy format for callback (AudioFormat is Copy)
+    let format_clone = *format;
     let bytes_per_frame = (format.channels as usize) * (format.bits_per_sample as usize / 8);
     let bytes_per_packet = (frames_per_packet as usize) * bytes_per_frame;
     let capture_tx_err = capture_tx.clone();
@@ -739,23 +753,23 @@ fn create_capture_stream(
         .add_local_listener_with_user_data(())
         .process(move |stream, _user_data| {
             match stream.dequeue_buffer() {
-                Some(buffer) => {
-                    let datas = buffer.datas();
+                Some(mut buffer) => {
+                    let datas = buffer.datas_mut();
                     if datas.is_empty() {
                         return;
                     }
 
-                    let data = &datas[0];
+                    let data = &mut datas[0];
+                    // Get chunk info first (immutable borrow)
+                    let size = data.chunk().size() as usize;
+                    if size == 0 {
+                        return;
+                    }
+
+                    // Now get the data slice (mutable borrow)
                     if let Some(slice) = data.data() {
-                        let chunk = data.chunk();
-                        let size = chunk.size() as usize;
-
-                        if size == 0 {
-                            return;
-                        }
-
                         // Get actual audio data
-                        let audio_data = &slice[..size.min(slice.len())];
+                        let audio_data: &[u8] = &slice[..size.min(slice.len())];
 
                         let mut cs = capture_state.borrow_mut();
                         if !cs.active {
@@ -772,7 +786,7 @@ fn create_capture_stream(
 
                             let _ = capture_tx.send(FromAudio::CapturedData {
                                 data: packet,
-                                format: format_clone.clone(),
+                                format: format_clone,
                             });
                         }
                     }
@@ -782,7 +796,7 @@ fn create_capture_stream(
                 }
             }
         })
-        .state_changed(move |_old, new| {
+        .state_changed(move |_stream, _user_data, _old, new| {
             debug!("Capture stream state changed to {:?}", new);
         })
         .register();
@@ -806,23 +820,41 @@ fn create_capture_stream(
         _ => SpaAudioFormat::S16LE,
     };
 
-    let audio_info = AudioInfoRaw::new()
-        .set_format(spa_format)
-        .set_rate(format.sample_rate)
-        .set_channels(format.channels as u32);
+    let mut audio_info = AudioInfoRaw::new();
+    audio_info.set_format(spa_format);
+    audio_info.set_rate(format.sample_rate);
+    audio_info.set_channels(format.channels as u32);
 
-    let mut params_buffer = [0u8; 1024];
-    let pod = match PodSerializer::serialize(
-        std::io::Cursor::new(&mut params_buffer[..]),
-        &pipewire::spa::param::audio::AudioInfoRaw::build(&audio_info),
-    ) {
-        Ok((_, pod)) => pod,
-        Err(e) => {
-            error!("Failed to serialize audio format pod: {:?}", e);
-            let _ = capture_tx_err.send(FromAudio::CaptureError(format!(
-                "Failed to serialize audio format: {:?}",
-                e
-            )));
+    // Convert AudioInfoRaw to properties and wrap in Object for serialization
+    let props_capture: Vec<Property> = audio_info.into();
+    let obj = Object {
+        type_: SPA_TYPE_OBJECT_Format,
+        id: SPA_PARAM_EnumFormat,
+        properties: props_capture,
+    };
+
+    // Serialize to a Vec<u8> as shown in pipewire examples
+    let values: Vec<u8> =
+        match PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj)) {
+            Ok((cursor, _len)) => cursor.into_inner(),
+            Err(e) => {
+                error!("Failed to serialize audio format pod: {:?}", e);
+                let _ = capture_tx_err.send(FromAudio::CaptureError(format!(
+                    "Failed to serialize audio format: {:?}",
+                    e
+                )));
+                return;
+            }
+        };
+
+    // Create Pod from serialized bytes
+    let mut params = match Pod::from_bytes(&values) {
+        Some(pod) => [pod],
+        None => {
+            error!("Failed to create Pod from serialized bytes");
+            let _ = capture_tx_err.send(FromAudio::CaptureError(
+                "Failed to create Pod from serialized bytes".to_string(),
+            ));
             return;
         }
     };
@@ -831,7 +863,7 @@ fn create_capture_stream(
     // Direction::Input means we're receiving audio FROM PipeWire (capture)
     let flags = StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
 
-    if let Err(e) = stream.connect(Direction::Input, None, flags, &mut [&pod]) {
+    if let Err(e) = stream.connect(Direction::Input, None, flags, &mut params) {
         error!("Failed to connect capture stream: {}", e);
         let _ = capture_tx_err.send(FromAudio::CaptureError(format!(
             "Failed to connect capture stream: {}",
