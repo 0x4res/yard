@@ -141,6 +141,14 @@ async fn network_loop(
                 // Story 5.2: Clipboard request should be received during active session
                 warn!("Received clipboard request outside of active session");
             }
+            ToNetwork::LocalClipboardText { .. } => {
+                // Story 5.3: Local clipboard should be received during active session
+                warn!("Received local clipboard update outside of active session");
+            }
+            ToNetwork::LocalClipboardCleared => {
+                // Story 5.3: Local clipboard cleared should be received during active session
+                warn!("Received local clipboard cleared outside of active session");
+            }
         }
     }
 }
@@ -699,6 +707,17 @@ where
                         // TODO: Access CLIPRDR handler via active_stage.get_svc_processor_mut()
                         // and call request_text_data() to get the PDU to send.
                         debug!("Clipboard text request received - auto-fetch already active");
+                    }
+                    Some(ToNetwork::LocalClipboardText { text }) => {
+                        // Story 5.3: Local clipboard changed with text
+                        // TODO: Access CLIPRDR handler and call set_local_clipboard_text()
+                        // to get Format List PDU to send to server
+                        debug!("Local clipboard changed: {} chars", text.len());
+                        // For now, log the event - full integration requires SVC handler access
+                    }
+                    Some(ToNetwork::LocalClipboardCleared) => {
+                        // Story 5.3: Local clipboard was cleared
+                        debug!("Local clipboard cleared");
                     }
                     None => {
                         // Channel closed - main thread disconnected

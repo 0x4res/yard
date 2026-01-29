@@ -508,6 +508,19 @@ impl FormatListPdu {
         let payload = self.encode_payload_long();
         encode_pdu(MessageType::FormatList, MessageFlags::empty(), &payload)
     }
+
+    /// Story 5.3: Creates a Format List PDU announcing text formats.
+    ///
+    /// This announces that the client has text available in both
+    /// CF_UNICODETEXT and CF_TEXT formats.
+    pub fn text_formats() -> Self {
+        Self {
+            formats: vec![
+                ClipboardFormat::new(StandardFormat::UnicodeText as u32, ""),
+                ClipboardFormat::new(StandardFormat::Text as u32, ""),
+            ],
+        }
+    }
 }
 
 /// Format List Response PDU (CB_FORMAT_LIST_RESPONSE) - section 2.2.3.2.

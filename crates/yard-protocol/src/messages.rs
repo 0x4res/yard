@@ -425,6 +425,16 @@ pub enum ToNetwork {
     /// Sent when the local Wayland compositor requests clipboard data
     /// (e.g., user pastes in a local application).
     RequestClipboardText,
+    /// Story 5.3: Local clipboard changed with text content.
+    ///
+    /// Sent when the user copies text in a local application.
+    /// The network thread should send Format List PDU to the server.
+    LocalClipboardText {
+        /// The clipboard text content (UTF-8).
+        text: String,
+    },
+    /// Story 5.3: Local clipboard was cleared or taken by another app.
+    LocalClipboardCleared,
 }
 
 /// Monitor layout information for RDP DISPLAYCONTROL channel (Story 3.6).

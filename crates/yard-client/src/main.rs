@@ -909,6 +909,16 @@ fn run_event_loop(
                     // Note: MonitorLayoutChanged event is emitted separately and will
                     // trigger DISPLAYCONTROL notification to server
                 }
+                // Story 5.3: Handle local clipboard changes
+                WindowEvent::LocalClipboardChanged { text } => {
+                    debug!("Local clipboard changed: {} chars", text.len());
+                    if to_network_tx
+                        .blocking_send(ToNetwork::LocalClipboardText { text })
+                        .is_err()
+                    {
+                        error!("Failed to send local clipboard text to network thread");
+                    }
+                }
             }
         }
     }

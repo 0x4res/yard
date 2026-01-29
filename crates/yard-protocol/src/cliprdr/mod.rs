@@ -88,6 +88,8 @@ pub struct YardCliprdrHandler {
     pending_clipboard_data: Option<String>,
     /// Optional channel for sending clipboard events to the main thread.
     event_tx: Option<Sender<ClipboardEvent>>,
+    /// Story 5.3: Local clipboard text to provide when server requests.
+    local_clipboard_text: Option<String>,
 }
 
 impl YardCliprdrHandler {
@@ -105,6 +107,7 @@ impl YardCliprdrHandler {
             pending_format_request: None,
             pending_clipboard_data: None,
             event_tx: None,
+            local_clipboard_text: None,
         }
     }
 
@@ -122,6 +125,7 @@ impl YardCliprdrHandler {
             pending_format_request: None,
             pending_clipboard_data: None,
             event_tx: Some(event_tx),
+            local_clipboard_text: None,
         }
     }
 
@@ -136,6 +140,7 @@ impl YardCliprdrHandler {
             pending_format_request: None,
             pending_clipboard_data: None,
             event_tx: None,
+            local_clipboard_text: None,
         }
     }
 
@@ -288,8 +293,7 @@ impl YardCliprdrHandler {
     /// Handles a Format Data Request PDU from the server.
     ///
     /// The server sends this when it wants to paste data that we announced
-    /// in our Format List. For now, we respond with failure since we don't
-    /// have local clipboard integration yet.
+    /// in our Format List. Story 5.3: Respond with local clipboard data.
     fn handle_format_data_request(
         &mut self,
         request: &FormatDataRequestPdu,
@@ -300,16 +304,45 @@ impl YardCliprdrHandler {
             request.requested_format_id
         );
 
-        // For now, respond with failure since we don't have local clipboard data
-        // This will be implemented when we add local → remote clipboard sync
-        let response = FormatDataResponsePdu::fail();
+        // Story 5.3: Provide local clipboard data if available
+        let response = if let Some(ref text) = self.local_clipboard_text {
+            match request.requested_format_id {
+                id if id == StandardFormat::UnicodeText as u32 => {
+                    // Convert UTF-8 to UTF-16LE with null terminator
+                    let data = Self::utf8_to_utf16le_with_null(text);
+                    debug!("Sending Format Data Response (Unicode, {} bytes)", data.len());
+                    FormatDataResponsePdu::ok(data)
+                }
+                id if id == StandardFormat::Text as u32 => {
+                    // Convert to ANSI (lossy conversion, just use ASCII bytes)
+                    let mut data: Vec<u8> = text.bytes().filter(|&b| b < 128).collect();
+                    data.push(0); // Null terminator
+                    debug!("Sending Format Data Response (ANSI, {} bytes)", data.len());
+                    FormatDataResponsePdu::ok(data)
+                }
+                _ => {
+                    debug!("Requested format {} not available", request.requested_format_id);
+                    FormatDataResponsePdu::fail()
+                }
+            }
+        } else {
+            debug!("No local clipboard data available");
+            FormatDataResponsePdu::fail()
+        };
+
         let response_data = response.encode();
+        Ok(vec![SvcMessage::from(CliprdrSvcMessage::new(response_data))])
+    }
 
-        debug!("Sending Format Data Response (FAIL - not implemented)");
-
-        Ok(vec![SvcMessage::from(CliprdrSvcMessage::new(
-            response_data,
-        ))])
+    /// Converts UTF-8 string to UTF-16LE bytes with null terminator.
+    fn utf8_to_utf16le_with_null(text: &str) -> Vec<u8> {
+        let mut data = Vec::with_capacity((text.len() + 1) * 2);
+        for code_unit in text.encode_utf16() {
+            data.extend_from_slice(&code_unit.to_le_bytes());
+        }
+        // Add null terminator
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data
     }
 
     /// Handles a Format Data Response PDU from the server.
@@ -414,6 +447,46 @@ impl YardCliprdrHandler {
     /// Returns true if there's a pending format data request.
     pub fn has_pending_request(&self) -> bool {
         self.pending_format_request.is_some()
+    }
+
+    /// Story 5.3: Sets the local clipboard text and returns Format List PDU to send.
+    ///
+    /// Call this when the local clipboard changes with text content.
+    /// Send the returned bytes via the CLIPRDR static channel.
+    pub fn set_local_clipboard_text(&mut self, text: String) -> Option<Vec<u8>> {
+        if self.state != CliprdrState::Ready {
+            warn!("Cannot set local clipboard: channel not ready");
+            return None;
+        }
+
+        debug!("Setting local clipboard text: {} chars", text.len());
+        self.local_clipboard_text = Some(text);
+
+        // Create Format List PDU announcing text formats
+        let format_list = FormatListPdu::text_formats();
+        let encoded = format_list.encode();
+
+        debug!("Sending Format List with text formats");
+        Some(encoded)
+    }
+
+    /// Story 5.3: Clears the local clipboard.
+    pub fn clear_local_clipboard(&mut self) -> Option<Vec<u8>> {
+        if self.state != CliprdrState::Ready {
+            return None;
+        }
+
+        debug!("Clearing local clipboard");
+        self.local_clipboard_text = None;
+
+        // Send empty Format List
+        let format_list = FormatListPdu::empty();
+        Some(format_list.encode())
+    }
+
+    /// Story 5.3: Returns the local clipboard text for Format Data Response.
+    pub fn local_clipboard_text(&self) -> Option<&str> {
+        self.local_clipboard_text.as_deref()
     }
 }
 

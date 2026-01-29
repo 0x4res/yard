@@ -711,6 +711,12 @@ mod linux {
             new_width: u32,
             new_height: u32,
         },
+        /// Story 5.3: Local clipboard changed with text content.
+        /// Emitted when another application copies text to the clipboard.
+        LocalClipboardChanged {
+            /// The clipboard text content (UTF-8).
+            text: String,
+        },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -2705,11 +2711,55 @@ mod linux {
             _data_device: &smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice,
         ) {
             // Story 5.3: Selection changed - another app copied something
-            // This is where we would detect local clipboard changes and notify
-            // the network thread to send Format List to the server.
             tracing::debug!("Clipboard selection changed (local app copied)");
-            // TODO: Read the selection and send to network thread
-            // For now, just log the event
+
+            // Get the selection offer from our tracked data device
+            if let Some(ref data_device) = self.data_device {
+                if let Some(offer) = data_device.selection_offer() {
+                    // Check if text format is available
+                    let mime_types = offer.mime_types();
+                    let text_mime = mime_types.iter().find(|m| {
+                        m.as_str() == "text/plain;charset=utf-8"
+                            || m.as_str() == "text/plain"
+                            || m.as_str() == "UTF8_STRING"
+                            || m.as_str() == "STRING"
+                    });
+
+                    if let Some(mime) = text_mime {
+                        tracing::debug!("Text format available: {}", mime);
+
+                        // Request the data - this gives us a ReadPipe
+                        match offer.receive(mime.clone()) {
+                            Ok(mut pipe) => {
+                                // Read the text (may block briefly for small content)
+                                let mut text = String::new();
+                                if let Err(e) = pipe.read_to_string(&mut text) {
+                                    tracing::warn!("Failed to read clipboard data: {}", e);
+                                    return;
+                                }
+
+                                if !text.is_empty() {
+                                    tracing::debug!(
+                                        "Local clipboard text: {} chars",
+                                        text.len()
+                                    );
+                                    // Notify main thread of clipboard change
+                                    let _ = self.event_tx.send(WindowEvent::LocalClipboardChanged {
+                                        text,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to receive clipboard data: {}", e);
+                            }
+                        }
+                    } else {
+                        tracing::debug!("No text format in clipboard (formats: {:?})", mime_types);
+                    }
+                } else {
+                    tracing::debug!("No selection offer available");
+                }
+            }
         }
     }
 
@@ -3131,6 +3181,8 @@ mod stub {
             new_width: u32,
             new_height: u32,
         },
+        /// Story 5.3: Local clipboard changed (stub).
+        LocalClipboardChanged { text: String },
     }
 
     /// Keyboard shortcuts that the window can detect.
