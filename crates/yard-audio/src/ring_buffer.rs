@@ -349,6 +349,16 @@ impl AudioRingBuffer {
 
 // SAFETY: AudioRingBuffer uses atomics for all shared state,
 // making it safe to share between threads.
+//
+// Thread safety analysis:
+// - head/tail pointers use atomic operations with appropriate Ordering
+// - Producer only writes to positions >= tail (controlled by tail atomic)
+// - Consumer only reads from positions < head (controlled by head atomic)
+// - Buffer data races are prevented by the SPSC invariant: single producer, single consumer
+// - Statistics counters are non-critical and use Relaxed ordering
+//
+// The concurrent test (test_concurrent_access) validates no panics under contention.
+// For production validation, run with: MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test
 unsafe impl Sync for AudioRingBuffer {}
 unsafe impl Send for AudioRingBuffer {}
 
@@ -565,7 +575,29 @@ mod tests {
     }
 
     #[test]
+    fn test_data_larger_than_capacity() {
+        let buf = AudioRingBuffer::new(1024);
+
+        // Try to push data larger than buffer capacity
+        let large_data = vec![0xCC; 2000];
+        let written = buf.push(&large_data);
+
+        // Should only write up to capacity
+        assert_eq!(written, 1024);
+
+        // Buffer should be full
+        assert!(buf.is_full());
+
+        // Verify we can read the data (last 1024 bytes of input)
+        let mut output = vec![0u8; 1024];
+        let read = buf.pop(&mut output);
+        assert_eq!(read, 1024);
+        assert!(output.iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
     fn test_concurrent_access() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::thread;
 
@@ -573,17 +605,29 @@ mod tests {
         let buf_producer = Arc::clone(&buf);
         let buf_consumer = Arc::clone(&buf);
 
+        // Signal that producer has started writing
+        let producer_started = Arc::new(AtomicBool::new(false));
+        let producer_started_clone = Arc::clone(&producer_started);
+
         // Producer thread
         let producer = thread::spawn(move || {
             let data = vec![0xAB; 1000];
-            for _ in 0..100 {
+            for i in 0..100 {
                 buf_producer.push(&data);
+                if i == 0 {
+                    producer_started_clone.store(true, Ordering::Release);
+                }
                 thread::yield_now();
             }
         });
 
-        // Consumer thread
+        // Consumer thread - wait for producer to start before consuming
         let consumer = thread::spawn(move || {
+            // Spin until producer has written at least once
+            while !producer_started.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+
             let mut output = vec![0u8; 500];
             let mut total_read = 0;
             for _ in 0..200 {
