@@ -11,6 +11,7 @@
 //! Protocol: MS-RDPECLIP (Remote Desktop Protocol: Clipboard Virtual Channel Extension)
 
 use std::any::Any;
+use std::sync::mpsc::Sender;
 
 use ironrdp::core::AsAny;
 use ironrdp::pdu::gcc::ChannelName;
@@ -20,10 +21,40 @@ use tracing::{debug, trace, warn};
 
 pub mod pdu;
 
-use pdu::{ClipCapsPdu, ClipboardFormat, CliprdrPdu, FormatListPdu, FormatListResponsePdu};
+use pdu::{
+    ClipCapsPdu, ClipboardFormat, CliprdrPdu, FormatDataRequestPdu, FormatDataResponsePdu,
+    FormatListPdu, FormatListResponsePdu, StandardFormat,
+};
 
 /// Channel name for CLIPRDR Static Virtual Channel.
 pub const CLIPRDR_CHANNEL_NAME: &str = "cliprdr";
+
+/// Events emitted by the CLIPRDR handler for clipboard synchronization.
+///
+/// These events are sent to the main thread when clipboard state changes
+/// on the remote server.
+#[derive(Debug, Clone)]
+pub enum ClipboardEvent {
+    /// Server clipboard content changed (Format List received).
+    ///
+    /// The formats list contains the IDs of available clipboard formats.
+    /// Use `StandardFormat` to check for text formats.
+    FormatsAvailable {
+        /// Available clipboard format IDs.
+        formats: Vec<u32>,
+        /// True if text data is available (CF_UNICODETEXT or CF_TEXT).
+        has_text: bool,
+    },
+    /// Clipboard text data received from server.
+    ///
+    /// Response to a format data request.
+    TextReceived {
+        /// The clipboard text content (UTF-8).
+        text: String,
+    },
+    /// Format data request failed.
+    RequestFailed,
+}
 
 /// CLIPRDR protocol state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +71,6 @@ enum CliprdrState {
 ///
 /// Implements MS-RDPECLIP protocol for clipboard redirection.
 /// This handler manages the clipboard channel state and format negotiation.
-#[derive(Debug)]
 pub struct YardCliprdrHandler {
     /// Current protocol state.
     state: CliprdrState,
@@ -52,10 +82,19 @@ pub struct YardCliprdrHandler {
     server_formats: Vec<ClipboardFormat>,
     /// Whether clipboard functionality is enabled.
     enabled: bool,
+    /// Pending format data request (format ID we're waiting for).
+    pending_format_request: Option<u32>,
+    /// Received clipboard data (text), waiting to be consumed.
+    pending_clipboard_data: Option<String>,
+    /// Optional channel for sending clipboard events to the main thread.
+    event_tx: Option<Sender<ClipboardEvent>>,
 }
 
 impl YardCliprdrHandler {
-    /// Creates a new CLIPRDR handler.
+    /// Creates a new CLIPRDR handler without event channel.
+    ///
+    /// This handler will not send clipboard events to the main thread.
+    /// Use `with_event_channel` for clipboard synchronization.
     pub fn new() -> Self {
         Self {
             state: CliprdrState::Initial,
@@ -63,6 +102,26 @@ impl YardCliprdrHandler {
             use_long_format_names: true, // Default to long format names
             server_formats: Vec::new(),
             enabled: true,
+            pending_format_request: None,
+            pending_clipboard_data: None,
+            event_tx: None,
+        }
+    }
+
+    /// Creates a new CLIPRDR handler with an event channel.
+    ///
+    /// Clipboard events (format list updates, data received) will be sent
+    /// through the provided channel for integration with the main thread.
+    pub fn with_event_channel(event_tx: Sender<ClipboardEvent>) -> Self {
+        Self {
+            state: CliprdrState::Initial,
+            channel_id: None,
+            use_long_format_names: true,
+            server_formats: Vec::new(),
+            enabled: true,
+            pending_format_request: None,
+            pending_clipboard_data: None,
+            event_tx: Some(event_tx),
         }
     }
 
@@ -74,6 +133,18 @@ impl YardCliprdrHandler {
             use_long_format_names: false,
             server_formats: Vec::new(),
             enabled: false,
+            pending_format_request: None,
+            pending_clipboard_data: None,
+            event_tx: None,
+        }
+    }
+
+    /// Sends a clipboard event to the main thread if a channel is configured.
+    fn send_event(&self, event: ClipboardEvent) {
+        if let Some(ref tx) = self.event_tx
+            && let Err(e) = tx.send(event)
+        {
+            warn!("Failed to send clipboard event: {e}");
         }
     }
 
@@ -153,15 +224,50 @@ impl YardCliprdrHandler {
             }
         }
 
-        // Always respond with success
+        // Check if text formats are available
+        let has_unicode = self
+            .server_formats
+            .iter()
+            .any(|f| f.id == StandardFormat::UnicodeText as u32);
+        let has_ansi = self
+            .server_formats
+            .iter()
+            .any(|f| f.id == StandardFormat::Text as u32);
+        let has_text = has_unicode || has_ansi;
+
+        // Notify main thread of available formats
+        let formats: Vec<u32> = self.server_formats.iter().map(|f| f.id).collect();
+        self.send_event(ClipboardEvent::FormatsAvailable {
+            formats,
+            has_text,
+        });
+
+        // Build response messages
+        let mut messages = Vec::new();
+
+        // Always respond with Format List Response (success)
         let response = FormatListResponsePdu::ok();
         let response_data = response.encode();
-
         debug!("Sending Format List Response (OK)");
+        messages.push(SvcMessage::from(CliprdrSvcMessage::new(response_data)));
 
-        Ok(vec![SvcMessage::from(CliprdrSvcMessage::new(
-            response_data,
-        ))])
+        // Automatically request text data if available (Story 5.2)
+        // This is the "pull" model where we fetch text immediately when announced
+        if has_text && self.event_tx.is_some() {
+            // Prefer Unicode over ANSI
+            let format_id = if has_unicode {
+                StandardFormat::UnicodeText as u32
+            } else {
+                StandardFormat::Text as u32
+            };
+
+            debug!("Auto-requesting clipboard text (format {})", format_id);
+            let request = FormatDataRequestPdu::new(format_id);
+            self.pending_format_request = Some(format_id);
+            messages.push(SvcMessage::from(CliprdrSvcMessage::new(request.encode())));
+        }
+
+        Ok(messages)
     }
 
     /// Handles a Format List Response PDU from the server.
@@ -178,11 +284,160 @@ impl YardCliprdrHandler {
 
         Ok(Vec::new())
     }
+
+    /// Handles a Format Data Request PDU from the server.
+    ///
+    /// The server sends this when it wants to paste data that we announced
+    /// in our Format List. For now, we respond with failure since we don't
+    /// have local clipboard integration yet.
+    fn handle_format_data_request(
+        &mut self,
+        request: &FormatDataRequestPdu,
+        _channel_id: u32,
+    ) -> PduResult<Vec<SvcMessage>> {
+        debug!(
+            "Received Format Data Request for format ID {}",
+            request.requested_format_id
+        );
+
+        // For now, respond with failure since we don't have local clipboard data
+        // This will be implemented when we add local → remote clipboard sync
+        let response = FormatDataResponsePdu::fail();
+        let response_data = response.encode();
+
+        debug!("Sending Format Data Response (FAIL - not implemented)");
+
+        Ok(vec![SvcMessage::from(CliprdrSvcMessage::new(
+            response_data,
+        ))])
+    }
+
+    /// Handles a Format Data Response PDU from the server.
+    ///
+    /// The server sends this in response to our Format Data Request,
+    /// containing the actual clipboard data.
+    fn handle_format_data_response(
+        &mut self,
+        response: &FormatDataResponsePdu,
+        _channel_id: u32,
+    ) -> PduResult<Vec<SvcMessage>> {
+        if response.success {
+            debug!(
+                "Received Format Data Response with {} bytes",
+                response.data.len()
+            );
+
+            // Try to convert to text if possible
+            if let Some(text) = response.as_utf8_from_unicode() {
+                debug!("Clipboard text (Unicode): {} chars", text.len());
+                // Store the received data for the clipboard bridge
+                self.pending_clipboard_data = Some(text.clone());
+                // Notify main thread
+                self.send_event(ClipboardEvent::TextReceived { text });
+            } else if let Some(text) = response.as_utf8_from_ansi() {
+                debug!("Clipboard text (ANSI): {} chars", text.len());
+                self.pending_clipboard_data = Some(text.clone());
+                // Notify main thread
+                self.send_event(ClipboardEvent::TextReceived { text });
+            } else {
+                debug!("Clipboard data is not text or failed to decode");
+                self.send_event(ClipboardEvent::RequestFailed);
+            }
+        } else {
+            warn!("Format Data Request failed");
+            self.send_event(ClipboardEvent::RequestFailed);
+        }
+
+        // Clear the pending request
+        self.pending_format_request = None;
+
+        Ok(Vec::new())
+    }
+
+    /// Requests clipboard data in the specified format.
+    ///
+    /// Sends a Format Data Request PDU to the server. The response will be
+    /// received asynchronously via `handle_format_data_response`.
+    pub fn request_format_data(&mut self, format_id: u32) -> Option<Vec<u8>> {
+        if self.state != CliprdrState::Ready {
+            warn!("Cannot request format data: clipboard not ready");
+            return None;
+        }
+
+        // Check if the format is available
+        if !self.server_formats.iter().any(|f| f.id == format_id) {
+            warn!("Requested format {} not available on server", format_id);
+            return None;
+        }
+
+        debug!("Requesting clipboard format {}", format_id);
+
+        let request = FormatDataRequestPdu::new(format_id);
+        self.pending_format_request = Some(format_id);
+
+        Some(request.encode())
+    }
+
+    /// Requests text clipboard data, preferring Unicode format.
+    ///
+    /// Returns the encoded PDU to send, or None if not available.
+    pub fn request_text_data(&mut self) -> Option<Vec<u8>> {
+        // Prefer Unicode text
+        if self
+            .server_formats
+            .iter()
+            .any(|f| f.id == StandardFormat::UnicodeText as u32)
+        {
+            return self.request_format_data(StandardFormat::UnicodeText as u32);
+        }
+
+        // Fall back to ANSI text
+        if self
+            .server_formats
+            .iter()
+            .any(|f| f.id == StandardFormat::Text as u32)
+        {
+            return self.request_format_data(StandardFormat::Text as u32);
+        }
+
+        warn!("No text format available on server clipboard");
+        None
+    }
+
+    /// Returns the pending clipboard data, if any.
+    ///
+    /// This is set when we receive a successful Format Data Response.
+    pub fn take_clipboard_data(&mut self) -> Option<String> {
+        self.pending_clipboard_data.take()
+    }
+
+    /// Returns true if there's a pending format data request.
+    pub fn has_pending_request(&self) -> bool {
+        self.pending_format_request.is_some()
+    }
 }
 
 impl Default for YardCliprdrHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for YardCliprdrHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YardCliprdrHandler")
+            .field("state", &self.state)
+            .field("channel_id", &self.channel_id)
+            .field("use_long_format_names", &self.use_long_format_names)
+            .field("server_formats", &self.server_formats)
+            .field("enabled", &self.enabled)
+            .field("pending_format_request", &self.pending_format_request)
+            .field(
+                "pending_clipboard_data",
+                &self.pending_clipboard_data.as_ref().map(|s| s.len()),
+            )
+            .field("event_tx", &self.event_tx.is_some())
+            .finish()
     }
 }
 
@@ -224,6 +479,12 @@ impl SvcProcessor for YardCliprdrHandler {
             }
             CliprdrPdu::FormatListResponse(response) => {
                 self.handle_format_list_response(&response, channel_id)
+            }
+            CliprdrPdu::FormatDataRequest(request) => {
+                self.handle_format_data_request(&request, channel_id)
+            }
+            CliprdrPdu::FormatDataResponse(response) => {
+                self.handle_format_data_response(&response, channel_id)
             }
         }
     }
@@ -275,18 +536,23 @@ impl SvcEncode for CliprdrSvcMessage {}
 ///
 /// # Arguments
 ///
-/// * `enabled` - Whether clipboard functionality should be enabled.
+/// * `event_tx` - Optional channel for clipboard events. If provided, clipboard
+///   events (format list updates, data received) will be sent through this channel.
+///   If `None`, clipboard is disabled.
 ///
 /// # Returns
 ///
 /// A `YardCliprdrHandler` instance ready to be attached to the RDP connector.
-pub fn create_cliprdr_client(enabled: bool) -> YardCliprdrHandler {
-    if enabled {
-        debug!("Creating CLIPRDR client for clipboard redirection");
-        YardCliprdrHandler::new()
-    } else {
-        debug!("Creating disabled CLIPRDR client (clipboard disabled)");
-        YardCliprdrHandler::disabled()
+pub fn create_cliprdr_client(event_tx: Option<Sender<ClipboardEvent>>) -> YardCliprdrHandler {
+    match event_tx {
+        Some(tx) => {
+            debug!("Creating CLIPRDR client with event channel");
+            YardCliprdrHandler::with_event_channel(tx)
+        }
+        None => {
+            debug!("Creating disabled CLIPRDR client (clipboard disabled)");
+            YardCliprdrHandler::disabled()
+        }
     }
 }
 
@@ -400,14 +666,15 @@ mod tests {
     }
 
     #[test]
-    fn test_create_cliprdr_client_enabled() {
-        let handler = create_cliprdr_client(true);
+    fn test_create_cliprdr_client_with_channel() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let handler = create_cliprdr_client(Some(tx));
         assert!(handler.is_enabled());
     }
 
     #[test]
     fn test_create_cliprdr_client_disabled() {
-        let handler = create_cliprdr_client(false);
+        let handler = create_cliprdr_client(None);
         assert!(!handler.is_enabled());
     }
 

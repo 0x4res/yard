@@ -420,6 +420,11 @@ pub enum ToNetwork {
         /// The new monitor layout to report to the server.
         monitors: Vec<RdpMonitorLayout>,
     },
+    /// Story 5.2: Request clipboard text data from the remote server.
+    ///
+    /// Sent when the local Wayland compositor requests clipboard data
+    /// (e.g., user pastes in a local application).
+    RequestClipboardText,
 }
 
 /// Monitor layout information for RDP DISPLAYCONTROL channel (Story 3.6).
@@ -489,6 +494,22 @@ pub enum FromNetwork {
     /// Server does not support multi-monitor (Story 3.2).
     /// The client should fall back to single-monitor mode.
     MultiMonitorNotSupported,
+    /// Story 5.2: Server clipboard updated with text.
+    ///
+    /// The server has new text content available on its clipboard.
+    /// The main thread should update the Wayland clipboard.
+    ClipboardTextAvailable {
+        /// Available clipboard formats (format IDs).
+        /// Use StandardFormat enum values to check for text formats.
+        formats: Vec<u32>,
+    },
+    /// Story 5.2: Clipboard text data received from server.
+    ///
+    /// Response to a RequestClipboardText message.
+    ClipboardText {
+        /// The clipboard text content (UTF-8).
+        text: String,
+    },
 }
 
 /// Error types for connection failures.
@@ -1121,5 +1142,44 @@ mod tests {
         // Secondary can be anywhere
         let secondary = RdpMonitorInfo::new(1920, -500, 2560, 1440, false);
         assert!(secondary.is_position_valid());
+    }
+
+    // Story 5.2: Clipboard message tests
+
+    #[test]
+    fn test_to_network_request_clipboard_text() {
+        let msg = ToNetwork::RequestClipboardText;
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("RequestClipboardText"));
+    }
+
+    #[test]
+    fn test_from_network_clipboard_text_available() {
+        let msg = FromNetwork::ClipboardTextAvailable {
+            formats: vec![13, 1], // CF_UNICODETEXT = 13, CF_TEXT = 1
+        };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("ClipboardTextAvailable"));
+        assert!(debug.contains("13"));
+    }
+
+    #[test]
+    fn test_from_network_clipboard_text() {
+        let msg = FromNetwork::ClipboardText {
+            text: "Hello, World!".to_string(),
+        };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("ClipboardText"));
+        assert!(debug.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn test_from_network_clipboard_text_unicode() {
+        let msg = FromNetwork::ClipboardText {
+            text: "Привет мир! 🎉".to_string(),
+        };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("ClipboardText"));
+        assert!(debug.contains("Привет"));
     }
 }

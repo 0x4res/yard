@@ -485,6 +485,10 @@ fn run_event_loop(
                 // Server doesn't support multi-monitor, continue with single monitor
                 warn!("Server does not support multi-monitor mode");
             }
+            Some(FromNetwork::ClipboardTextAvailable { .. })
+            | Some(FromNetwork::ClipboardText { .. }) => {
+                // Story 5.2: Clipboard events during setup phase - ignore
+            }
             None => {
                 error!("Network thread terminated unexpectedly");
                 return Ok(exit_codes::CONNECTION_ERROR);
@@ -635,6 +639,15 @@ fn run_event_loop(
                 }
                 Ok(FromNetwork::MultiMonitorNotSupported) => {
                     // Already warned during connection
+                }
+                Ok(FromNetwork::ClipboardTextAvailable { formats }) => {
+                    // Story 5.2: Server has text on clipboard
+                    debug!("Clipboard text available ({} formats)", formats.len());
+                }
+                Ok(FromNetwork::ClipboardText { text }) => {
+                    // Story 5.2: Clipboard text received from server
+                    debug!("Clipboard text received: {} chars", text.len());
+                    window.set_clipboard_text(text);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -1019,6 +1032,15 @@ fn run_event_loop(
             Some(FromNetwork::MultiMonitorNotSupported) => {
                 // Server doesn't support multi-monitor, continue with single monitor
                 warn!("Server does not support multi-monitor mode");
+            }
+            Some(FromNetwork::ClipboardTextAvailable { formats }) => {
+                // Story 5.2: Server has text on clipboard
+                debug!("Clipboard text available ({} formats)", formats.len());
+            }
+            Some(FromNetwork::ClipboardText { text }) => {
+                // Story 5.2: Clipboard text received from server
+                debug!("Clipboard text received: {} chars", text.len());
+                // On non-Linux, we just log it (no Wayland clipboard)
             }
             None => {
                 error!("Network thread terminated unexpectedly");

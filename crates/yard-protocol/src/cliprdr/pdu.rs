@@ -548,6 +548,177 @@ impl FormatListResponsePdu {
     }
 }
 
+/// Format Data Request PDU (CB_FORMAT_DATA_REQUEST) - section 2.2.5.1.
+///
+/// Client sends this to request clipboard data in a specific format.
+///
+/// Structure:
+/// - Header (8 bytes): msgType=0x0004, msgFlags=0, dataLen=4
+/// - requestedFormatId (4 bytes): The clipboard format ID to request
+#[derive(Debug, Clone, Copy)]
+pub struct FormatDataRequestPdu {
+    /// The format ID being requested (from Format List PDU).
+    pub requested_format_id: u32,
+}
+
+impl FormatDataRequestPdu {
+    /// Creates a new Format Data Request PDU.
+    pub fn new(format_id: u32) -> Self {
+        Self {
+            requested_format_id: format_id,
+        }
+    }
+
+    /// Creates a request for CF_UNICODETEXT.
+    pub fn unicode_text() -> Self {
+        Self::new(StandardFormat::UnicodeText as u32)
+    }
+
+    /// Creates a request for CF_TEXT.
+    pub fn text() -> Self {
+        Self::new(StandardFormat::Text as u32)
+    }
+
+    /// Decodes a Format Data Request PDU from payload (after header).
+    pub fn decode(payload: &[u8]) -> Result<Self, CliprdrError> {
+        if payload.len() < 4 {
+            return Err(CliprdrError::PayloadTooShort {
+                context: "FormatDataRequestPdu",
+                expected: 4,
+                actual: payload.len(),
+            });
+        }
+
+        let requested_format_id =
+            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+
+        Ok(Self {
+            requested_format_id,
+        })
+    }
+
+    /// Encodes the Format Data Request PDU payload.
+    pub fn encode_payload(&self) -> Vec<u8> {
+        self.requested_format_id.to_le_bytes().to_vec()
+    }
+
+    /// Encodes the full PDU with header.
+    pub fn encode(&self) -> Vec<u8> {
+        let payload = self.encode_payload();
+        encode_pdu(
+            MessageType::FormatDataRequest,
+            MessageFlags::empty(),
+            &payload,
+        )
+    }
+}
+
+/// Format Data Response PDU (CB_FORMAT_DATA_RESPONSE) - section 2.2.5.2.
+///
+/// Server sends this in response to a Format Data Request, containing the
+/// actual clipboard data.
+///
+/// Structure:
+/// - Header (8 bytes): msgType=0x0005, msgFlags, dataLen
+/// - requestedFormatData (variable): The clipboard data bytes
+#[derive(Debug, Clone)]
+pub struct FormatDataResponsePdu {
+    /// Whether the request was successful.
+    pub success: bool,
+    /// The clipboard data (empty if failed).
+    pub data: Vec<u8>,
+}
+
+impl FormatDataResponsePdu {
+    /// Creates a successful response with data.
+    pub fn ok(data: Vec<u8>) -> Self {
+        Self {
+            success: true,
+            data,
+        }
+    }
+
+    /// Creates a failed response.
+    pub fn fail() -> Self {
+        Self {
+            success: false,
+            data: Vec::new(),
+        }
+    }
+
+    /// Decodes a Format Data Response PDU from payload and flags.
+    pub fn decode(payload: &[u8], flags: MessageFlags) -> Result<Self, CliprdrError> {
+        let success = flags.is_ok();
+        let data = if success {
+            payload.to_vec()
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self { success, data })
+    }
+
+    /// Returns the data as UTF-8 string, assuming CF_UNICODETEXT format.
+    ///
+    /// CF_UNICODETEXT is UTF-16LE encoded, so this converts to UTF-8.
+    pub fn as_utf8_from_unicode(&self) -> Option<String> {
+        if !self.success || self.data.is_empty() {
+            return None;
+        }
+
+        // CF_UNICODETEXT is UTF-16LE with optional BOM
+        let mut data = &self.data[..];
+
+        // Skip BOM if present (0xFF 0xFE for little-endian)
+        if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xFE {
+            data = &data[2..];
+        }
+
+        // Convert UTF-16LE to UTF-8
+        // Data should be pairs of bytes (even length)
+        if !data.len().is_multiple_of(2) {
+            return None;
+        }
+
+        let utf16_units: Vec<u16> = data
+            .chunks(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .take_while(|&c| c != 0) // Stop at null terminator
+            .collect();
+
+        String::from_utf16(&utf16_units).ok()
+    }
+
+    /// Returns the data as UTF-8 string, assuming CF_TEXT format.
+    ///
+    /// CF_TEXT is ANSI/ASCII encoded.
+    pub fn as_utf8_from_ansi(&self) -> Option<String> {
+        if !self.success || self.data.is_empty() {
+            return None;
+        }
+
+        // Find null terminator
+        let end = self
+            .data
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.data.len());
+
+        // CF_TEXT is typically Windows-1252 or similar, but we'll treat as UTF-8/ASCII
+        String::from_utf8(self.data[..end].to_vec()).ok()
+    }
+
+    /// Encodes the full PDU with header.
+    pub fn encode(&self) -> Vec<u8> {
+        let flags = if self.success {
+            MessageFlags::RESPONSE_OK
+        } else {
+            MessageFlags::RESPONSE_FAIL
+        };
+        encode_pdu(MessageType::FormatDataResponse, flags, &self.data)
+    }
+}
+
 /// Parsed CLIPRDR PDU.
 #[derive(Debug, Clone)]
 pub enum CliprdrPdu {
@@ -559,6 +730,10 @@ pub enum CliprdrPdu {
     FormatList(FormatListPdu),
     /// Format List Response PDU.
     FormatListResponse(FormatListResponsePdu),
+    /// Format Data Request PDU.
+    FormatDataRequest(FormatDataRequestPdu),
+    /// Format Data Response PDU.
+    FormatDataResponse(FormatDataResponsePdu),
 }
 
 impl CliprdrPdu {
@@ -598,8 +773,14 @@ impl CliprdrPdu {
             MessageType::FormatListResponse => Ok(Self::FormatListResponse(
                 FormatListResponsePdu::from_flags(msg_flags),
             )),
+            MessageType::FormatDataRequest => Ok(Self::FormatDataRequest(
+                FormatDataRequestPdu::decode(payload)?,
+            )),
+            MessageType::FormatDataResponse => Ok(Self::FormatDataResponse(
+                FormatDataResponsePdu::decode(payload, msg_flags)?,
+            )),
             _ => {
-                // Other message types not yet implemented (Story 5.2+)
+                // Other message types not yet implemented (File transfers in Story 5.4+)
                 Err(CliprdrError::InvalidMessageType(msg_type as u16))
             }
         }
@@ -815,5 +996,154 @@ mod tests {
         let data = [0x01, 0x00]; // Too short for header
         let result = CliprdrPdu::decode(&data, true);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_data_request_unicode() {
+        let request = FormatDataRequestPdu::unicode_text();
+        assert_eq!(
+            request.requested_format_id,
+            StandardFormat::UnicodeText as u32
+        );
+
+        let encoded = request.encode();
+
+        // Header check
+        assert_eq!(
+            u16::from_le_bytes([encoded[0], encoded[1]]),
+            MessageType::FormatDataRequest as u16
+        );
+        // dataLen should be 4
+        assert_eq!(
+            u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]),
+            4
+        );
+
+        // Decode
+        let decoded = CliprdrPdu::decode(&encoded, true).unwrap();
+        if let CliprdrPdu::FormatDataRequest(req) = decoded {
+            assert_eq!(req.requested_format_id, StandardFormat::UnicodeText as u32);
+        } else {
+            panic!("Expected FormatDataRequest PDU");
+        }
+    }
+
+    #[test]
+    fn test_format_data_request_text() {
+        let request = FormatDataRequestPdu::text();
+        assert_eq!(request.requested_format_id, StandardFormat::Text as u32);
+    }
+
+    #[test]
+    fn test_format_data_request_custom() {
+        let request = FormatDataRequestPdu::new(0xC001);
+        assert_eq!(request.requested_format_id, 0xC001);
+    }
+
+    #[test]
+    fn test_format_data_response_ok() {
+        let data = vec![0x48, 0x00, 0x69, 0x00, 0x00, 0x00]; // "Hi" in UTF-16LE + null
+        let response = FormatDataResponsePdu::ok(data.clone());
+        assert!(response.success);
+        assert_eq!(response.data, data);
+
+        let encoded = response.encode();
+
+        // Header check
+        assert_eq!(
+            u16::from_le_bytes([encoded[0], encoded[1]]),
+            MessageType::FormatDataResponse as u16
+        );
+        // Flags should have RESPONSE_OK
+        let flags = MessageFlags::from_bits(u16::from_le_bytes([encoded[2], encoded[3]]));
+        assert!(flags.is_ok());
+
+        // Decode
+        let decoded = CliprdrPdu::decode(&encoded, true).unwrap();
+        if let CliprdrPdu::FormatDataResponse(resp) = decoded {
+            assert!(resp.success);
+            assert_eq!(resp.data, data);
+        } else {
+            panic!("Expected FormatDataResponse PDU");
+        }
+    }
+
+    #[test]
+    fn test_format_data_response_fail() {
+        let response = FormatDataResponsePdu::fail();
+        assert!(!response.success);
+        assert!(response.data.is_empty());
+
+        let encoded = response.encode();
+
+        let flags = MessageFlags::from_bits(u16::from_le_bytes([encoded[2], encoded[3]]));
+        assert!(flags.is_fail());
+
+        let decoded = CliprdrPdu::decode(&encoded, true).unwrap();
+        if let CliprdrPdu::FormatDataResponse(resp) = decoded {
+            assert!(!resp.success);
+        } else {
+            panic!("Expected FormatDataResponse PDU");
+        }
+    }
+
+    #[test]
+    fn test_format_data_response_utf16_to_utf8() {
+        // "Hello" in UTF-16LE: H(0x48 0x00) e(0x65 0x00) l(0x6C 0x00) l(0x6C 0x00) o(0x6F 0x00) null(0x00 0x00)
+        let data = vec![
+            0x48, 0x00, 0x65, 0x00, 0x6C, 0x00, 0x6C, 0x00, 0x6F, 0x00, 0x00, 0x00,
+        ];
+        let response = FormatDataResponsePdu::ok(data);
+
+        let text = response.as_utf8_from_unicode().unwrap();
+        assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn test_format_data_response_utf16_with_bom() {
+        // UTF-16LE BOM (0xFF 0xFE) + "Hi" + null
+        let data = vec![
+            0xFF, 0xFE, // BOM
+            0x48, 0x00, // H
+            0x69, 0x00, // i
+            0x00, 0x00, // null
+        ];
+        let response = FormatDataResponsePdu::ok(data);
+
+        let text = response.as_utf8_from_unicode().unwrap();
+        assert_eq!(text, "Hi");
+    }
+
+    #[test]
+    fn test_format_data_response_unicode_special_chars() {
+        // "Héllo" with é (U+00E9) in UTF-16LE
+        let data = vec![
+            0x48, 0x00, // H
+            0xE9, 0x00, // é (U+00E9)
+            0x6C, 0x00, // l
+            0x6C, 0x00, // l
+            0x6F, 0x00, // o
+            0x00, 0x00, // null
+        ];
+        let response = FormatDataResponsePdu::ok(data);
+
+        let text = response.as_utf8_from_unicode().unwrap();
+        assert_eq!(text, "Héllo");
+    }
+
+    #[test]
+    fn test_format_data_response_ansi() {
+        let data = vec![0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x00]; // "Hello" + null
+        let response = FormatDataResponsePdu::ok(data);
+
+        let text = response.as_utf8_from_ansi().unwrap();
+        assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn test_format_data_response_empty_fails() {
+        let response = FormatDataResponsePdu::fail();
+        assert!(response.as_utf8_from_unicode().is_none());
+        assert!(response.as_utf8_from_ansi().is_none());
     }
 }

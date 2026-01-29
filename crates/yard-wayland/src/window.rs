@@ -829,6 +829,10 @@ mod linux {
         /// Region mapper for multi-monitor coordinate translation (Story 3.5).
         /// Used to map frame regions to the correct monitor surfaces.
         region_mapper: RegionMapper,
+        /// Cached clipboard text from remote server (Story 5.2).
+        /// When this is set, the window should offer it to the Wayland compositor
+        /// so local applications can paste it.
+        clipboard_text: Option<String>,
     }
 
     impl WaylandWindow {
@@ -922,6 +926,8 @@ mod linux {
                 xdg_shell,
                 // Story 3.5: Region mapper for multi-monitor coordinate translation
                 region_mapper: RegionMapper::new(&HashMap::new()),
+                // Story 5.2: Clipboard text from remote server
+                clipboard_text: None,
             };
 
             Ok((event_loop, state, event_rx))
@@ -1009,6 +1015,33 @@ mod linux {
         /// Used for targeting fullscreen to a specific monitor.
         pub fn get_output(&self, id: u32) -> Option<&WlOutput> {
             self.outputs.get(&id)
+        }
+
+        /// Sets the clipboard text from the remote server (Story 5.2).
+        ///
+        /// This stores the text so it can be offered to local applications
+        /// when they request paste. Call this when the network thread receives
+        /// clipboard text from the RDP server.
+        ///
+        /// Note: Full Wayland data source integration (offering to compositor)
+        /// is planned for a future enhancement. Currently, this just stores the text.
+        pub fn set_clipboard_text(&mut self, text: String) {
+            tracing::debug!("Clipboard text received from remote: {} chars", text.len());
+            self.clipboard_text = Some(text);
+            // TODO: Create a Wayland data_source and offer to compositor
+            // This will require implementing DataDeviceHandler and DataSourceHandler
+        }
+
+        /// Returns the current clipboard text from the remote server.
+        ///
+        /// Returns None if no clipboard text has been received from the server.
+        pub fn clipboard_text(&self) -> Option<&str> {
+            self.clipboard_text.as_deref()
+        }
+
+        /// Clears the cached clipboard text.
+        pub fn clear_clipboard(&mut self) {
+            self.clipboard_text = None;
         }
 
         /// Returns the primary monitor (the one at position 0,0).
@@ -3073,6 +3106,15 @@ mod stub {
         pub fn all_fullscreen(&self) -> bool {
             false
         }
+
+        // Story 5.2: Clipboard stubs
+        pub fn set_clipboard_text(&mut self, _text: String) {}
+
+        pub fn clipboard_text(&self) -> Option<&str> {
+            None
+        }
+
+        pub fn clear_clipboard(&mut self) {}
     }
 }
 

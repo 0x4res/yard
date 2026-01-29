@@ -32,7 +32,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 use crate::audin::create_audin_client;
-use crate::cliprdr::create_cliprdr_client;
+use crate::cliprdr::{ClipboardEvent, create_cliprdr_client};
 use crate::messages::{
     CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, MouseButton,
     RdpMonitorInfo, ToNetwork,
@@ -137,6 +137,10 @@ async fn network_loop(
                 // Ignore if received outside of session (no connection established)
                 warn!("Received monitor layout update outside of active session");
             }
+            ToNetwork::RequestClipboardText => {
+                // Story 5.2: Clipboard request should be received during active session
+                warn!("Received clipboard request outside of active session");
+            }
         }
     }
 }
@@ -190,15 +194,19 @@ async fn handle_connect(
         debug!("Audio disabled, skipping RDPSND channel");
     }
 
-    // Set up CLIPRDR channel for clipboard synchronization (Story 5.1)
+    // Set up CLIPRDR channel for clipboard synchronization (Story 5.1, 5.2)
     // CLIPRDR is a Static Virtual Channel
-    if config.clipboard_enabled {
-        let cliprdr = create_cliprdr_client(true);
+    // Create channel for clipboard events from CLIPRDR handler
+    let (clipboard_tx, clipboard_rx) = std::sync::mpsc::channel::<ClipboardEvent>();
+    let clipboard_rx = if config.clipboard_enabled {
+        let cliprdr = create_cliprdr_client(Some(clipboard_tx));
         connector.attach_static_channel(cliprdr);
         debug!("CLIPRDR channel configured for clipboard synchronization");
+        Some(clipboard_rx)
     } else {
         debug!("Clipboard disabled, skipping CLIPRDR channel");
-    }
+        None
+    };
 
     // Set up Dynamic Virtual Channels (DVC) via single DrdynvcClient
     // Both DISPLAYCONTROL and AUDIN are DVCs and must be attached to the same DrdynvcClient
@@ -364,6 +372,7 @@ async fn handle_connect(
         &mut image,
         to_network_rx,
         tx,
+        clipboard_rx,
     )
     .await
     {
@@ -383,6 +392,7 @@ async fn session_loop<S>(
     image: &mut ironrdp::session::image::DecodedImage,
     to_network_rx: &mut mpsc::Receiver<ToNetwork>,
     tx: &mpsc::Sender<FromNetwork>,
+    clipboard_rx: Option<std::sync::mpsc::Receiver<ClipboardEvent>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
@@ -459,6 +469,29 @@ where
                         | ActiveStageOutput::PointerPosition { .. }
                         | ActiveStageOutput::PointerBitmap(_) => {
                             // Pointer updates - TODO: implement cursor handling
+                        }
+                    }
+                }
+
+                // Check for clipboard events from CLIPRDR handler (Story 5.2)
+                if let Some(ref rx) = clipboard_rx {
+                    while let Ok(event) = rx.try_recv() {
+                        match event {
+                            ClipboardEvent::FormatsAvailable { formats, has_text } => {
+                                if has_text {
+                                    debug!("Clipboard text available ({} formats)", formats.len());
+                                    let _ = tx
+                                        .send(FromNetwork::ClipboardTextAvailable { formats })
+                                        .await;
+                                }
+                            }
+                            ClipboardEvent::TextReceived { text } => {
+                                debug!("Clipboard text received ({} chars)", text.len());
+                                let _ = tx.send(FromNetwork::ClipboardText { text }).await;
+                            }
+                            ClipboardEvent::RequestFailed => {
+                                debug!("Clipboard request failed");
+                            }
                         }
                     }
                 }
@@ -658,6 +691,14 @@ where
                                 m.id, m.width, m.height, m.x, m.y, m.is_primary
                             );
                         }
+                    }
+                    Some(ToNetwork::RequestClipboardText) => {
+                        // Story 5.2: Request clipboard text from server
+                        // Note: Currently, text is auto-requested when Format List is received.
+                        // This message can be used for lazy/on-demand clipboard loading.
+                        // TODO: Access CLIPRDR handler via active_stage.get_svc_processor_mut()
+                        // and call request_text_data() to get the PDU to send.
+                        debug!("Clipboard text request received - auto-fetch already active");
                     }
                     None => {
                         // Channel closed - main thread disconnected
