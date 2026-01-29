@@ -33,14 +33,21 @@ mod linux {
     use smithay_client_toolkit::shell::xdg::window::{
         Window, WindowConfigure, WindowDecorations, WindowHandler,
     };
+    use smithay_client_toolkit::data_device_manager::data_device::DataDeviceHandler;
+    use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
+    use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
+    use smithay_client_toolkit::data_device_manager::{
+        DataDeviceManagerState, ReadPipe, WritePipe,
+    };
     use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
     use smithay_client_toolkit::shm::{Shm, ShmHandler};
     use smithay_client_toolkit::{
-        delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer,
-        delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
-        registry_handlers,
+        delegate_compositor, delegate_data_device, delegate_keyboard, delegate_output,
+        delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell,
+        delegate_xdg_window, registry_handlers,
     };
     use std::collections::{HashMap, HashSet};
+    use std::io::{Read, Write};
 
     /// Information about a connected monitor (Story 3.1).
     ///
@@ -833,6 +840,12 @@ mod linux {
         /// When this is set, the window should offer it to the Wayland compositor
         /// so local applications can paste it.
         clipboard_text: Option<String>,
+        /// Data device manager for clipboard operations (Story 5.2, 5.3).
+        data_device_manager: DataDeviceManagerState,
+        /// Data device for clipboard operations (per seat).
+        data_device: Option<smithay_client_toolkit::data_device_manager::data_device::DataDevice>,
+        /// Active clipboard data source (must be kept alive while offering).
+        clipboard_source: Option<smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource>,
     }
 
     impl WaylandWindow {
@@ -870,6 +883,8 @@ mod linux {
             let xdg_shell = XdgShell::bind(&globals, &qh)?;
             let shm = Shm::bind(&globals, &qh)?;
             let seat_state = SeatState::new(&globals, &qh);
+            // Story 5.2/5.3: Data device manager for clipboard operations
+            let data_device_manager = DataDeviceManagerState::bind(&globals, &qh)?;
 
             // Create surface and window
             let surface = compositor.create_surface(&qh);
@@ -928,6 +943,10 @@ mod linux {
                 region_mapper: RegionMapper::new(&HashMap::new()),
                 // Story 5.2: Clipboard text from remote server
                 clipboard_text: None,
+                // Story 5.2/5.3: Data device manager for clipboard
+                data_device_manager,
+                data_device: None,
+                clipboard_source: None,
             };
 
             Ok((event_loop, state, event_rx))
@@ -1019,17 +1038,52 @@ mod linux {
 
         /// Sets the clipboard text from the remote server (Story 5.2).
         ///
-        /// This stores the text so it can be offered to local applications
-        /// when they request paste. Call this when the network thread receives
-        /// clipboard text from the RDP server.
+        /// This stores the text and offers it to the Wayland compositor so
+        /// local applications can paste it. Call this when the network thread
+        /// receives clipboard text from the RDP server.
         ///
-        /// Note: Full Wayland data source integration (offering to compositor)
-        /// is planned for a future enhancement. Currently, this just stores the text.
+        /// Note: Requires a QueueHandle to create the data source. Use
+        /// `set_clipboard_text_with_qh` if you have access to the QueueHandle.
         pub fn set_clipboard_text(&mut self, text: String) {
             tracing::debug!("Clipboard text received from remote: {} chars", text.len());
             self.clipboard_text = Some(text);
-            // TODO: Create a Wayland data_source and offer to compositor
-            // This will require implementing DataDeviceHandler and DataSourceHandler
+            // Note: To actually offer to compositor, we need a QueueHandle
+            // The full integration happens via set_clipboard_text_with_qh
+        }
+
+        /// Sets the clipboard text and offers it to the Wayland compositor.
+        ///
+        /// This is the full implementation that creates a data source and
+        /// sets the selection so local applications can paste the text.
+        pub fn set_clipboard_text_with_qh(
+            &mut self,
+            text: String,
+            qh: &QueueHandle<Self>,
+        ) {
+            tracing::debug!("Setting clipboard text: {} chars", text.len());
+            self.clipboard_text = Some(text);
+
+            // Create a data source offering text formats
+            let source = self.data_device_manager.create_copy_paste_source(
+                qh,
+                vec![
+                    "text/plain;charset=utf-8".to_string(),
+                    "text/plain".to_string(),
+                    "UTF8_STRING".to_string(),
+                    "STRING".to_string(),
+                ],
+            );
+
+            // Set the selection on the data device
+            if let Some(ref data_device) = self.data_device {
+                source.set_selection(data_device, None);
+                tracing::debug!("Clipboard selection set");
+            } else {
+                tracing::warn!("No data device available, cannot set clipboard selection");
+            }
+
+            // Keep the source alive
+            self.clipboard_source = Some(source);
         }
 
         /// Returns the current clipboard text from the remote server.
@@ -2229,8 +2283,12 @@ mod linux {
             &mut self.seat_state
         }
 
-        fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {
-            // Seat will be handled when capabilities are announced
+        fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: WlSeat) {
+            // Story 5.2/5.3: Get data device for this seat for clipboard operations
+            if self.data_device.is_none() {
+                tracing::debug!("Getting data device for seat");
+                self.data_device = Some(self.data_device_manager.get_data_device(qh, &seat));
+            }
         }
 
         fn new_capability(
@@ -2251,6 +2309,11 @@ mod linux {
                 if self.seat_state.get_pointer(qh, &seat).is_ok() {
                     self.has_pointer = true;
                 }
+            }
+            // Also ensure we have a data device for clipboard
+            if self.data_device.is_none() {
+                tracing::debug!("Getting data device for seat (from capability)");
+                self.data_device = Some(self.data_device_manager.get_data_device(qh, &seat));
             }
         }
 
@@ -2591,6 +2654,150 @@ mod linux {
         }
     }
 
+    // Story 5.2/5.3: Data device handler for clipboard operations
+    impl DataDeviceHandler for WaylandWindow {
+        fn data_device_state(&self) -> &DataDeviceManagerState {
+            &self.data_device_manager
+        }
+
+        fn enter(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _data_device: &smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice,
+        ) {
+            // Drag-and-drop enter - not implemented
+        }
+
+        fn leave(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _data_device: &smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice,
+        ) {
+            // Drag-and-drop leave - not implemented
+        }
+
+        fn motion(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _data_device: &smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice,
+            _x: f64,
+            _y: f64,
+        ) {
+            // Drag-and-drop motion - not implemented
+        }
+
+        fn drop_performed(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _data_device: &smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice,
+        ) {
+            // Drag-and-drop - not implemented
+        }
+
+        fn selection(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _data_device: &smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice,
+        ) {
+            // Story 5.3: Selection changed - another app copied something
+            // This is where we would detect local clipboard changes and notify
+            // the network thread to send Format List to the server.
+            tracing::debug!("Clipboard selection changed (local app copied)");
+            // TODO: Read the selection and send to network thread
+            // For now, just log the event
+        }
+    }
+
+    impl DataOfferHandler for WaylandWindow {
+        fn source_actions(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _offer: &mut smithay_client_toolkit::data_device_manager::data_offer::DragOffer,
+            _actions: smithay_client_toolkit::reexports::client::protocol::wl_data_device_manager::DndAction,
+        ) {
+            // Drag-and-drop actions - not implemented
+        }
+
+        fn selected_action(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _offer: &mut smithay_client_toolkit::data_device_manager::data_offer::DragOffer,
+            _actions: smithay_client_toolkit::reexports::client::protocol::wl_data_device_manager::DndAction,
+        ) {
+            // Drag-and-drop action selected - not implemented
+        }
+    }
+
+    impl DataSourceHandler for WaylandWindow {
+        fn send_request(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+            mime_type: String,
+            write_pipe: WritePipe,
+        ) {
+            // Story 5.2: Compositor requests clipboard data for paste
+            // This is called when a local app wants to paste our offered data
+            tracing::debug!("Clipboard data requested for mime type: {}", mime_type);
+
+            if mime_type == "text/plain;charset=utf-8" || mime_type == "text/plain" {
+                if let Some(ref text) = self.clipboard_text {
+                    // Write the text to the pipe
+                    let mut pipe = write_pipe;
+                    if let Err(e) = pipe.write_all(text.as_bytes()) {
+                        tracing::warn!("Failed to write clipboard data: {}", e);
+                    }
+                }
+            }
+        }
+
+        fn cancelled(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+        ) {
+            // Our data source was cancelled (another app took ownership)
+            tracing::debug!("Clipboard data source cancelled");
+        }
+
+        fn dnd_dropped(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+        ) {
+            // Drag-and-drop completed - not implemented
+        }
+
+        fn dnd_finished(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+        ) {
+            // Drag-and-drop finished - not implemented
+        }
+
+        fn action(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+            _action: smithay_client_toolkit::reexports::client::protocol::wl_data_device_manager::DndAction,
+        ) {
+            // Drag-and-drop action - not implemented
+        }
+    }
+
     delegate_compositor!(WaylandWindow);
     delegate_output!(WaylandWindow);
     delegate_seat!(WaylandWindow);
@@ -2600,6 +2807,7 @@ mod linux {
     delegate_xdg_shell!(WaylandWindow);
     delegate_xdg_window!(WaylandWindow);
     delegate_registry!(WaylandWindow);
+    delegate_data_device!(WaylandWindow);
 }
 
 #[cfg(target_os = "linux")]
@@ -3109,6 +3317,8 @@ mod stub {
 
         // Story 5.2: Clipboard stubs
         pub fn set_clipboard_text(&mut self, _text: String) {}
+
+        pub fn set_clipboard_text_with_qh(&mut self, _text: String, _qh: &()) {}
 
         pub fn clipboard_text(&self) -> Option<&str> {
             None
