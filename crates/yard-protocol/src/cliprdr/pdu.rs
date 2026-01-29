@@ -1054,6 +1054,48 @@ mod tests {
     }
 
     #[test]
+    fn test_format_data_request_roundtrip() {
+        // Test that encode then decode produces the same result
+        let original = FormatDataRequestPdu::new(0xC123);
+        let encoded = original.encode();
+
+        // Decode the full PDU
+        let decoded = CliprdrPdu::decode(&encoded, true).unwrap();
+        if let CliprdrPdu::FormatDataRequest(req) = decoded {
+            assert_eq!(req.requested_format_id, original.requested_format_id);
+        } else {
+            panic!("Expected FormatDataRequest PDU");
+        }
+    }
+
+    #[test]
+    fn test_format_data_response_roundtrip() {
+        // Test success response round-trip
+        let original_data = vec![0x48, 0x65, 0x6C, 0x6C, 0x6F]; // "Hello"
+        let original = FormatDataResponsePdu::ok(original_data.clone());
+        let encoded = original.encode();
+
+        let decoded = CliprdrPdu::decode(&encoded, true).unwrap();
+        if let CliprdrPdu::FormatDataResponse(resp) = decoded {
+            assert!(resp.success);
+            assert_eq!(resp.data, original_data);
+        } else {
+            panic!("Expected FormatDataResponse PDU");
+        }
+
+        // Test fail response round-trip
+        let fail_response = FormatDataResponsePdu::fail();
+        let encoded_fail = fail_response.encode();
+
+        let decoded_fail = CliprdrPdu::decode(&encoded_fail, true).unwrap();
+        if let CliprdrPdu::FormatDataResponse(resp) = decoded_fail {
+            assert!(!resp.success);
+        } else {
+            panic!("Expected FormatDataResponse PDU");
+        }
+    }
+
+    #[test]
     fn test_format_data_response_ok() {
         let data = vec![0x48, 0x00, 0x69, 0x00, 0x00, 0x00]; // "Hi" in UTF-16LE + null
         let response = FormatDataResponsePdu::ok(data.clone());
@@ -1142,6 +1184,56 @@ mod tests {
 
         let text = response.as_utf8_from_unicode().unwrap();
         assert_eq!(text, "Héllo");
+    }
+
+    #[test]
+    fn test_format_data_response_unicode_cjk() {
+        // "日本語" (Japanese) in UTF-16LE
+        // 日 = U+65E5, 本 = U+672C, 語 = U+8A9E
+        let data = vec![
+            0xE5, 0x65, // 日
+            0x2C, 0x67, // 本
+            0x9E, 0x8A, // 語
+            0x00, 0x00, // null
+        ];
+        let response = FormatDataResponsePdu::ok(data);
+
+        let text = response.as_utf8_from_unicode().unwrap();
+        assert_eq!(text, "日本語");
+    }
+
+    #[test]
+    fn test_format_data_response_unicode_emoji() {
+        // "Hi👋" with waving hand emoji (U+1F44B) - requires surrogate pair in UTF-16
+        // U+1F44B = D83D DC4B in UTF-16 surrogate pair
+        let data = vec![
+            0x48, 0x00, // H
+            0x69, 0x00, // i
+            0x3D, 0xD8, // High surrogate D83D
+            0x4B, 0xDC, // Low surrogate DC4B
+            0x00, 0x00, // null
+        ];
+        let response = FormatDataResponsePdu::ok(data);
+
+        let text = response.as_utf8_from_unicode().unwrap();
+        assert_eq!(text, "Hi👋");
+    }
+
+    #[test]
+    fn test_format_data_response_unicode_rtl() {
+        // "שלום" (Hebrew "Shalom") in UTF-16LE
+        // ש = U+05E9, ל = U+05DC, ו = U+05D5, ם = U+05DD
+        let data = vec![
+            0xE9, 0x05, // ש
+            0xDC, 0x05, // ל
+            0xD5, 0x05, // ו
+            0xDD, 0x05, // ם
+            0x00, 0x00, // null
+        ];
+        let response = FormatDataResponsePdu::ok(data);
+
+        let text = response.as_utf8_from_unicode().unwrap();
+        assert_eq!(text, "שלום");
     }
 
     #[test]

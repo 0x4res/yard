@@ -3367,15 +3367,18 @@ mod stub {
             false
         }
 
-        // Story 5.2: Clipboard stubs
+        /// Sets the clipboard text from the remote server (stub).
         pub fn set_clipboard_text(&mut self, _text: String) {}
 
+        /// Sets the clipboard text with queue handle (stub).
         pub fn set_clipboard_text_with_qh(&mut self, _text: String, _qh: &()) {}
 
+        /// Returns the cached clipboard text (stub, always None).
         pub fn clipboard_text(&self) -> Option<&str> {
             None
         }
 
+        /// Clears the cached clipboard text (stub).
         pub fn clear_clipboard(&mut self) {}
     }
 }

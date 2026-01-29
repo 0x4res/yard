@@ -486,7 +486,8 @@ fn run_event_loop(
                 warn!("Server does not support multi-monitor mode");
             }
             Some(FromNetwork::ClipboardTextAvailable { .. })
-            | Some(FromNetwork::ClipboardText { .. }) => {
+            | Some(FromNetwork::ClipboardText { .. })
+            | Some(FromNetwork::ClipboardRequestFailed) => {
                 // Story 5.2: Clipboard events during setup phase - ignore
             }
             None => {
@@ -648,6 +649,10 @@ fn run_event_loop(
                     // Story 5.2: Clipboard text received from server
                     debug!("Clipboard text received: {} chars", text.len());
                     window.set_clipboard_text(text);
+                }
+                Ok(FromNetwork::ClipboardRequestFailed) => {
+                    // Story 5.2: Clipboard request failed
+                    warn!("Clipboard request failed - server could not provide data");
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -1051,6 +1056,10 @@ fn run_event_loop(
                 // Story 5.2: Clipboard text received from server
                 debug!("Clipboard text received: {} chars", text.len());
                 // On non-Linux, we just log it (no Wayland clipboard)
+            }
+            Some(FromNetwork::ClipboardRequestFailed) => {
+                // Story 5.2: Clipboard request failed
+                warn!("Clipboard request failed - server could not provide data");
             }
             None => {
                 error!("Network thread terminated unexpectedly");

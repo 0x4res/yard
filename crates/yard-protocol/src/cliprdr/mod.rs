@@ -29,6 +29,10 @@ use pdu::{
 /// Channel name for CLIPRDR Static Virtual Channel.
 pub const CLIPRDR_CHANNEL_NAME: &str = "cliprdr";
 
+/// Maximum byte value for ASCII characters (exclusive).
+/// Used when converting UTF-8 to ANSI format (lossy).
+const ASCII_MAX: u8 = 128;
+
 /// Events emitted by the CLIPRDR handler for clipboard synchronization.
 ///
 /// These events are sent to the main thread when clipboard state changes
@@ -315,7 +319,7 @@ impl YardCliprdrHandler {
                 }
                 id if id == StandardFormat::Text as u32 => {
                     // Convert to ANSI (lossy conversion, just use ASCII bytes)
-                    let mut data: Vec<u8> = text.bytes().filter(|&b| b < 128).collect();
+                    let mut data: Vec<u8> = text.bytes().filter(|&b| b < ASCII_MAX).collect();
                     data.push(0); // Null terminator
                     debug!("Sending Format Data Response (ANSI, {} bytes)", data.len());
                     FormatDataResponsePdu::ok(data)

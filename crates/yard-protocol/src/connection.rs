@@ -499,6 +499,7 @@ where
                             }
                             ClipboardEvent::RequestFailed => {
                                 debug!("Clipboard request failed");
+                                let _ = tx.send(FromNetwork::ClipboardRequestFailed).await;
                             }
                         }
                     }

@@ -520,6 +520,10 @@ pub enum FromNetwork {
         /// The clipboard text content (UTF-8).
         text: String,
     },
+    /// Story 5.2: Clipboard data request failed.
+    ///
+    /// The server could not provide the requested clipboard data.
+    ClipboardRequestFailed,
 }
 
 /// Error types for connection failures.
@@ -1191,5 +1195,12 @@ mod tests {
         let debug = format!("{:?}", msg);
         assert!(debug.contains("ClipboardText"));
         assert!(debug.contains("Привет"));
+    }
+
+    #[test]
+    fn test_from_network_clipboard_request_failed() {
+        let msg = FromNetwork::ClipboardRequestFailed;
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("ClipboardRequestFailed"));
     }
 }
