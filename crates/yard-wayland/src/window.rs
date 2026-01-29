@@ -4426,6 +4426,32 @@ mod tests {
     }
 
     #[test]
+    fn test_window_event_local_clipboard_changed() {
+        // Story 5.3: Test local clipboard change event structure
+        let event = WindowEvent::LocalClipboardChanged {
+            text: "Hello, Remote!".to_string(),
+        };
+
+        if let WindowEvent::LocalClipboardChanged { text } = event {
+            assert_eq!(text, "Hello, Remote!");
+        } else {
+            panic!("Expected LocalClipboardChanged event");
+        }
+
+        // Test with Unicode content
+        let unicode_event = WindowEvent::LocalClipboardChanged {
+            text: "日本語テスト 🎉".to_string(),
+        };
+
+        if let WindowEvent::LocalClipboardChanged { text } = unicode_event {
+            assert!(text.contains("日本語"));
+            assert!(text.contains("🎉"));
+        } else {
+            panic!("Expected LocalClipboardChanged event");
+        }
+    }
+
+    #[test]
     fn test_resolution_change_detection() {
         // Story 3.7 Task 1.4: Test that resolution change is correctly detected
         let old_monitor = create_test_monitor(1, "DP-1", 1920, 1080, 0, 0);

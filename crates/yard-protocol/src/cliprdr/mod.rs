@@ -772,4 +772,71 @@ mod tests {
         handler.server_formats = vec![ClipboardFormat::new(13, "")];
         assert_eq!(handler.server_formats().len(), 1);
     }
+
+    #[test]
+    fn test_utf8_to_utf16le_conversion() {
+        // Story 5.3: Test UTF-8 to UTF-16LE conversion for clipboard
+        // "Hello" should convert to UTF-16LE with null terminator
+        let result = YardCliprdrHandler::utf8_to_utf16le_with_null("Hello");
+
+        // Expected: H(0x48 0x00) e(0x65 0x00) l(0x6C 0x00) l(0x6C 0x00) o(0x6F 0x00) null(0x00 0x00)
+        assert_eq!(result.len(), 12); // 5 chars * 2 bytes + 2 bytes null
+        assert_eq!(result[0..2], [0x48, 0x00]); // H
+        assert_eq!(result[10..12], [0x00, 0x00]); // null terminator
+    }
+
+    #[test]
+    fn test_utf8_to_utf16le_unicode() {
+        // Story 5.3: Test Unicode characters including emoji
+        let result = YardCliprdrHandler::utf8_to_utf16le_with_null("日本");
+
+        // 日 = U+65E5 → 0xE5 0x65 in UTF-16LE
+        // 本 = U+672C → 0x2C 0x67 in UTF-16LE
+        assert_eq!(result.len(), 6); // 2 chars * 2 bytes + 2 bytes null
+        assert_eq!(result[0..2], [0xE5, 0x65]); // 日
+        assert_eq!(result[2..4], [0x2C, 0x67]); // 本
+    }
+
+    #[test]
+    fn test_utf8_to_utf16le_emoji() {
+        // Story 5.3: Test emoji (surrogate pair)
+        let result = YardCliprdrHandler::utf8_to_utf16le_with_null("👋");
+
+        // 👋 = U+1F44B → D83D DC4B in UTF-16 surrogate pair
+        assert_eq!(result.len(), 6); // 2 code units * 2 bytes + 2 bytes null
+        assert_eq!(result[0..2], [0x3D, 0xD8]); // High surrogate
+        assert_eq!(result[2..4], [0x4B, 0xDC]); // Low surrogate
+    }
+
+    #[test]
+    fn test_set_local_clipboard_text() {
+        // Story 5.3: Test setting local clipboard text
+        let mut handler = YardCliprdrHandler::new();
+        handler.start().unwrap();
+        handler.state = CliprdrState::Ready;
+
+        // Set local clipboard text
+        let result = handler.set_local_clipboard_text("Test clipboard".to_string());
+
+        // Should return a Format List PDU
+        assert!(result.is_some());
+        let pdu_bytes = result.unwrap();
+
+        // Verify it's a Format List PDU (msgType = 0x0002)
+        assert_eq!(pdu_bytes[0], 0x02);
+        assert_eq!(pdu_bytes[1], 0x00);
+
+        // Verify local clipboard text is stored
+        assert_eq!(handler.local_clipboard_text(), Some("Test clipboard"));
+    }
+
+    #[test]
+    fn test_set_local_clipboard_not_ready() {
+        // Story 5.3: Setting clipboard when not ready should fail
+        let mut handler = YardCliprdrHandler::new();
+        // Don't call start() or set state to Ready
+
+        let result = handler.set_local_clipboard_text("Test".to_string());
+        assert!(result.is_none());
+    }
 }
