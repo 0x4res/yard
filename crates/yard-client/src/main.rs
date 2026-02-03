@@ -592,7 +592,12 @@ fn run_event_loop(
     // Story 6.2: Track session state for overlay display
     let session_start = std::time::Instant::now();
     // Extract server name for overlay (strip port if present)
-    let server_name = window_config.title.split('@').nth(1).unwrap_or("Unknown").to_string();
+    let server_name = window_config
+        .title
+        .split('@')
+        .nth(1)
+        .unwrap_or("Unknown")
+        .to_string();
 
     // Set initial overlay content (connected state)
     window.update_overlay_content(OverlayContent {
@@ -707,7 +712,12 @@ fn run_event_loop(
                 Ok(FromNetwork::ClipboardFilesReceived { files }) => {
                     debug!("Clipboard files received: {} files", files.len());
                     for file in &files {
-                        debug!("  - {} ({} bytes, dir={})", file.name, file.size.unwrap_or(0), file.is_directory);
+                        debug!(
+                            "  - {} ({} bytes, dir={})",
+                            file.name,
+                            file.size.unwrap_or(0),
+                            file.is_directory
+                        );
                     }
 
                     // Create file transfer manager and start downloads
@@ -764,11 +774,16 @@ fn run_event_loop(
                                     {
                                         error!("Failed to send file size request");
                                     }
-                                } else if manager.pending_count() == 0 && manager.active_count() == 0 {
+                                } else if manager.pending_count() == 0
+                                    && manager.active_count() == 0
+                                {
                                     // All transfers complete
                                     let completed = manager.completed_files();
                                     if !completed.is_empty() {
-                                        info!("All {} files downloaded, setting clipboard", completed.len());
+                                        info!(
+                                            "All {} files downloaded, setting clipboard",
+                                            completed.len()
+                                        );
                                         window.set_clipboard_files(completed);
                                     }
                                 }
@@ -810,11 +825,16 @@ fn run_event_loop(
                                     {
                                         error!("Failed to send file size request");
                                     }
-                                } else if manager.pending_count() == 0 && manager.active_count() == 0 {
+                                } else if manager.pending_count() == 0
+                                    && manager.active_count() == 0
+                                {
                                     // All transfers complete
                                     let completed = manager.completed_files();
                                     if !completed.is_empty() {
-                                        info!("All {} files downloaded, setting clipboard", completed.len());
+                                        info!(
+                                            "All {} files downloaded, setting clipboard",
+                                            completed.len()
+                                        );
                                         window.set_clipboard_files(completed);
                                     }
                                 }
@@ -1127,7 +1147,10 @@ fn run_event_loop(
                     }
                 }
                 // Story 6.1/6.2: Handle overlay visibility changes
-                WindowEvent::OverlayVisibilityChanged { visible, monitor_id } => {
+                WindowEvent::OverlayVisibilityChanged {
+                    visible,
+                    monitor_id,
+                } => {
                     debug!(
                         "Overlay visibility changed: visible={}, monitor={:?}",
                         visible, monitor_id

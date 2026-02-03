@@ -31,8 +31,10 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
+use ironrdp::svc::SvcProcessorMessages;
+
 use crate::audin::create_audin_client;
-use crate::cliprdr::{ClipboardEvent, create_cliprdr_client};
+use crate::cliprdr::{ClipboardEvent, YardCliprdrHandler, create_cliprdr_client};
 use crate::messages::{
     CertificateInfo, ConnectionConfig, ConnectionError, DesktopSize, FromNetwork, MouseButton,
     RdpMonitorInfo, ToNetwork,
@@ -148,6 +150,14 @@ async fn network_loop(
             ToNetwork::LocalClipboardCleared => {
                 // Story 5.3: Local clipboard cleared should be received during active session
                 warn!("Received local clipboard cleared outside of active session");
+            }
+            ToNetwork::LocalClipboardFiles { .. } => {
+                // Story 5.5: Local clipboard files should be received during active session
+                warn!("Received local clipboard files outside of active session");
+            }
+            ToNetwork::RequestFileSize { .. } | ToNetwork::RequestFileContent { .. } => {
+                // Story 5.4: File requests should be received during active session
+                warn!("Received file request outside of active session");
             }
         }
     }
@@ -485,8 +495,24 @@ where
                 if let Some(ref rx) = clipboard_rx {
                     while let Ok(event) = rx.try_recv() {
                         match event {
-                            ClipboardEvent::FormatsAvailable { formats, has_text } => {
-                                if has_text {
+                            ClipboardEvent::FormatsAvailable {
+                                formats,
+                                has_text,
+                                has_files,
+                            } => {
+                                if has_files {
+                                    debug!(
+                                        "Clipboard files available ({} formats)",
+                                        formats.len()
+                                    );
+                                    let _ = tx
+                                        .send(FromNetwork::ClipboardFilesAvailable {
+                                            formats: formats.clone(),
+                                        })
+                                        .await;
+                                }
+                                if has_text && !has_files {
+                                    // Only notify for text if no files (files take priority)
                                     debug!("Clipboard text available ({} formats)", formats.len());
                                     let _ = tx
                                         .send(FromNetwork::ClipboardTextAvailable { formats })
@@ -500,6 +526,34 @@ where
                             ClipboardEvent::RequestFailed => {
                                 debug!("Clipboard request failed");
                                 let _ = tx.send(FromNetwork::ClipboardRequestFailed).await;
+                            }
+                            ClipboardEvent::FilesReceived { files } => {
+                                debug!("Clipboard files received ({} files)", files.len());
+                                let _ = tx
+                                    .send(FromNetwork::ClipboardFilesReceived { files })
+                                    .await;
+                            }
+                            ClipboardEvent::FileSizeReceived { stream_id, size } => {
+                                debug!("File size received: stream_id={}, size={}", stream_id, size);
+                                let _ = tx
+                                    .send(FromNetwork::ClipboardFileSizeReceived { stream_id, size })
+                                    .await;
+                            }
+                            ClipboardEvent::FileContentReceived { stream_id, data } => {
+                                debug!(
+                                    "File content received: stream_id={}, {} bytes",
+                                    stream_id,
+                                    data.len()
+                                );
+                                let _ = tx
+                                    .send(FromNetwork::ClipboardFileContentReceived { stream_id, data })
+                                    .await;
+                            }
+                            ClipboardEvent::FileTransferFailed { stream_id } => {
+                                debug!("File transfer failed: stream_id={}", stream_id);
+                                let _ = tx
+                                    .send(FromNetwork::ClipboardFileTransferFailed { stream_id })
+                                    .await;
                             }
                         }
                     }
@@ -705,20 +759,131 @@ where
                         // Story 5.2: Request clipboard text from server
                         // Note: Currently, text is auto-requested when Format List is received.
                         // This message can be used for lazy/on-demand clipboard loading.
-                        // TODO: Access CLIPRDR handler via active_stage.get_svc_processor_mut()
-                        // and call request_text_data() to get the PDU to send.
                         debug!("Clipboard text request received - auto-fetch already active");
                     }
                     Some(ToNetwork::LocalClipboardText { text }) => {
-                        // Story 5.3: Local clipboard changed with text
-                        // TODO: Access CLIPRDR handler and call set_local_clipboard_text()
-                        // to get Format List PDU to send to server
-                        debug!("Local clipboard changed: {} chars", text.len());
-                        // For now, log the event - full integration requires SVC handler access
+                        // Story 5.3/5.6: Local clipboard changed with text
+                        // Access CLIPRDR handler and send Format List PDU to server
+                        if let Some(cliprdr) = active_stage.get_svc_processor_mut::<YardCliprdrHandler>() {
+                            if let Some(messages) = cliprdr.set_local_clipboard_text(text) {
+                                match active_stage.process_svc_processor_messages(
+                                    SvcProcessorMessages::<YardCliprdrHandler>::new(messages),
+                                ) {
+                                    Ok(encoded) => {
+                                        if let Err(e) = framed.write_all(&encoded).await {
+                                            warn!("Failed to send local clipboard text: {e}");
+                                        } else {
+                                            debug!("Local clipboard text sent to server");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to encode clipboard message: {e}");
+                                    }
+                                }
+                            }
+                        } else {
+                            debug!("CLIPRDR handler not available");
+                        }
                     }
                     Some(ToNetwork::LocalClipboardCleared) => {
-                        // Story 5.3: Local clipboard was cleared
-                        debug!("Local clipboard cleared");
+                        // Story 5.3/5.6: Local clipboard was cleared
+                        if let Some(cliprdr) =
+                            active_stage.get_svc_processor_mut::<YardCliprdrHandler>()
+                            && let Some(messages) = cliprdr.clear_local_clipboard()
+                        {
+                            match active_stage.process_svc_processor_messages(
+                                SvcProcessorMessages::<YardCliprdrHandler>::new(messages),
+                            ) {
+                                Ok(encoded) => {
+                                    if let Err(e) = framed.write_all(&encoded).await {
+                                        warn!("Failed to send clipboard cleared: {e}");
+                                    } else {
+                                        debug!("Local clipboard cleared sent to server");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to encode clipboard clear message: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Some(ToNetwork::LocalClipboardFiles { files }) => {
+                        // Story 5.5/5.6: Local clipboard changed with files
+                        // Access CLIPRDR handler and send Format List PDU to server
+                        if let Some(cliprdr) = active_stage.get_svc_processor_mut::<YardCliprdrHandler>() {
+                            if let Some(messages) = cliprdr.set_local_clipboard_files(files) {
+                                match active_stage.process_svc_processor_messages(
+                                    SvcProcessorMessages::<YardCliprdrHandler>::new(messages),
+                                ) {
+                                    Ok(encoded) => {
+                                        if let Err(e) = framed.write_all(&encoded).await {
+                                            warn!("Failed to send local clipboard files: {e}");
+                                        } else {
+                                            debug!("Local clipboard files sent to server");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to encode clipboard files message: {e}");
+                                    }
+                                }
+                            }
+                        } else {
+                            debug!("CLIPRDR handler not available");
+                        }
+                    }
+                    Some(ToNetwork::RequestFileSize { file_index }) => {
+                        // Story 5.4: Request file size from remote server
+                        if let Some(cliprdr) = active_stage.get_svc_processor_mut::<YardCliprdrHandler>() {
+                            if let Some((_stream_id, pdu_data)) = cliprdr.request_file_size(file_index) {
+                                // Wrap the raw PDU data in SvcMessage for proper encoding
+                                use crate::cliprdr::CliprdrSvcMessage;
+                                use ironrdp::svc::SvcMessage;
+                                let messages = vec![SvcMessage::from(CliprdrSvcMessage::new(pdu_data))];
+                                match active_stage.process_svc_processor_messages(
+                                    SvcProcessorMessages::<YardCliprdrHandler>::new(messages),
+                                ) {
+                                    Ok(encoded) => {
+                                        if let Err(e) = framed.write_all(&encoded).await {
+                                            warn!("Failed to send file size request: {e}");
+                                        } else {
+                                            debug!("File size request sent for file_index={}", file_index);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to encode file size request: {e}");
+                                    }
+                                }
+                            }
+                        } else {
+                            debug!("CLIPRDR handler not available");
+                        }
+                    }
+                    Some(ToNetwork::RequestFileContent { file_index, offset, length }) => {
+                        // Story 5.4: Request file content chunk from remote server
+                        if let Some(cliprdr) = active_stage.get_svc_processor_mut::<YardCliprdrHandler>() {
+                            if let Some((_stream_id, pdu_data)) = cliprdr.request_file_content(file_index, offset, length) {
+                                // Wrap the raw PDU data in SvcMessage for proper encoding
+                                use crate::cliprdr::CliprdrSvcMessage;
+                                use ironrdp::svc::SvcMessage;
+                                let messages = vec![SvcMessage::from(CliprdrSvcMessage::new(pdu_data))];
+                                match active_stage.process_svc_processor_messages(
+                                    SvcProcessorMessages::<YardCliprdrHandler>::new(messages),
+                                ) {
+                                    Ok(encoded) => {
+                                        if let Err(e) = framed.write_all(&encoded).await {
+                                            warn!("Failed to send file content request: {e}");
+                                        } else {
+                                            debug!("File content request sent for file_index={}, offset={}, length={}", file_index, offset, length);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to encode file content request: {e}");
+                                    }
+                                }
+                            }
+                        } else {
+                            debug!("CLIPRDR handler not available");
+                        }
                     }
                     None => {
                         // Channel closed - main thread disconnected

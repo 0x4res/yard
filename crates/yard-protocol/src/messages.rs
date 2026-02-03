@@ -435,6 +435,33 @@ pub enum ToNetwork {
     },
     /// Story 5.3: Local clipboard was cleared or taken by another app.
     LocalClipboardCleared,
+    /// Story 5.5: Local clipboard changed with file content.
+    ///
+    /// Sent when the user copies files in a local file manager.
+    /// The network thread should send Format List PDU to the server announcing
+    /// file formats (FileGroupDescriptorW, FileContents).
+    LocalClipboardFiles {
+        /// The file paths that were copied.
+        files: Vec<std::path::PathBuf>,
+    },
+    /// Story 5.4: Request file size from remote server.
+    ///
+    /// Sent when starting a file transfer to get the actual file size.
+    RequestFileSize {
+        /// Index of the file in the remote file list.
+        file_index: u32,
+    },
+    /// Story 5.4: Request file content chunk from remote server.
+    ///
+    /// Sent to download file data in chunks.
+    RequestFileContent {
+        /// Index of the file in the remote file list.
+        file_index: u32,
+        /// Byte offset to start reading from.
+        offset: u64,
+        /// Number of bytes to request.
+        length: u32,
+    },
 }
 
 /// Monitor layout information for RDP DISPLAYCONTROL channel (Story 3.6).
@@ -524,6 +551,37 @@ pub enum FromNetwork {
     ///
     /// The server could not provide the requested clipboard data.
     ClipboardRequestFailed,
+
+    // Story 5.4: File clipboard messages
+    /// Story 5.4: Files are available on the remote clipboard.
+    ClipboardFilesAvailable {
+        /// Available clipboard format IDs.
+        formats: Vec<u32>,
+    },
+    /// Story 5.4: File list received from server.
+    ClipboardFilesReceived {
+        /// File information.
+        files: Vec<crate::cliprdr::FileInfo>,
+    },
+    /// Story 5.4: File size received.
+    ClipboardFileSizeReceived {
+        /// Stream ID matching the request.
+        stream_id: u32,
+        /// File size in bytes.
+        size: u64,
+    },
+    /// Story 5.4: File content chunk received.
+    ClipboardFileContentReceived {
+        /// Stream ID matching the request.
+        stream_id: u32,
+        /// File data bytes.
+        data: Vec<u8>,
+    },
+    /// Story 5.4: File transfer failed.
+    ClipboardFileTransferFailed {
+        /// Stream ID of the failed request.
+        stream_id: u32,
+    },
 }
 
 /// Error types for connection failures.

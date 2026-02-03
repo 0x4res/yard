@@ -11,6 +11,12 @@ mod linux {
     use calloop::channel::Sender;
     use calloop_wayland_source::WaylandSource;
     use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
+    use smithay_client_toolkit::data_device_manager::data_device::DataDeviceHandler;
+    use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
+    use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
+    use smithay_client_toolkit::data_device_manager::{
+        DataDeviceManagerState, ReadPipe, WritePipe,
+    };
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
     use smithay_client_toolkit::reexports::client::Proxy;
     use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
@@ -29,19 +35,13 @@ mod linux {
     use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
     use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
     use smithay_client_toolkit::shell::WaylandSurface;
-    use smithay_client_toolkit::shell::xdg::XdgShell;
-    use smithay_client_toolkit::shell::xdg::window::{
-        Window, WindowConfigure, WindowDecorations, WindowHandler,
-    };
-    use smithay_client_toolkit::data_device_manager::data_device::DataDeviceHandler;
-    use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
-    use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
-    use smithay_client_toolkit::data_device_manager::{
-        DataDeviceManagerState, ReadPipe, WritePipe,
-    };
     use smithay_client_toolkit::shell::wlr_layer::{
         Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
         LayerSurfaceConfigure,
+    };
+    use smithay_client_toolkit::shell::xdg::XdgShell;
+    use smithay_client_toolkit::shell::xdg::window::{
+        Window, WindowConfigure, WindowDecorations, WindowHandler,
     };
     use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
     use smithay_client_toolkit::shm::{Shm, ShmHandler};
@@ -54,8 +54,8 @@ mod linux {
     use std::io::{Read, Write};
 
     use crate::overlay::{
-        generate_overlay_buffer_with_content, hit_test_disconnect_button, ConnectionStatus,
-        OverlayContent, OverlayController, OverlayState, OVERLAY_BG_COLOR, OVERLAY_HEIGHT,
+        ConnectionStatus, OVERLAY_BG_COLOR, OVERLAY_HEIGHT, OverlayContent, OverlayController,
+        OverlayState, generate_overlay_buffer_with_content, hit_test_disconnect_button,
     };
 
     /// Linux evdev button code for left mouse button (BTN_LEFT = 0x110 = 272).
@@ -868,7 +868,10 @@ mod linux {
         ///
         /// # Story 6.2
         /// Updated to accept `OverlayContent` for displaying connection status.
-        pub fn render(&mut self, content: &OverlayContent) -> Result<(), Box<dyn std::error::Error>> {
+        pub fn render(
+            &mut self,
+            content: &OverlayContent,
+        ) -> Result<(), Box<dyn std::error::Error>> {
             if !self.configured {
                 tracing::trace!("OverlaySurface not yet configured, skipping render");
                 return Ok(());
@@ -900,15 +903,19 @@ mod linux {
             canvas[..overlay_data.len()].copy_from_slice(&overlay_data);
 
             // Attach and commit
-            self.surface
-                .attach(Some(buffer.wl_buffer()), 0, 0);
+            self.surface.attach(Some(buffer.wl_buffer()), 0, 0);
             self.surface
                 .damage_buffer(0, 0, width as i32, height as i32);
             self.surface.commit();
 
             self.buffer = Some(buffer);
 
-            tracing::trace!("Rendered overlay {}x{} with status {:?}", width, height, content.status);
+            tracing::trace!(
+                "Rendered overlay {}x{} with status {:?}",
+                width,
+                height,
+                content.status
+            );
             Ok(())
         }
 
@@ -1076,7 +1083,8 @@ mod linux {
         /// Data device for clipboard operations (per seat).
         data_device: Option<smithay_client_toolkit::data_device_manager::data_device::DataDevice>,
         /// Active clipboard data source (must be kept alive while offering).
-        clipboard_source: Option<smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource>,
+        clipboard_source:
+            Option<smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource>,
         /// Story 6.1: Layer shell protocol binding (optional, wlroots-based compositors only).
         /// None if the compositor doesn't support wlr-layer-shell.
         layer_shell: Option<LayerShell>,
@@ -1350,7 +1358,9 @@ mod linux {
                 return false;
             };
 
-            let changed = self.overlay_controller.check_pointer_position(y, monitor_id);
+            let changed = self
+                .overlay_controller
+                .check_pointer_position(y, monitor_id);
 
             if changed {
                 match self.overlay_controller.state() {
@@ -1439,14 +1449,10 @@ mod linux {
         /// * `y` - Pointer Y position on the new monitor
         /// * `monitor_id` - ID of the monitor the pointer entered
         /// * `qh` - Queue handle for creating Wayland objects
-        pub fn pointer_entered_monitor(
-            &mut self,
-            y: f64,
-            monitor_id: u32,
-            qh: &QueueHandle<Self>,
-        ) {
-            let (old_monitor, should_show) =
-                self.overlay_controller.pointer_entered_monitor(y, monitor_id);
+        pub fn pointer_entered_monitor(&mut self, y: f64, monitor_id: u32, qh: &QueueHandle<Self>) {
+            let (old_monitor, should_show) = self
+                .overlay_controller
+                .pointer_entered_monitor(y, monitor_id);
 
             // Hide overlay on old monitor if it was showing
             if let Some(old_id) = old_monitor {
@@ -1527,11 +1533,7 @@ mod linux {
         ///
         /// This is the full implementation that creates a data source and
         /// sets the selection so local applications can paste the text.
-        pub fn set_clipboard_text_with_qh(
-            &mut self,
-            text: String,
-            qh: &QueueHandle<Self>,
-        ) {
+        pub fn set_clipboard_text_with_qh(&mut self, text: String, qh: &QueueHandle<Self>) {
             tracing::debug!("Setting clipboard text: {} chars", text.len());
             self.clipboard_text = Some(text);
 
@@ -1576,7 +1578,10 @@ mod linux {
         /// This stores the file paths and offers them to the Wayland compositor
         /// as `text/uri-list` so local file managers can paste them.
         pub fn set_clipboard_files(&mut self, files: Vec<std::path::PathBuf>) {
-            tracing::debug!("Clipboard files received from remote: {} files", files.len());
+            tracing::debug!(
+                "Clipboard files received from remote: {} files",
+                files.len()
+            );
             self.clipboard_files = Some(files);
         }
 
@@ -1716,9 +1721,7 @@ mod linux {
                 // Only handle file:// URIs
                 if let Some(path) = line.strip_prefix("file://") {
                     // Handle file://localhost/ prefix (some apps use this)
-                    let path = path
-                        .strip_prefix("localhost")
-                        .unwrap_or(path);
+                    let path = path.strip_prefix("localhost").unwrap_or(path);
 
                     // Decode percent-encoded characters
                     let decoded = Self::decode_file_uri(path);
@@ -3293,7 +3296,8 @@ mod linux {
                         // Story 6.3: Check if this completes a disconnect button click
                         // Only left mouse button (BTN_LEFT = 0x110 = 272)
                         if button == BTN_LEFT {
-                            if let Some((overlay_w, overlay_h)) = self.disconnect_button_press.take()
+                            if let Some((overlay_w, overlay_h)) =
+                                self.disconnect_button_press.take()
                             {
                                 // Verify release is also on the disconnect button
                                 if hit_test_disconnect_button(overlay_w, overlay_h, x, y) {
@@ -3456,9 +3460,9 @@ mod linux {
                                         // Clear text cache since files take precedence
                                         self.last_local_clipboard_text = None;
                                         // Notify main thread of file clipboard change
-                                        let _ = self.event_tx.send(WindowEvent::LocalClipboardFilesChanged {
-                                            files,
-                                        });
+                                        let _ = self.event_tx.send(
+                                            WindowEvent::LocalClipboardFilesChanged { files },
+                                        );
                                     }
                                 }
                             }
@@ -3512,9 +3516,9 @@ mod linux {
                                         // Clear file cache since text takes precedence
                                         self.last_local_clipboard_files = None;
                                         // Notify main thread of clipboard change
-                                        let _ = self.event_tx.send(WindowEvent::LocalClipboardChanged {
-                                            text,
-                                        });
+                                        let _ = self
+                                            .event_tx
+                                            .send(WindowEvent::LocalClipboardChanged { text });
                                     }
                                 }
                             }
@@ -3523,7 +3527,10 @@ mod linux {
                             }
                         }
                     } else {
-                        tracing::debug!("No supported format in clipboard (formats: {:?})", mime_types);
+                        tracing::debug!(
+                            "No supported format in clipboard (formats: {:?})",
+                            mime_types
+                        );
                     }
                 } else {
                     tracing::debug!("No selection offer available");
@@ -3645,12 +3652,7 @@ mod linux {
 
     // Story 6.1: LayerShellHandler implementation for overlay surfaces
     impl LayerShellHandler for WaylandWindow {
-        fn closed(
-            &mut self,
-            _conn: &Connection,
-            _qh: &QueueHandle<Self>,
-            _layer: &LayerSurface,
-        ) {
+        fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
             // Layer surface was closed by the compositor
             tracing::debug!("Overlay layer surface closed by compositor");
             // Find and remove the closed surface from our map
@@ -4032,9 +4034,13 @@ mod stub {
             new_height: u32,
         },
         /// Story 5.3: Local clipboard changed (stub).
-        LocalClipboardChanged { text: String },
+        LocalClipboardChanged {
+            text: String,
+        },
         /// Story 5.5: Local clipboard files changed (stub).
-        LocalClipboardFilesChanged { files: Vec<std::path::PathBuf> },
+        LocalClipboardFilesChanged {
+            files: Vec<std::path::PathBuf>,
+        },
         /// Story 6.1: Overlay visibility changed (stub).
         OverlayVisibilityChanged {
             visible: bool,
@@ -5650,7 +5656,11 @@ mod tests {
             monitor_id: Some(1),
         };
 
-        if let WindowEvent::OverlayVisibilityChanged { visible, monitor_id } = event {
+        if let WindowEvent::OverlayVisibilityChanged {
+            visible,
+            monitor_id,
+        } = event
+        {
             assert!(visible);
             assert_eq!(monitor_id, Some(1));
         } else {
@@ -5665,7 +5675,11 @@ mod tests {
             monitor_id: None,
         };
 
-        if let WindowEvent::OverlayVisibilityChanged { visible, monitor_id } = event {
+        if let WindowEvent::OverlayVisibilityChanged {
+            visible,
+            monitor_id,
+        } = event
+        {
             assert!(!visible);
             assert_eq!(monitor_id, None);
         } else {

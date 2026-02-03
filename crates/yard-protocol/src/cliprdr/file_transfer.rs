@@ -72,7 +72,12 @@ pub struct PendingFileTransfer {
 
 impl PendingFileTransfer {
     /// Creates a new pending file transfer.
-    pub fn new(file_index: u32, file_name: String, declared_size: Option<u64>, is_directory: bool) -> Self {
+    pub fn new(
+        file_index: u32,
+        file_name: String,
+        declared_size: Option<u64>,
+        is_directory: bool,
+    ) -> Self {
         Self {
             file_index,
             file_name,
@@ -160,12 +165,7 @@ impl FileTransferManager {
 
         for (index, (name, size, is_dir)) in files.iter().enumerate() {
             let file_index = index as u32;
-            let transfer = PendingFileTransfer::new(
-                file_index,
-                name.clone(),
-                *size,
-                *is_dir,
-            );
+            let transfer = PendingFileTransfer::new(file_index, name.clone(), *size, *is_dir);
             self.transfers.insert(file_index, transfer);
         }
 
@@ -177,7 +177,9 @@ impl FileTransferManager {
     /// Returns the stream ID and file index, or None if no pending transfers.
     pub fn start_next_transfer(&mut self) -> Option<(u32, u32)> {
         // Find first pending transfer
-        let file_index = self.transfers.iter()
+        let file_index = self
+            .transfers
+            .iter()
             .find(|(_, t)| t.state == FileTransferState::Pending && !t.is_directory)
             .map(|(&idx, _)| idx)?;
 
@@ -204,12 +206,16 @@ impl FileTransferManager {
         stream_id: u32,
         size: u64,
     ) -> Result<Option<(u32, u32, u64, u32)>, String> {
-        let file_index = self.stream_to_file.remove(&stream_id)
+        let file_index = self
+            .stream_to_file
+            .remove(&stream_id)
             .ok_or_else(|| format!("Unknown stream_id: {}", stream_id))?;
 
         // Validate state first
         {
-            let transfer = self.transfers.get(&file_index)
+            let transfer = self
+                .transfers
+                .get(&file_index)
                 .ok_or_else(|| format!("Unknown file_index: {}", file_index))?;
 
             if !matches!(transfer.state, FileTransferState::AwaitingSize { .. }) {
@@ -252,9 +258,8 @@ impl FileTransferManager {
 
         // Create temporary file
         let temp_path = self.staging_dir.join(format!(".{}.part", file_name));
-        let temp_file = File::create(&temp_path).map_err(|e| {
-            format!("Failed to create temp file: {}", e)
-        })?;
+        let temp_file =
+            File::create(&temp_path).map_err(|e| format!("Failed to create temp file: {}", e))?;
 
         // Get new stream ID before borrowing transfer mutably
         let new_stream_id = self.next_stream_id();
@@ -289,18 +294,24 @@ impl FileTransferManager {
         stream_id: u32,
         data: &[u8],
     ) -> Result<Option<(u32, u32, u64, u32)>, String> {
-        let file_index = self.stream_to_file.remove(&stream_id)
+        let file_index = self
+            .stream_to_file
+            .remove(&stream_id)
             .ok_or_else(|| format!("Unknown stream_id: {}", stream_id))?;
 
         // Get state info first
         let (total_size, bytes_received, file_name) = {
-            let transfer = self.transfers.get(&file_index)
+            let transfer = self
+                .transfers
+                .get(&file_index)
                 .ok_or_else(|| format!("Unknown file_index: {}", file_index))?;
 
             match &transfer.state {
-                FileTransferState::Downloading { total_size, bytes_received, .. } => {
-                    (*total_size, *bytes_received, transfer.file_name.clone())
-                }
+                FileTransferState::Downloading {
+                    total_size,
+                    bytes_received,
+                    ..
+                } => (*total_size, *bytes_received, transfer.file_name.clone()),
                 _ => {
                     return Err(format!(
                         "Unexpected content response for file {} in state {:?}",
@@ -314,7 +325,8 @@ impl FileTransferManager {
         {
             let transfer = self.transfers.get_mut(&file_index).unwrap();
             if let Some(ref mut file) = transfer.temp_file {
-                file.write_all(data).map_err(|e| format!("Write failed: {}", e))?;
+                file.write_all(data)
+                    .map_err(|e| format!("Write failed: {}", e))?;
             } else {
                 return Err("No temp file handle".to_string());
             }
@@ -330,11 +342,12 @@ impl FileTransferManager {
 
             if let Some(temp_path) = transfer.temp_path.take() {
                 let final_path = self.staging_dir.join(&transfer.file_name);
-                fs::rename(&temp_path, &final_path).map_err(|e| {
-                    format!("Failed to rename temp file: {}", e)
-                })?;
+                fs::rename(&temp_path, &final_path)
+                    .map_err(|e| format!("Failed to rename temp file: {}", e))?;
 
-                transfer.state = FileTransferState::Completed { path: final_path.clone() };
+                transfer.state = FileTransferState::Completed {
+                    path: final_path.clone(),
+                };
                 info!(
                     "File transfer complete: {} ({} bytes)",
                     transfer.file_name, new_bytes_received
@@ -364,55 +377,66 @@ impl FileTransferManager {
             file_name, new_bytes_received, total_size
         );
 
-        Ok(Some((new_stream_id, file_index, new_bytes_received, chunk_len)))
+        Ok(Some((
+            new_stream_id,
+            file_index,
+            new_bytes_received,
+            chunk_len,
+        )))
     }
 
     /// Handles a transfer failure.
     pub fn handle_failure(&mut self, stream_id: u32) {
-        if let Some(file_index) = self.stream_to_file.remove(&stream_id) {
-            if let Some(transfer) = self.transfers.get_mut(&file_index) {
-                // Clean up temp file
-                if let Some(temp_path) = transfer.temp_path.take() {
-                    let _ = fs::remove_file(&temp_path);
-                }
-                transfer.temp_file = None;
-
-                transfer.state = FileTransferState::Failed {
-                    error: "Server returned failure".to_string(),
-                };
-
-                warn!("File transfer failed: {}", transfer.file_name);
+        if let Some(file_index) = self.stream_to_file.remove(&stream_id)
+            && let Some(transfer) = self.transfers.get_mut(&file_index)
+        {
+            // Clean up temp file
+            if let Some(temp_path) = transfer.temp_path.take() {
+                let _ = fs::remove_file(&temp_path);
             }
+            transfer.temp_file = None;
+
+            transfer.state = FileTransferState::Failed {
+                error: "Server returned failure".to_string(),
+            };
+
+            warn!("File transfer failed: {}", transfer.file_name);
         }
     }
 
     /// Returns the list of completed file paths.
     pub fn completed_files(&self) -> Vec<PathBuf> {
-        self.transfers.values()
+        self.transfers
+            .values()
             .filter_map(|t| t.final_path().map(|p| p.to_path_buf()))
             .collect()
     }
 
     /// Returns the number of pending transfers (excludes directories).
     pub fn pending_count(&self) -> usize {
-        self.transfers.values()
+        self.transfers
+            .values()
             .filter(|t| matches!(t.state, FileTransferState::Pending) && !t.is_directory)
             .count()
     }
 
     /// Returns the number of active transfers.
     pub fn active_count(&self) -> usize {
-        self.transfers.values()
-            .filter(|t| matches!(
-                t.state,
-                FileTransferState::AwaitingSize { .. } | FileTransferState::Downloading { .. }
-            ))
+        self.transfers
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.state,
+                    FileTransferState::AwaitingSize { .. } | FileTransferState::Downloading { .. }
+                )
+            })
             .count()
     }
 
     /// Returns the number of completed transfers.
     pub fn completed_count(&self) -> usize {
-        self.transfers.values()
+        self.transfers
+            .values()
             .filter(|t| matches!(t.state, FileTransferState::Completed { .. }))
             .count()
     }
@@ -470,8 +494,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let temp_dir = std::env::temp_dir()
-            .join(format!("yard-test-{}-{}", std::process::id(), timestamp));
+        let temp_dir =
+            std::env::temp_dir().join(format!("yard-test-{}-{}", std::process::id(), timestamp));
         FileTransferManager::new(temp_dir).unwrap()
     }
 
@@ -485,7 +509,12 @@ mod tests {
             current_stream_id: 1,
         };
 
-        if let FileTransferState::Downloading { total_size, bytes_received, .. } = state {
+        if let FileTransferState::Downloading {
+            total_size,
+            bytes_received,
+            ..
+        } = state
+        {
             assert_eq!(total_size, 1000);
             assert_eq!(bytes_received, 500);
         }
@@ -529,9 +558,7 @@ mod tests {
     fn test_start_transfer() {
         let mut manager = create_test_manager();
 
-        let files = vec![
-            ("test.txt".to_string(), Some(100u64), false),
-        ];
+        let files = vec![("test.txt".to_string(), Some(100u64), false)];
         manager.add_files(&files);
 
         let result = manager.start_next_transfer();
@@ -550,9 +577,7 @@ mod tests {
     fn test_empty_file_transfer() {
         let mut manager = create_test_manager();
 
-        let files = vec![
-            ("empty.txt".to_string(), Some(0u64), false),
-        ];
+        let files = vec![("empty.txt".to_string(), Some(0u64), false)];
         manager.add_files(&files);
 
         let (stream_id, _) = manager.start_next_transfer().unwrap();
@@ -574,9 +599,7 @@ mod tests {
     fn test_file_too_large() {
         let mut manager = create_test_manager();
 
-        let files = vec![
-            ("huge.bin".to_string(), None, false),
-        ];
+        let files = vec![("huge.bin".to_string(), None, false)];
         manager.add_files(&files);
 
         let (stream_id, _) = manager.start_next_transfer().unwrap();
@@ -594,13 +617,11 @@ mod tests {
     fn test_full_transfer() {
         let mut manager = create_test_manager();
 
-        let files = vec![
-            ("hello.txt".to_string(), Some(5u64), false),
-        ];
+        let files = vec![("hello.txt".to_string(), Some(5u64), false)];
         manager.add_files(&files);
 
         // Start transfer
-        let (stream_id, file_index) = manager.start_next_transfer().unwrap();
+        let (stream_id, _file_index) = manager.start_next_transfer().unwrap();
 
         // Handle size response
         let result = manager.handle_size_response(stream_id, 5).unwrap();
@@ -611,7 +632,9 @@ mod tests {
         assert_eq!(length, 5);
 
         // Handle content response
-        let result = manager.handle_content_response(content_stream_id, b"Hello").unwrap();
+        let result = manager
+            .handle_content_response(content_stream_id, b"Hello")
+            .unwrap();
         assert!(result.is_none()); // Transfer complete
 
         // Verify file
@@ -620,7 +643,10 @@ mod tests {
         assert_eq!(completed.len(), 1);
 
         let mut content = String::new();
-        File::open(&completed[0]).unwrap().read_to_string(&mut content).unwrap();
+        File::open(&completed[0])
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert_eq!(content, "Hello");
     }
 
@@ -629,33 +655,43 @@ mod tests {
         let mut manager = create_test_manager();
         manager.chunk_size = 3; // Small chunks for testing
 
-        let files = vec![
-            ("chunks.txt".to_string(), Some(10u64), false),
-        ];
+        let files = vec![("chunks.txt".to_string(), Some(10u64), false)];
         manager.add_files(&files);
 
         let (stream_id, _) = manager.start_next_transfer().unwrap();
 
         // Handle size
-        let result = manager.handle_size_response(stream_id, 10).unwrap().unwrap();
+        let result = manager
+            .handle_size_response(stream_id, 10)
+            .unwrap()
+            .unwrap();
         let (stream_id, _, offset, length) = result;
         assert_eq!(offset, 0);
         assert_eq!(length, 3);
 
         // First chunk
-        let result = manager.handle_content_response(stream_id, b"ABC").unwrap().unwrap();
+        let result = manager
+            .handle_content_response(stream_id, b"ABC")
+            .unwrap()
+            .unwrap();
         let (stream_id, _, offset, length) = result;
         assert_eq!(offset, 3);
         assert_eq!(length, 3);
 
         // Second chunk
-        let result = manager.handle_content_response(stream_id, b"DEF").unwrap().unwrap();
+        let result = manager
+            .handle_content_response(stream_id, b"DEF")
+            .unwrap()
+            .unwrap();
         let (stream_id, _, offset, length) = result;
         assert_eq!(offset, 6);
         assert_eq!(length, 3);
 
         // Third chunk
-        let result = manager.handle_content_response(stream_id, b"GHI").unwrap().unwrap();
+        let result = manager
+            .handle_content_response(stream_id, b"GHI")
+            .unwrap()
+            .unwrap();
         let (stream_id, _, offset, length) = result;
         assert_eq!(offset, 9);
         assert_eq!(length, 1);
@@ -667,7 +703,10 @@ mod tests {
         // Verify
         let completed = manager.completed_files();
         let mut content = String::new();
-        File::open(&completed[0]).unwrap().read_to_string(&mut content).unwrap();
+        File::open(&completed[0])
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
         assert_eq!(content, "ABCDEFGHIJ");
     }
 
@@ -675,9 +714,7 @@ mod tests {
     fn test_handle_failure() {
         let mut manager = create_test_manager();
 
-        let files = vec![
-            ("fail.txt".to_string(), Some(100u64), false),
-        ];
+        let files = vec![("fail.txt".to_string(), Some(100u64), false)];
         manager.add_files(&files);
 
         let (stream_id, _) = manager.start_next_transfer().unwrap();

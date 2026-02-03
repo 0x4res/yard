@@ -463,7 +463,14 @@ mod linux {
     /// * `y` - Y position in pixels
     /// * `text` - Text string to render
     /// * `color` - BGRA color for the text
-    pub fn render_text(buffer: &mut [u8], buffer_width: u32, x: u32, y: u32, text: &str, color: [u8; 4]) {
+    pub fn render_text(
+        buffer: &mut [u8],
+        buffer_width: u32,
+        x: u32,
+        y: u32,
+        text: &str,
+        color: [u8; 4],
+    ) {
         for (i, ch) in text.chars().enumerate() {
             let char_x = x + (i as u32 * FONT_WIDTH);
             render_char(buffer, buffer_width, char_x, y, ch, color);
@@ -479,7 +486,14 @@ mod linux {
     /// * `cy` - Center Y position
     /// * `radius` - Radius in pixels
     /// * `color` - BGRA color for the circle
-    pub fn render_circle(buffer: &mut [u8], buffer_width: u32, cx: u32, cy: u32, radius: u32, color: [u8; 4]) {
+    pub fn render_circle(
+        buffer: &mut [u8],
+        buffer_width: u32,
+        cx: u32,
+        cy: u32,
+        radius: u32,
+        color: [u8; 4],
+    ) {
         let buffer_height = buffer.len() as u32 / (buffer_width * 4);
         let r2 = (radius * radius) as i32;
 
@@ -556,7 +570,10 @@ mod linux {
     ///
     /// # Returns
     /// Tuple of (x, y, width, height) representing the button bounds relative to overlay.
-    pub fn disconnect_button_bounds(overlay_width: u32, overlay_height: u32) -> (u32, u32, u32, u32) {
+    pub fn disconnect_button_bounds(
+        overlay_width: u32,
+        overlay_height: u32,
+    ) -> (u32, u32, u32, u32) {
         let x = overlay_width.saturating_sub(BUTTON_WIDTH + BUTTON_MARGIN);
         let y = (overlay_height.saturating_sub(BUTTON_HEIGHT)) / 2;
         (x, y, BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -621,7 +638,14 @@ mod linux {
         let text_y = by + (bh.saturating_sub(FONT_HEIGHT)) / 2;
 
         // Render button text
-        render_text(buffer, buffer_width, text_x, text_y, BUTTON_TEXT, COLOR_WHITE);
+        render_text(
+            buffer,
+            buffer_width,
+            text_x,
+            text_y,
+            BUTTON_TEXT,
+            COLOR_WHITE,
+        );
     }
 
     /// State of the overlay visibility.
@@ -1081,8 +1105,8 @@ mod linux {
 
         #[test]
         fn test_overlay_content_connected_with_duration() {
-            let content = OverlayContent::connected("server")
-                .with_duration(Duration::from_secs(3661)); // 1h 1m 1s
+            let content =
+                OverlayContent::connected("server").with_duration(Duration::from_secs(3661)); // 1h 1m 1s
             assert_eq!(content.session_duration, Some(Duration::from_secs(3661)));
         }
 
@@ -1098,7 +1122,10 @@ mod linux {
         fn test_overlay_content_disconnected() {
             let content = OverlayContent::disconnected("Connection refused");
             assert_eq!(content.status, ConnectionStatus::Disconnected);
-            assert_eq!(content.disconnect_reason, Some("Connection refused".to_string()));
+            assert_eq!(
+                content.disconnect_reason,
+                Some("Connection refused".to_string())
+            );
         }
 
         #[test]
@@ -1148,8 +1175,8 @@ mod linux {
 
         #[test]
         fn test_format_status_text_connected_with_duration() {
-            let content = OverlayContent::connected("server")
-                .with_duration(Duration::from_secs(3661));
+            let content =
+                OverlayContent::connected("server").with_duration(Duration::from_secs(3661));
             let text = content.format_status_text();
             assert!(text.contains("01:01:01"));
         }
@@ -1218,7 +1245,10 @@ mod linux {
 
             // Check that some pixels were modified (at least one white pixel)
             let has_white_pixel = buffer.chunks(4).any(|pixel| pixel == COLOR_WHITE);
-            assert!(has_white_pixel, "Text should have rendered some white pixels");
+            assert!(
+                has_white_pixel,
+                "Text should have rendered some white pixels"
+            );
         }
 
         #[test]
@@ -1252,7 +1282,10 @@ mod linux {
             let content = OverlayContent::connected("test-server").with_rtt(50);
 
             let buffer = generate_overlay_buffer_with_content(
-                width, height, OVERLAY_BG_COLOR, Some(&content)
+                width,
+                height,
+                OVERLAY_BG_COLOR,
+                Some(&content),
             );
 
             assert_eq!(buffer.len(), (width * height * 4) as usize);
@@ -1269,7 +1302,8 @@ mod linux {
             let width = 100u32;
             let height = 40u32;
 
-            let buffer = generate_overlay_buffer_with_content(width, height, OVERLAY_BG_COLOR, None);
+            let buffer =
+                generate_overlay_buffer_with_content(width, height, OVERLAY_BG_COLOR, None);
             let plain_buffer = generate_overlay_buffer(width, height, OVERLAY_BG_COLOR);
 
             // Should be identical when no content
@@ -1281,7 +1315,11 @@ mod linux {
             // Font should have data for all 95 printable ASCII characters (32-126)
             let expected_chars = 95;
             let expected_size = expected_chars * (FONT_HEIGHT as usize);
-            assert_eq!(FONT_DATA.len(), expected_size, "Font data should cover ASCII 32-126");
+            assert_eq!(
+                FONT_DATA.len(),
+                expected_size,
+                "Font data should cover ASCII 32-126"
+            );
         }
 
         // Story 6.3: Disconnect button tests
@@ -1321,15 +1359,27 @@ mod linux {
             // Center of button should hit
             let center_x = bx as f64 + (bw as f64 / 2.0);
             let center_y = by as f64 + (bh as f64 / 2.0);
-            assert!(hit_test_disconnect_button(overlay_width, overlay_height, center_x, center_y));
+            assert!(hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                center_x,
+                center_y
+            ));
 
             // Top-left corner (just inside)
-            assert!(hit_test_disconnect_button(overlay_width, overlay_height, bx as f64, by as f64));
+            assert!(hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                bx as f64,
+                by as f64
+            ));
 
             // Bottom-right corner (just inside)
             assert!(hit_test_disconnect_button(
-                overlay_width, overlay_height,
-                (bx + bw - 1) as f64, (by + bh - 1) as f64
+                overlay_width,
+                overlay_height,
+                (bx + bw - 1) as f64,
+                (by + bh - 1) as f64
             ));
         }
 
@@ -1341,16 +1391,36 @@ mod linux {
             let (bx, by, _bw, bh) = disconnect_button_bounds(overlay_width, overlay_height);
 
             // Left of button
-            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, (bx - 1) as f64, (by + bh / 2) as f64));
+            assert!(!hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                (bx - 1) as f64,
+                (by + bh / 2) as f64
+            ));
 
             // Above button
-            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, (bx + 10) as f64, (by - 1) as f64));
+            assert!(!hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                (bx + 10) as f64,
+                (by - 1) as f64
+            ));
 
             // Below button
-            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, (bx + 10) as f64, (by + bh) as f64));
+            assert!(!hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                (bx + 10) as f64,
+                (by + bh) as f64
+            ));
 
             // Far left (in status text area)
-            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, 50.0, 20.0));
+            assert!(!hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                50.0,
+                20.0
+            ));
         }
 
         #[test]
@@ -1359,13 +1429,28 @@ mod linux {
             let overlay_height = 40u32;
 
             // Negative coordinates
-            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, -10.0, 20.0));
+            assert!(!hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                -10.0,
+                20.0
+            ));
 
             // Beyond overlay width
-            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, 900.0, 20.0));
+            assert!(!hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                900.0,
+                20.0
+            ));
 
             // Beyond overlay height
-            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, 750.0, 50.0));
+            assert!(!hit_test_disconnect_button(
+                overlay_width,
+                overlay_height,
+                750.0,
+                50.0
+            ));
         }
 
         #[test]
@@ -1411,7 +1496,11 @@ mod linux {
             // Button area should have non-zero pixels (button background)
             let (bx, by, _, _) = disconnect_button_bounds(width, height);
             let idx = ((by + 5) * width + bx + 5) as usize * 4;
-            assert_ne!(&buffer[idx..idx + 4], &[0, 0, 0, 0], "Button area should be rendered");
+            assert_ne!(
+                &buffer[idx..idx + 4],
+                &[0, 0, 0, 0],
+                "Button area should be rendered"
+            );
 
             // Check that button background color is present
             let has_button_color = buffer.chunks(4).any(|p| p == BUTTON_BG_COLOR);
@@ -1419,7 +1508,10 @@ mod linux {
 
             // Check that white text pixels are present
             let has_white = buffer.chunks(4).any(|p| p == COLOR_WHITE);
-            assert!(has_white, "Should have white text pixels from 'Disconnect' label");
+            assert!(
+                has_white,
+                "Should have white text pixels from 'Disconnect' label"
+            );
         }
 
         #[test]
@@ -1434,10 +1526,16 @@ mod linux {
 
             // Hover state should use different color
             let has_hover_color = buffer_hover.chunks(4).any(|p| p == BUTTON_HOVER_COLOR);
-            assert!(has_hover_color, "Hover state should have hover background color");
+            assert!(
+                has_hover_color,
+                "Hover state should have hover background color"
+            );
 
             let has_normal_color = buffer_normal.chunks(4).any(|p| p == BUTTON_BG_COLOR);
-            assert!(has_normal_color, "Normal state should have normal background color");
+            assert!(
+                has_normal_color,
+                "Normal state should have normal background color"
+            );
         }
 
         #[test]
@@ -1446,11 +1544,19 @@ mod linux {
             let height = 40u32;
 
             let content = OverlayContent::connected("test.server.com");
-            let buffer = generate_overlay_buffer_with_content(width, height, OVERLAY_BG_COLOR, Some(&content));
+            let buffer = generate_overlay_buffer_with_content(
+                width,
+                height,
+                OVERLAY_BG_COLOR,
+                Some(&content),
+            );
 
             // Should have button background color
             let has_button_color = buffer.chunks(4).any(|p| p == BUTTON_BG_COLOR);
-            assert!(has_button_color, "Overlay with content should include disconnect button");
+            assert!(
+                has_button_color,
+                "Overlay with content should include disconnect button"
+            );
         }
     }
 }
@@ -1514,14 +1620,26 @@ mod stub {
             Self::default()
         }
         pub fn reconnecting(_attempt: u32, _max: u32, _reason: Option<String>) -> Self {
-            Self { status: ConnectionStatus::Reconnecting, ..Default::default() }
+            Self {
+                status: ConnectionStatus::Reconnecting,
+                ..Default::default()
+            }
         }
         pub fn disconnected(_reason: impl Into<String>) -> Self {
-            Self { status: ConnectionStatus::Disconnected, ..Default::default() }
+            Self {
+                status: ConnectionStatus::Disconnected,
+                ..Default::default()
+            }
         }
-        pub fn with_rtt(self, _rtt: u32) -> Self { self }
-        pub fn with_duration(self, _dur: Duration) -> Self { self }
-        pub fn format_status_text(&self) -> String { String::new() }
+        pub fn with_rtt(self, _rtt: u32) -> Self {
+            self
+        }
+        pub fn with_duration(self, _dur: Duration) -> Self {
+            self
+        }
+        pub fn format_status_text(&self) -> String {
+            String::new()
+        }
     }
 
     /// Overlay controller stub for non-Linux platforms.
@@ -1563,7 +1681,11 @@ mod stub {
             false
         }
 
-        pub fn pointer_entered_monitor(&mut self, _y: f64, _monitor_id: u32) -> (Option<u32>, bool) {
+        pub fn pointer_entered_monitor(
+            &mut self,
+            _y: f64,
+            _monitor_id: u32,
+        ) -> (Option<u32>, bool) {
             (None, false)
         }
 
@@ -1595,9 +1717,27 @@ mod stub {
         String::new()
     }
 
-    pub fn render_text(_buffer: &mut [u8], _width: u32, _x: u32, _y: u32, _text: &str, _color: [u8; 4]) {}
-    pub fn render_circle(_buffer: &mut [u8], _width: u32, _cx: u32, _cy: u32, _radius: u32, _color: [u8; 4]) {}
-    pub fn rtt_color(_rtt_ms: u32) -> [u8; 4] { [0, 0, 0, 0] }
+    pub fn render_text(
+        _buffer: &mut [u8],
+        _width: u32,
+        _x: u32,
+        _y: u32,
+        _text: &str,
+        _color: [u8; 4],
+    ) {
+    }
+    pub fn render_circle(
+        _buffer: &mut [u8],
+        _width: u32,
+        _cx: u32,
+        _cy: u32,
+        _radius: u32,
+        _color: [u8; 4],
+    ) {
+    }
+    pub fn rtt_color(_rtt_ms: u32) -> [u8; 4] {
+        [0, 0, 0, 0]
+    }
 
     pub const DEFAULT_HOVER_THRESHOLD: f64 = 10.0;
     pub const DEFAULT_HIDE_DELAY: Duration = Duration::from_millis(300);

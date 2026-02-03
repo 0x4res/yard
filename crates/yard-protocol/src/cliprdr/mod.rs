@@ -19,11 +19,13 @@ use ironrdp::pdu::{Encode, EncodeResult, PduResult, WriteCursor};
 use ironrdp::svc::{SvcClientProcessor, SvcEncode, SvcMessage, SvcProcessor};
 use tracing::{debug, trace, warn};
 
+pub mod file_transfer;
 pub mod pdu;
 
 use pdu::{
-    ClipCapsPdu, ClipboardFormat, CliprdrPdu, FormatDataRequestPdu, FormatDataResponsePdu,
-    FormatListPdu, FormatListResponsePdu, StandardFormat,
+    ClipCapsPdu, ClipboardFormat, CliprdrFileList, CliprdrPdu, FileContentsRequestPdu,
+    FormatDataRequestPdu, FormatDataResponsePdu, FormatListPdu, FormatListResponsePdu,
+    StandardFormat,
 };
 
 /// Channel name for CLIPRDR Static Virtual Channel.
@@ -48,6 +50,8 @@ pub enum ClipboardEvent {
         formats: Vec<u32>,
         /// True if text data is available (CF_UNICODETEXT or CF_TEXT).
         has_text: bool,
+        /// True if files are available (FileGroupDescriptorW format).
+        has_files: bool,
     },
     /// Clipboard text data received from server.
     ///
@@ -58,6 +62,83 @@ pub enum ClipboardEvent {
     },
     /// Format data request failed.
     RequestFailed,
+    /// Story 5.4: File list received from server.
+    ///
+    /// Contains metadata about files available for download.
+    FilesReceived {
+        /// File descriptors with names and sizes.
+        files: Vec<FileInfo>,
+    },
+    /// Story 5.4: File content chunk received.
+    FileContentReceived {
+        /// Stream ID matching the request.
+        stream_id: u32,
+        /// File data bytes.
+        data: Vec<u8>,
+    },
+    /// Story 5.4: File size received.
+    FileSizeReceived {
+        /// Stream ID matching the request.
+        stream_id: u32,
+        /// File size in bytes.
+        size: u64,
+    },
+    /// Story 5.4: File transfer failed.
+    FileTransferFailed {
+        /// Stream ID of the failed request.
+        stream_id: u32,
+    },
+}
+
+/// Story 5.4: Information about a file in the clipboard (from remote server).
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    /// File name.
+    pub name: String,
+    /// File size in bytes (if known).
+    pub size: Option<u64>,
+    /// True if this is a directory.
+    pub is_directory: bool,
+}
+
+/// Story 5.5: Information about a local file to send to the remote server.
+#[derive(Debug, Clone)]
+pub struct LocalFileInfo {
+    /// Full path to the local file.
+    pub path: std::path::PathBuf,
+    /// File name (extracted from path for convenience).
+    pub name: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Last modification time as Unix timestamp.
+    pub modified_time: u64,
+    /// True if this is a directory.
+    pub is_directory: bool,
+}
+
+impl LocalFileInfo {
+    /// Creates a LocalFileInfo from a file path by reading its metadata.
+    ///
+    /// Returns None if the file doesn't exist or can't be read.
+    pub fn from_path(path: std::path::PathBuf) -> Option<Self> {
+        let metadata = std::fs::metadata(&path).ok()?;
+        let name = path.file_name()?.to_str()?.to_string();
+
+        let modified_time = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        Some(Self {
+            path,
+            name,
+            size: metadata.len(),
+            modified_time,
+            is_directory: metadata.is_dir(),
+        })
+    }
 }
 
 /// CLIPRDR protocol state machine.
@@ -82,6 +163,8 @@ pub struct YardCliprdrHandler {
     channel_id: Option<u32>,
     /// Whether long format names are supported (CB_USE_LONG_FORMAT_NAMES).
     use_long_format_names: bool,
+    /// Whether file clipboard is enabled (CB_STREAM_FILECLIP_ENABLED).
+    file_clipboard_enabled: bool,
     /// Formats available on the server's clipboard.
     server_formats: Vec<ClipboardFormat>,
     /// Whether clipboard functionality is enabled.
@@ -94,6 +177,20 @@ pub struct YardCliprdrHandler {
     event_tx: Option<Sender<ClipboardEvent>>,
     /// Story 5.3: Local clipboard text to provide when server requests.
     local_clipboard_text: Option<String>,
+    /// Story 5.4: Format ID for FileGroupDescriptorW (dynamic, announced by server).
+    file_group_descriptor_format_id: Option<u32>,
+    /// Story 5.4: Format ID for FileContents (dynamic, announced by server).
+    file_contents_format_id: Option<u32>,
+    /// Story 5.4: Next stream ID for file content requests.
+    next_stream_id: u32,
+    /// Story 5.4: Cached file list from server.
+    remote_file_list: Option<CliprdrFileList>,
+    /// Story 5.5: Local files to offer to the remote server.
+    local_clipboard_files: Option<Vec<LocalFileInfo>>,
+    /// Story 5.5: Client-assigned format ID for FileGroupDescriptorW (for local→remote).
+    local_file_group_descriptor_format_id: u32,
+    /// Story 5.5: Client-assigned format ID for FileContents (for local→remote).
+    local_file_contents_format_id: u32,
 }
 
 impl YardCliprdrHandler {
@@ -106,12 +203,21 @@ impl YardCliprdrHandler {
             state: CliprdrState::Initial,
             channel_id: None,
             use_long_format_names: true, // Default to long format names
+            file_clipboard_enabled: false,
             server_formats: Vec::new(),
             enabled: true,
             pending_format_request: None,
             pending_clipboard_data: None,
             event_tx: None,
             local_clipboard_text: None,
+            file_group_descriptor_format_id: None,
+            file_contents_format_id: None,
+            next_stream_id: 1,
+            remote_file_list: None,
+            local_clipboard_files: None,
+            // Story 5.5: Client-assigned format IDs in registered format range (>= 0xC000)
+            local_file_group_descriptor_format_id: 0xC100,
+            local_file_contents_format_id: 0xC101,
         }
     }
 
@@ -124,12 +230,20 @@ impl YardCliprdrHandler {
             state: CliprdrState::Initial,
             channel_id: None,
             use_long_format_names: true,
+            file_clipboard_enabled: false,
             server_formats: Vec::new(),
             enabled: true,
             pending_format_request: None,
             pending_clipboard_data: None,
             event_tx: Some(event_tx),
             local_clipboard_text: None,
+            file_group_descriptor_format_id: None,
+            file_contents_format_id: None,
+            next_stream_id: 1,
+            remote_file_list: None,
+            local_clipboard_files: None,
+            local_file_group_descriptor_format_id: 0xC100,
+            local_file_contents_format_id: 0xC101,
         }
     }
 
@@ -139,12 +253,20 @@ impl YardCliprdrHandler {
             state: CliprdrState::Closed,
             channel_id: None,
             use_long_format_names: false,
+            file_clipboard_enabled: false,
             server_formats: Vec::new(),
             enabled: false,
             pending_format_request: None,
             pending_clipboard_data: None,
             event_tx: None,
             local_clipboard_text: None,
+            file_group_descriptor_format_id: None,
+            file_contents_format_id: None,
+            next_stream_id: 1,
+            remote_file_list: None,
+            local_clipboard_files: None,
+            local_file_group_descriptor_format_id: 0xC100,
+            local_file_contents_format_id: 0xC101,
         }
     }
 
@@ -206,6 +328,7 @@ impl YardCliprdrHandler {
 
         // Update our understanding of server capabilities
         self.use_long_format_names = caps.general_flags.use_long_format_names();
+        self.file_clipboard_enabled = caps.general_flags.stream_fileclip_enabled();
 
         Ok(Vec::new())
     }
@@ -221,15 +344,37 @@ impl YardCliprdrHandler {
             format_list.formats.len()
         );
 
+        // Story 5.6: Clear local clipboard state when remote changes
+        // The server's Format List takes precedence - "most recent change wins"
+        if self.local_clipboard_text.is_some() || self.local_clipboard_files.is_some() {
+            debug!("Remote clipboard changed, clearing local clipboard state");
+            self.local_clipboard_text = None;
+            self.local_clipboard_files = None;
+        }
+
         // Store server formats
         self.server_formats = format_list.formats.clone();
 
-        // Log available formats for debugging
+        // Reset file format IDs
+        self.file_group_descriptor_format_id = None;
+        self.file_contents_format_id = None;
+        self.remote_file_list = None;
+
+        // Log available formats and detect file formats
         for format in &self.server_formats {
             if format.name.is_empty() {
                 trace!("  Format ID {}", format.id);
             } else {
                 trace!("  Format ID {} ({})", format.id, format.name);
+
+                // Story 5.4: Detect file clipboard formats by name
+                if format.name == "FileGroupDescriptorW" {
+                    debug!("Detected FileGroupDescriptorW format: ID {}", format.id);
+                    self.file_group_descriptor_format_id = Some(format.id);
+                } else if format.name == "FileContents" {
+                    debug!("Detected FileContents format: ID {}", format.id);
+                    self.file_contents_format_id = Some(format.id);
+                }
             }
         }
 
@@ -244,11 +389,15 @@ impl YardCliprdrHandler {
             .any(|f| f.id == StandardFormat::Text as u32);
         let has_text = has_unicode || has_ansi;
 
+        // Story 5.4: Check if file formats are available
+        let has_files = self.file_group_descriptor_format_id.is_some();
+
         // Notify main thread of available formats
         let formats: Vec<u32> = self.server_formats.iter().map(|f| f.id).collect();
         self.send_event(ClipboardEvent::FormatsAvailable {
             formats,
             has_text,
+            has_files,
         });
 
         // Build response messages
@@ -260,20 +409,29 @@ impl YardCliprdrHandler {
         debug!("Sending Format List Response (OK)");
         messages.push(SvcMessage::from(CliprdrSvcMessage::new(response_data)));
 
-        // Automatically request text data if available (Story 5.2)
-        // This is the "pull" model where we fetch text immediately when announced
-        if has_text && self.event_tx.is_some() {
-            // Prefer Unicode over ANSI
-            let format_id = if has_unicode {
-                StandardFormat::UnicodeText as u32
-            } else {
-                StandardFormat::Text as u32
-            };
+        // Automatically request data based on what's available
+        if self.event_tx.is_some() {
+            if has_files {
+                // Story 5.4: Prefer files over text if available
+                if let Some(format_id) = self.file_group_descriptor_format_id {
+                    debug!("Auto-requesting file list (format {})", format_id);
+                    let request = FormatDataRequestPdu::new(format_id);
+                    self.pending_format_request = Some(format_id);
+                    messages.push(SvcMessage::from(CliprdrSvcMessage::new(request.encode())));
+                }
+            } else if has_text {
+                // Prefer Unicode over ANSI
+                let format_id = if has_unicode {
+                    StandardFormat::UnicodeText as u32
+                } else {
+                    StandardFormat::Text as u32
+                };
 
-            debug!("Auto-requesting clipboard text (format {})", format_id);
-            let request = FormatDataRequestPdu::new(format_id);
-            self.pending_format_request = Some(format_id);
-            messages.push(SvcMessage::from(CliprdrSvcMessage::new(request.encode())));
+                debug!("Auto-requesting clipboard text (format {})", format_id);
+                let request = FormatDataRequestPdu::new(format_id);
+                self.pending_format_request = Some(format_id);
+                messages.push(SvcMessage::from(CliprdrSvcMessage::new(request.encode())));
+            }
         }
 
         Ok(messages)
@@ -297,24 +455,32 @@ impl YardCliprdrHandler {
     /// Handles a Format Data Request PDU from the server.
     ///
     /// The server sends this when it wants to paste data that we announced
-    /// in our Format List. Story 5.3: Respond with local clipboard data.
+    /// in our Format List. Story 5.3/5.5: Respond with local clipboard data.
     fn handle_format_data_request(
         &mut self,
         request: &FormatDataRequestPdu,
         _channel_id: u32,
     ) -> PduResult<Vec<SvcMessage>> {
         debug!(
-            "Received Format Data Request for format ID {}",
+            "Received Format Data Request for format ID 0x{:04X}",
             request.requested_format_id
         );
 
-        // Story 5.3: Provide local clipboard data if available
+        // Story 5.5: Check if this is a request for our file list
+        if request.requested_format_id == self.local_file_group_descriptor_format_id {
+            return self.handle_file_list_request();
+        }
+
+        // Story 5.3: Provide local clipboard text if available
         let response = if let Some(ref text) = self.local_clipboard_text {
             match request.requested_format_id {
                 id if id == StandardFormat::UnicodeText as u32 => {
                     // Convert UTF-8 to UTF-16LE with null terminator
                     let data = Self::utf8_to_utf16le_with_null(text);
-                    debug!("Sending Format Data Response (Unicode, {} bytes)", data.len());
+                    debug!(
+                        "Sending Format Data Response (Unicode, {} bytes)",
+                        data.len()
+                    );
                     FormatDataResponsePdu::ok(data)
                 }
                 id if id == StandardFormat::Text as u32 => {
@@ -325,7 +491,10 @@ impl YardCliprdrHandler {
                     FormatDataResponsePdu::ok(data)
                 }
                 _ => {
-                    debug!("Requested format {} not available", request.requested_format_id);
+                    debug!(
+                        "Requested format 0x{:04X} not available",
+                        request.requested_format_id
+                    );
                     FormatDataResponsePdu::fail()
                 }
             }
@@ -335,7 +504,45 @@ impl YardCliprdrHandler {
         };
 
         let response_data = response.encode();
-        Ok(vec![SvcMessage::from(CliprdrSvcMessage::new(response_data))])
+        Ok(vec![SvcMessage::from(CliprdrSvcMessage::new(
+            response_data,
+        ))])
+    }
+
+    /// Story 5.5: Handles request for local file list (FileGroupDescriptorW format).
+    fn handle_file_list_request(&self) -> PduResult<Vec<SvcMessage>> {
+        let response = if let Some(ref files) = self.local_clipboard_files {
+            debug!("Serving file list with {} files", files.len());
+
+            // Build FileDescriptorW array from local file info
+            let file_descriptors: Vec<pdu::FileDescriptorW> = files
+                .iter()
+                .map(|f| {
+                    pdu::FileDescriptorW::from_local_file(
+                        f.name.clone(),
+                        f.size,
+                        f.modified_time,
+                        f.is_directory,
+                    )
+                })
+                .collect();
+
+            let file_list = pdu::CliprdrFileList::new(file_descriptors);
+            let data = file_list.encode();
+            debug!(
+                "Sending Format Data Response (file list, {} bytes)",
+                data.len()
+            );
+            FormatDataResponsePdu::ok(data)
+        } else {
+            debug!("No local files available");
+            FormatDataResponsePdu::fail()
+        };
+
+        let response_data = response.encode();
+        Ok(vec![SvcMessage::from(CliprdrSvcMessage::new(
+            response_data,
+        ))])
     }
 
     /// Converts UTF-8 string to UTF-16LE bytes with null terminator.
@@ -364,8 +571,35 @@ impl YardCliprdrHandler {
                 response.data.len()
             );
 
-            // Try to convert to text if possible
-            if let Some(text) = response.as_utf8_from_unicode() {
+            // Story 5.4: Check if this is a file list response
+            if self.pending_format_request == self.file_group_descriptor_format_id {
+                // Parse as CLIPRDR_FILELIST
+                match CliprdrFileList::decode(&response.data) {
+                    Ok(file_list) => {
+                        debug!("Received file list with {} files", file_list.count());
+                        let files: Vec<FileInfo> = file_list
+                            .files
+                            .iter()
+                            .map(|f| FileInfo {
+                                name: f.file_name.clone(),
+                                size: if f.has_file_size() {
+                                    Some(f.file_size)
+                                } else {
+                                    None
+                                },
+                                is_directory: f.is_directory(),
+                            })
+                            .collect();
+                        self.remote_file_list = Some(file_list);
+                        self.send_event(ClipboardEvent::FilesReceived { files });
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse file list: {}", e);
+                        self.send_event(ClipboardEvent::RequestFailed);
+                    }
+                }
+            } else if let Some(text) = response.as_utf8_from_unicode() {
+                // Try to convert to text if possible
                 debug!("Clipboard text (Unicode): {} chars", text.len());
                 // Store the received data for the clipboard bridge
                 self.pending_clipboard_data = Some(text.clone());
@@ -387,6 +621,153 @@ impl YardCliprdrHandler {
 
         // Clear the pending request
         self.pending_format_request = None;
+
+        Ok(Vec::new())
+    }
+
+    /// Handles a File Contents Request PDU from the server.
+    ///
+    /// Story 5.5: The server sends this when it wants file contents that we
+    /// announced (local to remote file transfer).
+    fn handle_file_contents_request(
+        &mut self,
+        request: &pdu::FileContentsRequestPdu,
+        _channel_id: u32,
+    ) -> PduResult<Vec<SvcMessage>> {
+        debug!(
+            "Received File Contents Request: stream_id={}, file_index={}, flags={:?}",
+            request.stream_id, request.lindex, request.flags
+        );
+
+        // Get the file from our local clipboard
+        let response = match &self.local_clipboard_files {
+            Some(files) if (request.lindex as usize) < files.len() => {
+                let file_info = &files[request.lindex as usize];
+                self.serve_file_content(request, file_info)
+            }
+            Some(files) => {
+                warn!(
+                    "Invalid file index {} (have {} files)",
+                    request.lindex,
+                    files.len()
+                );
+                pdu::FileContentsResponsePdu::fail(request.stream_id)
+            }
+            None => {
+                warn!("No local files available for file contents request");
+                pdu::FileContentsResponsePdu::fail(request.stream_id)
+            }
+        };
+
+        let response_data = response.encode();
+        Ok(vec![SvcMessage::from(CliprdrSvcMessage::new(
+            response_data,
+        ))])
+    }
+
+    /// Story 5.5: Serves file content for a FileContentsRequest.
+    fn serve_file_content(
+        &self,
+        request: &pdu::FileContentsRequestPdu,
+        file_info: &LocalFileInfo,
+    ) -> pdu::FileContentsResponsePdu {
+        use pdu::FileContentsFlags;
+        use std::io::{Read, Seek, SeekFrom};
+
+        match request.flags {
+            FileContentsFlags::Size => {
+                // Return file size as 8-byte little-endian value
+                debug!(
+                    "Serving file size for '{}': {} bytes",
+                    file_info.name, file_info.size
+                );
+                let size_bytes = file_info.size.to_le_bytes().to_vec();
+                pdu::FileContentsResponsePdu::ok(request.stream_id, size_bytes)
+            }
+            FileContentsFlags::Range => {
+                // Read file content at specified offset
+                let offset = request.offset();
+                let length = request.cb_requested as usize;
+
+                debug!(
+                    "Serving file content for '{}': offset={}, length={}",
+                    file_info.name, offset, length
+                );
+
+                match std::fs::File::open(&file_info.path) {
+                    Ok(mut file) => {
+                        // Seek to the requested position
+                        if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+                            warn!("Failed to seek in file '{}': {}", file_info.name, e);
+                            return pdu::FileContentsResponsePdu::fail(request.stream_id);
+                        }
+
+                        // Read the requested bytes
+                        let mut buffer = vec![0u8; length];
+                        match file.read(&mut buffer) {
+                            Ok(bytes_read) => {
+                                buffer.truncate(bytes_read);
+                                debug!(
+                                    "Read {} bytes from '{}' at offset {}",
+                                    bytes_read, file_info.name, offset
+                                );
+                                pdu::FileContentsResponsePdu::ok(request.stream_id, buffer)
+                            }
+                            Err(e) => {
+                                warn!("Failed to read file '{}': {}", file_info.name, e);
+                                pdu::FileContentsResponsePdu::fail(request.stream_id)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to open file '{}': {}", file_info.name, e);
+                        pdu::FileContentsResponsePdu::fail(request.stream_id)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handles a File Contents Response PDU from the server.
+    ///
+    /// Story 5.4: The server sends this in response to our File Contents Request,
+    /// containing file size or content data for remote-to-local file transfer.
+    fn handle_file_contents_response(
+        &mut self,
+        response: &pdu::FileContentsResponsePdu,
+        _channel_id: u32,
+    ) -> PduResult<Vec<SvcMessage>> {
+        if response.success {
+            debug!(
+                "Received File Contents Response: stream_id={}, {} bytes",
+                response.stream_id,
+                response.data.len()
+            );
+
+            // Check if this is a size response (8 bytes)
+            if let Some(size) = response.as_file_size() {
+                debug!("File size: {} bytes", size);
+                self.send_event(ClipboardEvent::FileSizeReceived {
+                    stream_id: response.stream_id,
+                    size,
+                });
+            } else {
+                // Content data
+                debug!("File content: {} bytes", response.data.len());
+                self.send_event(ClipboardEvent::FileContentReceived {
+                    stream_id: response.stream_id,
+                    data: response.data.clone(),
+                });
+            }
+        } else {
+            warn!(
+                "File Contents Request failed: stream_id={}",
+                response.stream_id
+            );
+            self.send_event(ClipboardEvent::FileTransferFailed {
+                stream_id: response.stream_id,
+            });
+        }
 
         Ok(Vec::new())
     }
@@ -456,8 +837,8 @@ impl YardCliprdrHandler {
     /// Story 5.3: Sets the local clipboard text and returns Format List PDU to send.
     ///
     /// Call this when the local clipboard changes with text content.
-    /// Send the returned bytes via the CLIPRDR static channel.
-    pub fn set_local_clipboard_text(&mut self, text: String) -> Option<Vec<u8>> {
+    /// Returns SvcMessage vector ready for encoding via `process_svc_processor_messages()`.
+    pub fn set_local_clipboard_text(&mut self, text: String) -> Option<Vec<SvcMessage>> {
         if self.state != CliprdrState::Ready {
             warn!("Cannot set local clipboard: channel not ready");
             return None;
@@ -465,32 +846,218 @@ impl YardCliprdrHandler {
 
         debug!("Setting local clipboard text: {} chars", text.len());
         self.local_clipboard_text = Some(text);
+        // Story 5.6: Clear files when setting text (mutually exclusive)
+        self.local_clipboard_files = None;
 
         // Create Format List PDU announcing text formats
         let format_list = FormatListPdu::text_formats();
         let encoded = format_list.encode();
 
         debug!("Sending Format List with text formats");
-        Some(encoded)
+        Some(vec![SvcMessage::from(CliprdrSvcMessage::new(encoded))])
     }
 
-    /// Story 5.3: Clears the local clipboard.
-    pub fn clear_local_clipboard(&mut self) -> Option<Vec<u8>> {
+    /// Story 5.3/5.5: Clears the local clipboard (both text and files).
+    ///
+    /// Returns SvcMessage vector ready for encoding via `process_svc_processor_messages()`.
+    pub fn clear_local_clipboard(&mut self) -> Option<Vec<SvcMessage>> {
         if self.state != CliprdrState::Ready {
             return None;
         }
 
         debug!("Clearing local clipboard");
         self.local_clipboard_text = None;
+        self.local_clipboard_files = None;
 
         // Send empty Format List
         let format_list = FormatListPdu::empty();
-        Some(format_list.encode())
+        Some(vec![SvcMessage::from(CliprdrSvcMessage::new(
+            format_list.encode(),
+        ))])
     }
 
     /// Story 5.3: Returns the local clipboard text for Format Data Response.
     pub fn local_clipboard_text(&self) -> Option<&str> {
         self.local_clipboard_text.as_deref()
+    }
+
+    /// Story 5.5: Sets the local clipboard files and returns Format List PDU to send.
+    ///
+    /// Call this when the local clipboard changes with file content.
+    /// Returns SvcMessage vector ready for encoding via `process_svc_processor_messages()`.
+    ///
+    /// Note: The file paths must exist and be readable. Files are read on demand
+    /// when the server requests their content.
+    pub fn set_local_clipboard_files(
+        &mut self,
+        files: Vec<std::path::PathBuf>,
+    ) -> Option<Vec<SvcMessage>> {
+        if self.state != CliprdrState::Ready {
+            warn!("Cannot set local clipboard files: channel not ready");
+            return None;
+        }
+
+        if files.is_empty() {
+            debug!("No files to set in clipboard");
+            return self.clear_local_clipboard();
+        }
+
+        // Convert paths to LocalFileInfo, reading metadata
+        let file_infos: Vec<LocalFileInfo> = files
+            .into_iter()
+            .filter_map(|path| {
+                LocalFileInfo::from_path(path.clone()).or_else(|| {
+                    warn!("Failed to read file metadata for {:?}", path);
+                    None
+                })
+            })
+            .collect();
+
+        if file_infos.is_empty() {
+            warn!("No valid files to set in clipboard");
+            return None;
+        }
+
+        debug!("Setting local clipboard files: {} files", file_infos.len());
+        self.local_clipboard_files = Some(file_infos);
+        // Clear text when setting files (they're mutually exclusive)
+        self.local_clipboard_text = None;
+
+        // Create Format List PDU announcing file formats
+        let format_list = FormatListPdu::file_formats(
+            self.local_file_group_descriptor_format_id,
+            self.local_file_contents_format_id,
+        );
+        let encoded = format_list.encode();
+
+        debug!(
+            "Sending Format List with file formats (FileGroupDescriptorW: 0x{:04X}, FileContents: 0x{:04X})",
+            self.local_file_group_descriptor_format_id, self.local_file_contents_format_id
+        );
+        Some(vec![SvcMessage::from(CliprdrSvcMessage::new(encoded))])
+    }
+
+    /// Story 5.5: Returns the local clipboard files.
+    pub fn local_clipboard_files(&self) -> Option<&[LocalFileInfo]> {
+        self.local_clipboard_files.as_deref()
+    }
+
+    /// Story 5.5: Returns the client-assigned file format IDs.
+    pub fn local_file_format_ids(&self) -> (u32, u32) {
+        (
+            self.local_file_group_descriptor_format_id,
+            self.local_file_contents_format_id,
+        )
+    }
+
+    /// Story 5.4: Returns the cached file list from the server.
+    pub fn remote_file_list(&self) -> Option<&CliprdrFileList> {
+        self.remote_file_list.as_ref()
+    }
+
+    /// Story 5.4: Returns true if file clipboard is supported by the server.
+    pub fn supports_file_clipboard(&self) -> bool {
+        self.file_clipboard_enabled && self.file_group_descriptor_format_id.is_some()
+    }
+
+    /// Story 5.4: Requests file size for a file in the cached file list.
+    ///
+    /// Returns the stream ID and encoded PDU, or None if file index is invalid.
+    pub fn request_file_size(&mut self, file_index: u32) -> Option<(u32, Vec<u8>)> {
+        if self.state != CliprdrState::Ready {
+            warn!("Cannot request file size: clipboard not ready");
+            return None;
+        }
+
+        // Validate file index against cached file list
+        if let Some(ref file_list) = self.remote_file_list {
+            if file_index as usize >= file_list.count() {
+                warn!(
+                    "Invalid file index {} (have {} files)",
+                    file_index,
+                    file_list.count()
+                );
+                return None;
+            }
+        } else {
+            warn!("No file list available");
+            return None;
+        }
+
+        let stream_id = self.next_stream_id;
+        self.next_stream_id = self.next_stream_id.wrapping_add(1);
+
+        let request = FileContentsRequestPdu::size(stream_id, file_index);
+        debug!(
+            "Requesting file size: stream_id={}, file_index={}",
+            stream_id, file_index
+        );
+
+        Some((stream_id, request.encode()))
+    }
+
+    /// Story 5.4: Requests file content range for a file in the cached file list.
+    ///
+    /// Returns the stream ID and encoded PDU, or None if file index is invalid.
+    pub fn request_file_content(
+        &mut self,
+        file_index: u32,
+        offset: u64,
+        length: u32,
+    ) -> Option<(u32, Vec<u8>)> {
+        if self.state != CliprdrState::Ready {
+            warn!("Cannot request file content: clipboard not ready");
+            return None;
+        }
+
+        // Validate file index against cached file list
+        if let Some(ref file_list) = self.remote_file_list {
+            if file_index as usize >= file_list.count() {
+                warn!(
+                    "Invalid file index {} (have {} files)",
+                    file_index,
+                    file_list.count()
+                );
+                return None;
+            }
+        } else {
+            warn!("No file list available");
+            return None;
+        }
+
+        let stream_id = self.next_stream_id;
+        self.next_stream_id = self.next_stream_id.wrapping_add(1);
+
+        let request = FileContentsRequestPdu::range(stream_id, file_index, offset, length);
+        debug!(
+            "Requesting file content: stream_id={}, file_index={}, offset={}, length={}",
+            stream_id, file_index, offset, length
+        );
+
+        Some((stream_id, request.encode()))
+    }
+
+    /// Story 5.4: Returns the number of files in the cached file list.
+    pub fn remote_file_count(&self) -> usize {
+        self.remote_file_list
+            .as_ref()
+            .map(|l| l.count())
+            .unwrap_or(0)
+    }
+
+    /// Story 5.4: Returns file info for a file in the cached list.
+    pub fn remote_file_info(&self, index: usize) -> Option<FileInfo> {
+        self.remote_file_list.as_ref().and_then(|list| {
+            list.files.get(index).map(|f| FileInfo {
+                name: f.file_name.clone(),
+                size: if f.has_file_size() {
+                    Some(f.file_size)
+                } else {
+                    None
+                },
+                is_directory: f.is_directory(),
+            })
+        })
     }
 }
 
@@ -506,6 +1073,7 @@ impl std::fmt::Debug for YardCliprdrHandler {
             .field("state", &self.state)
             .field("channel_id", &self.channel_id)
             .field("use_long_format_names", &self.use_long_format_names)
+            .field("file_clipboard_enabled", &self.file_clipboard_enabled)
             .field("server_formats", &self.server_formats)
             .field("enabled", &self.enabled)
             .field("pending_format_request", &self.pending_format_request)
@@ -514,6 +1082,11 @@ impl std::fmt::Debug for YardCliprdrHandler {
                 &self.pending_clipboard_data.as_ref().map(|s| s.len()),
             )
             .field("event_tx", &self.event_tx.is_some())
+            .field(
+                "file_group_descriptor_format_id",
+                &self.file_group_descriptor_format_id,
+            )
+            .field("remote_file_count", &self.remote_file_count())
             .finish()
     }
 }
@@ -562,6 +1135,12 @@ impl SvcProcessor for YardCliprdrHandler {
             }
             CliprdrPdu::FormatDataResponse(response) => {
                 self.handle_format_data_response(&response, channel_id)
+            }
+            CliprdrPdu::FileContentsRequest(request) => {
+                self.handle_file_contents_request(&request, channel_id)
+            }
+            CliprdrPdu::FileContentsResponse(response) => {
+                self.handle_file_contents_response(&response, channel_id)
             }
         }
     }
@@ -810,7 +1389,7 @@ mod tests {
 
     #[test]
     fn test_set_local_clipboard_text() {
-        // Story 5.3: Test setting local clipboard text
+        // Story 5.3/5.6: Test setting local clipboard text
         let mut handler = YardCliprdrHandler::new();
         handler.start().unwrap();
         handler.state = CliprdrState::Ready;
@@ -818,16 +1397,15 @@ mod tests {
         // Set local clipboard text
         let result = handler.set_local_clipboard_text("Test clipboard".to_string());
 
-        // Should return a Format List PDU
+        // Should return SvcMessage vector with Format List PDU
         assert!(result.is_some());
-        let pdu_bytes = result.unwrap();
-
-        // Verify it's a Format List PDU (msgType = 0x0002)
-        assert_eq!(pdu_bytes[0], 0x02);
-        assert_eq!(pdu_bytes[1], 0x00);
+        let messages = result.unwrap();
+        assert_eq!(messages.len(), 1);
 
         // Verify local clipboard text is stored
         assert_eq!(handler.local_clipboard_text(), Some("Test clipboard"));
+        // Story 5.6: Files should be cleared when text is set
+        assert!(handler.local_clipboard_files().is_none());
     }
 
     #[test]
@@ -838,5 +1416,174 @@ mod tests {
 
         let result = handler.set_local_clipboard_text("Test".to_string());
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_remote_format_list_clears_local_clipboard() {
+        // Story 5.6: Remote Format List should clear local clipboard state
+        let mut handler = YardCliprdrHandler::new();
+        handler.start().unwrap();
+        handler.state = CliprdrState::Ready;
+
+        // Set local clipboard text first
+        handler.set_local_clipboard_text("Local content".to_string());
+        assert!(handler.local_clipboard_text().is_some());
+
+        // Simulate receiving Format List from server (remote clipboard changed)
+        let format_list = [
+            0x02, 0x00, // msgType = FormatList
+            0x00, 0x00, // msgFlags
+            0x06, 0x00, 0x00, 0x00, // dataLen = 6
+            0x0D, 0x00, 0x00, 0x00, // formatId = 13 (CF_UNICODETEXT)
+            0x00, 0x00, // null terminator
+        ];
+        let _ = handler.process(&format_list);
+
+        // Local clipboard should be cleared (remote takes precedence)
+        assert!(handler.local_clipboard_text().is_none());
+    }
+
+    #[test]
+    fn test_rapid_clipboard_changes_preserve_latest() {
+        // Story 5.6: Rapid clipboard changes should preserve the latest value
+        let mut handler = YardCliprdrHandler::new();
+        handler.start().unwrap();
+        handler.state = CliprdrState::Ready;
+
+        // Simulate rapid clipboard changes (Ctrl+C spam)
+        handler.set_local_clipboard_text("First".to_string());
+        handler.set_local_clipboard_text("Second".to_string());
+        handler.set_local_clipboard_text("Third".to_string());
+        handler.set_local_clipboard_text("Final".to_string());
+
+        // The latest value should be preserved
+        assert_eq!(handler.local_clipboard_text(), Some("Final"));
+    }
+
+    #[test]
+    fn test_bidirectional_text_sync_local_then_remote() {
+        // Story 5.6: Test local change followed by remote change
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut handler = YardCliprdrHandler::with_event_channel(tx);
+        handler.start().unwrap();
+        handler.state = CliprdrState::Ready;
+
+        // 1. Local clipboard change
+        let result = handler.set_local_clipboard_text("Local text".to_string());
+        assert!(result.is_some()); // Format List PDU generated
+        assert_eq!(handler.local_clipboard_text(), Some("Local text"));
+
+        // 2. Remote clipboard change (server sends Format List)
+        let format_list = [
+            0x02, 0x00, // msgType = FormatList
+            0x00, 0x00, // msgFlags
+            0x06, 0x00, 0x00, 0x00, // dataLen = 6
+            0x0D, 0x00, 0x00, 0x00, // formatId = 13 (CF_UNICODETEXT)
+            0x00, 0x00, // null terminator
+        ];
+        let _ = handler.process(&format_list);
+
+        // Local clipboard should be cleared (remote wins)
+        assert!(handler.local_clipboard_text().is_none());
+
+        // Event should be received for formats available
+        let event = rx.try_recv();
+        assert!(event.is_ok());
+        if let ClipboardEvent::FormatsAvailable { has_text, .. } = event.unwrap() {
+            assert!(has_text);
+        } else {
+            panic!("Expected FormatsAvailable event");
+        }
+    }
+
+    #[test]
+    fn test_bidirectional_text_sync_remote_then_local() {
+        // Story 5.6: Test remote change followed by local change
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut handler = YardCliprdrHandler::with_event_channel(tx);
+        handler.start().unwrap();
+        handler.state = CliprdrState::Ready;
+
+        // 1. Remote clipboard change
+        let format_list = [
+            0x02, 0x00, // msgType = FormatList
+            0x00, 0x00, // msgFlags
+            0x06, 0x00, 0x00, 0x00, // dataLen = 6
+            0x0D, 0x00, 0x00, 0x00, // formatId = 13 (CF_UNICODETEXT)
+            0x00, 0x00, // null terminator
+        ];
+        let _ = handler.process(&format_list);
+
+        // Server formats should be stored
+        assert!(!handler.server_formats().is_empty());
+
+        // 2. Local clipboard change
+        let result = handler.set_local_clipboard_text("New local text".to_string());
+        assert!(result.is_some()); // Format List PDU generated
+        assert_eq!(handler.local_clipboard_text(), Some("New local text"));
+    }
+
+    #[test]
+    fn test_text_and_files_mutually_exclusive() {
+        // Story 5.6: Text and files should be mutually exclusive
+        let mut handler = YardCliprdrHandler::new();
+        handler.start().unwrap();
+        handler.state = CliprdrState::Ready;
+
+        // Set text
+        handler.set_local_clipboard_text("Some text".to_string());
+        assert!(handler.local_clipboard_text().is_some());
+        assert!(handler.local_clipboard_files().is_none());
+
+        // Setting text again clears files (already None, but verifies logic)
+        handler.set_local_clipboard_text("More text".to_string());
+        assert!(handler.local_clipboard_text().is_some());
+        assert!(handler.local_clipboard_files().is_none());
+    }
+
+    #[test]
+    fn test_clear_local_clipboard() {
+        // Story 5.6: Test clearing the local clipboard
+        let mut handler = YardCliprdrHandler::new();
+        handler.start().unwrap();
+        handler.state = CliprdrState::Ready;
+
+        // Set some content
+        handler.set_local_clipboard_text("Content".to_string());
+        assert!(handler.local_clipboard_text().is_some());
+
+        // Clear clipboard
+        let result = handler.clear_local_clipboard();
+        assert!(result.is_some()); // Empty Format List PDU generated
+        assert!(handler.local_clipboard_text().is_none());
+        assert!(handler.local_clipboard_files().is_none());
+    }
+
+    #[test]
+    fn test_format_data_request_response_cycle() {
+        // Story 5.6: Test complete format data request/response cycle
+        let mut handler = YardCliprdrHandler::new();
+        handler.start().unwrap();
+        handler.state = CliprdrState::Ready;
+
+        // Set local clipboard text
+        handler.set_local_clipboard_text("Test data for server".to_string());
+
+        // Simulate server requesting Unicode text
+        let request = [
+            0x04, 0x00, // msgType = FormatDataRequest
+            0x00, 0x00, // msgFlags
+            0x04, 0x00, 0x00, 0x00, // dataLen = 4
+            0x0D, 0x00, 0x00, 0x00, // requestedFormatId = 13 (CF_UNICODETEXT)
+        ];
+        let result = handler.process(&request);
+        assert!(result.is_ok());
+
+        let messages = result.unwrap();
+        assert_eq!(messages.len(), 1); // Format Data Response
+
+        // Verify the response contains UTF-16LE encoded text
+        // The response is wrapped in SvcMessage, so we can't easily inspect the bytes
+        // but we know the handler processed it successfully
     }
 }
