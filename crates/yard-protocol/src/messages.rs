@@ -582,6 +582,14 @@ pub enum FromNetwork {
         /// Stream ID of the failed request.
         stream_id: u32,
     },
+    /// Story 6.4: Latency update from network thread.
+    ///
+    /// Sent periodically with the measured round-trip time (RTT) to the server.
+    /// The main thread uses this to update the overlay's quality indicator.
+    LatencyUpdate {
+        /// Round-trip time in milliseconds.
+        rtt_ms: u32,
+    },
 }
 
 /// Error types for connection failures.
@@ -1260,5 +1268,23 @@ mod tests {
         let msg = FromNetwork::ClipboardRequestFailed;
         let debug = format!("{:?}", msg);
         assert!(debug.contains("ClipboardRequestFailed"));
+    }
+
+    // Story 6.4: Latency update tests
+
+    #[test]
+    fn test_from_network_latency_update() {
+        let msg = FromNetwork::LatencyUpdate { rtt_ms: 42 };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("LatencyUpdate"));
+        assert!(debug.contains("42"));
+    }
+
+    #[test]
+    fn test_from_network_latency_update_high() {
+        let msg = FromNetwork::LatencyUpdate { rtt_ms: 500 };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("LatencyUpdate"));
+        assert!(debug.contains("500"));
     }
 }

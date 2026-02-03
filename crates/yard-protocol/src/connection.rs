@@ -403,6 +403,19 @@ async fn handle_connect(
     let _ = tx.send(FromNetwork::Disconnected).await;
 }
 
+/// Interval between RTT measurements (in seconds).
+///
+/// Set to 5 seconds as a balance between responsiveness (user sees latency changes quickly)
+/// and overhead (not flooding the main thread with updates). This aligns with typical
+/// network monitoring tools that report RTT every few seconds.
+const RTT_MEASUREMENT_INTERVAL_SECS: u64 = 5;
+
+/// Maximum age of RTT samples before they're considered stale (in seconds).
+///
+/// If no new input is sent for this duration, old RTT samples are discarded
+/// to avoid reporting outdated latency measurements.
+const RTT_SAMPLE_MAX_AGE_SECS: u64 = 30;
+
 /// Session loop that processes RDP frames and handles user input.
 async fn session_loop<S>(
     framed: &mut Framed<TokioStream<S>>,
@@ -419,6 +432,20 @@ where
 
     // Input database for tracking keyboard/mouse state and generating FastPath events
     let mut input_database = InputDatabase::new();
+
+    // Story 6.4: RTT measurement state
+    // Track timestamps when we send input to measure response latency
+    let mut last_input_sent: Option<tokio::time::Instant> = None;
+    // Use VecDeque for O(1) push_back/pop_front (rolling window)
+    let mut rtt_samples: std::collections::VecDeque<u32> = std::collections::VecDeque::with_capacity(10);
+    // Track when last sample was added to detect staleness
+    let mut last_sample_time = tokio::time::Instant::now();
+
+    // Create interval for periodic RTT reporting
+    let mut rtt_interval =
+        tokio::time::interval(Duration::from_secs(RTT_MEASUREMENT_INTERVAL_SECS));
+    // Skip the first immediate tick
+    rtt_interval.tick().await;
 
     loop {
         // Use select to handle both incoming PDUs and outgoing input events
@@ -439,6 +466,19 @@ where
                             framed.write_all(&response).await?;
                         }
                         ActiveStageOutput::GraphicsUpdate(rect) => {
+                            // Story 6.4: Measure RTT when we receive graphics after input
+                            if let Some(input_time) = last_input_sent.take() {
+                                let elapsed = input_time.elapsed();
+                                // Cap RTT at u32::MAX to avoid overflow (saturating conversion)
+                                let rtt_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
+                                // Keep last 10 samples for smoothing (O(1) with VecDeque)
+                                if rtt_samples.len() >= 10 {
+                                    rtt_samples.pop_front();
+                                }
+                                rtt_samples.push_back(rtt_ms);
+                                last_sample_time = tokio::time::Instant::now();
+                            }
+
                             // Extract the updated region and send to main thread
                             let x = rect.left;
                             let y = rect.top;
@@ -581,6 +621,9 @@ where
                         let events = input_database.apply([operation]);
 
                         if !events.is_empty() {
+                            // Story 6.4: Record timestamp for RTT measurement
+                            last_input_sent = Some(tokio::time::Instant::now());
+
                             // Process the input events through ActiveStage
                             // This encodes them and may produce response frames
                             // Note: We log errors instead of propagating to avoid disconnecting
@@ -613,6 +656,8 @@ where
                         let events = input_database.apply([operation]);
 
                         if !events.is_empty() {
+                            // Story 6.4: Record timestamp for RTT measurement
+                            last_input_sent = Some(tokio::time::Instant::now());
                             match active_stage.process_fastpath_input(image, &events) {
                                 Ok(outputs) => {
                                     for output in outputs {
@@ -671,6 +716,11 @@ where
                         let events = input_database.apply([pos_operation, operation]);
 
                         if !events.is_empty() {
+                            // Story 6.4: Record timestamp for RTT measurement (button press)
+                            if pressed {
+                                last_input_sent = Some(tokio::time::Instant::now());
+                            }
+
                             match active_stage.process_fastpath_input(image, &events) {
                                 Ok(outputs) => {
                                     for output in outputs {
@@ -890,6 +940,23 @@ where
                         info!("Main thread disconnected");
                         return Ok(());
                     }
+                }
+            }
+
+            // Story 6.4: Periodic RTT reporting to main thread
+            _ = rtt_interval.tick() => {
+                // Clear stale samples if no input for too long
+                if last_sample_time.elapsed().as_secs() > RTT_SAMPLE_MAX_AGE_SECS {
+                    rtt_samples.clear();
+                }
+
+                // Calculate average RTT from samples using saturating arithmetic
+                if !rtt_samples.is_empty() {
+                    // Use saturating_add to prevent overflow with extreme RTT values
+                    let sum: u32 = rtt_samples.iter().fold(0u32, |acc, &x| acc.saturating_add(x));
+                    let avg_rtt = sum / rtt_samples.len() as u32;
+                    let _ = tx.send(FromNetwork::LatencyUpdate { rtt_ms: avg_rtt }).await;
+                    debug!("RTT update: {}ms (from {} samples)", avg_rtt, rtt_samples.len());
                 }
             }
         }
@@ -1625,5 +1692,11 @@ mod tests {
         let monitors_bad = [RdpMonitorInfo::new(100, 50, 1920, 1080, true)];
         let primary = monitors_bad.iter().find(|m| m.is_primary).unwrap();
         assert_ne!(primary.x, 0); // This would trigger a warning in send_monitor_layout
+    }
+
+    // Story 6.4: RTT measurement interval constant
+    #[test]
+    fn test_rtt_measurement_interval_constant() {
+        assert_eq!(RTT_MEASUREMENT_INTERVAL_SECS, 5);
     }
 }

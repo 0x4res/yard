@@ -499,8 +499,9 @@ fn run_event_loop(
             | Some(FromNetwork::ClipboardFilesReceived { .. })
             | Some(FromNetwork::ClipboardFileSizeReceived { .. })
             | Some(FromNetwork::ClipboardFileContentReceived { .. })
-            | Some(FromNetwork::ClipboardFileTransferFailed { .. }) => {
-                // Story 5.2/5.4: Clipboard events during setup phase - ignore
+            | Some(FromNetwork::ClipboardFileTransferFailed { .. })
+            | Some(FromNetwork::LatencyUpdate { .. }) => {
+                // Story 5.2/5.4/6.4: Clipboard and latency events during setup phase - ignore
             }
             None => {
                 error!("Network thread terminated unexpectedly");
@@ -600,17 +601,32 @@ fn run_event_loop(
         .to_string();
 
     // Set initial overlay content (connected state)
-    window.update_overlay_content(OverlayContent {
-        status: ConnectionStatus::Connected,
-        server_name: Some(server_name.clone()),
-        session_duration: Some(session_start.elapsed()),
-        rtt_ms: None,
-        reconnect_attempt: None,
-        disconnect_reason: None,
-    });
+    window.update_overlay_content(build_connected_overlay(&server_name, session_start, None));
 
     // Story 5.4: File transfer manager for clipboard file downloads
     let mut file_transfer_manager: Option<FileTransferManager> = None;
+
+    // Story 6.4: Track latest RTT for overlay display
+    let mut latest_rtt_ms: Option<u32> = None;
+    // Track last overlay update time for duration refresh
+    let mut last_overlay_update = std::time::Instant::now();
+
+    /// Story 6.4: Helper to build connected state overlay content.
+    /// Reduces duplication across multiple update sites.
+    fn build_connected_overlay(
+        server_name: &str,
+        session_start: std::time::Instant,
+        rtt_ms: Option<u32>,
+    ) -> OverlayContent {
+        OverlayContent {
+            status: ConnectionStatus::Connected,
+            server_name: Some(server_name.to_string()),
+            session_duration: Some(session_start.elapsed()),
+            rtt_ms,
+            reconnect_attempt: None,
+            disconnect_reason: None,
+        }
+    }
 
     // Main event loop
     // NOTE: Network channel is polled manually via try_recv. Future optimization could
@@ -691,6 +707,18 @@ fn run_event_loop(
                 }
                 Ok(FromNetwork::MultiMonitorNotSupported) => {
                     // Already warned during connection
+                }
+                // Story 6.4: Handle latency updates from network thread
+                Ok(FromNetwork::LatencyUpdate { rtt_ms }) => {
+                    latest_rtt_ms = Some(rtt_ms);
+                    // Update overlay with new RTT if visible
+                    if window.is_overlay_visible() {
+                        window.update_overlay_content(build_connected_overlay(
+                            &server_name,
+                            session_start,
+                            Some(rtt_ms),
+                        ));
+                    }
                 }
                 Ok(FromNetwork::ClipboardTextAvailable { formats }) => {
                     // Story 5.2: Server has text on clipboard
@@ -880,6 +908,17 @@ fn run_event_loop(
         // Story 6.1: Update overlay hide timer
         // This must be called periodically to check if the hide delay has expired
         window.update_overlay_timer();
+
+        // Story 6.4: Refresh overlay duration every second while visible
+        // This ensures the session duration updates in real-time (AC1)
+        if window.is_overlay_visible() && last_overlay_update.elapsed().as_secs() >= 1 {
+            window.update_overlay_content(build_connected_overlay(
+                &server_name,
+                session_start,
+                latest_rtt_ms,
+            ));
+            last_overlay_update = std::time::Instant::now();
+        }
 
         // Check window events (includes close request from WindowHandler)
         while let Ok(event) = event_rx.try_recv() {
@@ -1156,15 +1195,15 @@ fn run_event_loop(
                         visible, monitor_id
                     );
                     // Story 6.2: Update session duration when overlay becomes visible
+                    // Story 6.4: Also include latest RTT measurement
                     if visible {
-                        window.update_overlay_content(OverlayContent {
-                            status: ConnectionStatus::Connected,
-                            server_name: Some(server_name.clone()),
-                            session_duration: Some(session_start.elapsed()),
-                            rtt_ms: None,
-                            reconnect_attempt: None,
-                            disconnect_reason: None,
-                        });
+                        window.update_overlay_content(build_connected_overlay(
+                            &server_name,
+                            session_start,
+                            latest_rtt_ms,
+                        ));
+                        // Reset timer so duration updates start from this point
+                        last_overlay_update = std::time::Instant::now();
                     }
                 }
                 // Story 6.3: Handle disconnect button click
@@ -1316,6 +1355,10 @@ fn run_event_loop(
             Some(FromNetwork::MultiMonitorNotSupported) => {
                 // Server doesn't support multi-monitor, continue with single monitor
                 warn!("Server does not support multi-monitor mode");
+            }
+            // Story 6.4: Latency update (no UI on non-Linux)
+            Some(FromNetwork::LatencyUpdate { rtt_ms }) => {
+                debug!("RTT update: {}ms", rtt_ms);
             }
             Some(FromNetwork::ClipboardTextAvailable { formats }) => {
                 // Story 5.2: Server has text on clipboard
