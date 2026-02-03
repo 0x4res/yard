@@ -39,15 +39,24 @@ mod linux {
     use smithay_client_toolkit::data_device_manager::{
         DataDeviceManagerState, ReadPipe, WritePipe,
     };
+    use smithay_client_toolkit::shell::wlr_layer::{
+        Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+        LayerSurfaceConfigure,
+    };
     use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
     use smithay_client_toolkit::shm::{Shm, ShmHandler};
     use smithay_client_toolkit::{
-        delegate_compositor, delegate_data_device, delegate_keyboard, delegate_output,
-        delegate_pointer, delegate_registry, delegate_seat, delegate_shm, delegate_xdg_shell,
-        delegate_xdg_window, registry_handlers,
+        delegate_compositor, delegate_data_device, delegate_keyboard, delegate_layer,
+        delegate_output, delegate_pointer, delegate_registry, delegate_seat, delegate_shm,
+        delegate_xdg_shell, delegate_xdg_window, registry_handlers,
     };
     use std::collections::{HashMap, HashSet};
     use std::io::{Read, Write};
+
+    use crate::overlay::{
+        generate_overlay_buffer_with_content, ConnectionStatus, OverlayContent,
+        OverlayController, OverlayState, OVERLAY_BG_COLOR, OVERLAY_HEIGHT,
+    };
 
     /// Information about a connected monitor (Story 3.1).
     ///
@@ -717,6 +726,20 @@ mod linux {
             /// The clipboard text content (UTF-8).
             text: String,
         },
+        /// Story 5.5: Local clipboard changed with file content.
+        /// Emitted when another application copies files to the clipboard.
+        LocalClipboardFilesChanged {
+            /// The file paths that were copied.
+            files: Vec<std::path::PathBuf>,
+        },
+        /// Story 6.1: Overlay visibility changed.
+        /// Emitted when the overlay is shown or hidden.
+        OverlayVisibilityChanged {
+            /// Whether the overlay is now visible.
+            visible: bool,
+            /// The monitor ID where the overlay is shown (if visible).
+            monitor_id: Option<u32>,
+        },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -726,6 +749,176 @@ mod linux {
         ToggleFullscreen,
         /// Disconnect from remote session (Ctrl+Alt+End).
         Disconnect,
+    }
+
+    /// Story 6.1: Overlay surface using wlr-layer-shell.
+    ///
+    /// This struct wraps a layer surface that renders the overlay bar
+    /// at the top of a monitor. The overlay appears when the user hovers
+    /// near the top edge and provides client controls.
+    pub struct OverlaySurface {
+        /// The layer surface for the overlay.
+        layer_surface: LayerSurface,
+        /// The underlying Wayland surface.
+        surface: WlSurface,
+        /// Buffer pool for overlay rendering.
+        pool: SlotPool,
+        /// Current buffer attached to the surface.
+        buffer: Option<Buffer>,
+        /// Width of the overlay (matches monitor width).
+        width: u32,
+        /// Height of the overlay bar.
+        height: u32,
+        /// Whether the surface has been configured by the compositor.
+        configured: bool,
+    }
+
+    impl OverlaySurface {
+        /// Creates a new overlay surface for a specific monitor.
+        ///
+        /// # Arguments
+        /// * `layer_shell` - The layer shell binding
+        /// * `compositor` - The compositor state for creating surfaces
+        /// * `shm` - The shared memory state for creating buffer pools
+        /// * `qh` - The queue handle for creating Wayland objects
+        /// * `output` - The target output (monitor) for the overlay, or None for default
+        /// * `width` - Width of the overlay (should match monitor width)
+        /// * `height` - Height of the overlay bar
+        pub fn new(
+            layer_shell: &LayerShell,
+            compositor: &CompositorState,
+            shm: &Shm,
+            qh: &QueueHandle<WaylandWindow>,
+            output: Option<&WlOutput>,
+            width: u32,
+            height: u32,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            // Create the underlying Wayland surface
+            let surface = compositor.create_surface(qh);
+
+            // Create layer surface
+            let layer_surface = layer_shell.create_layer_surface(
+                qh,
+                surface.clone(),
+                Layer::Overlay, // Render above everything
+                Some("yard-overlay"),
+                output,
+            );
+
+            // Configure the layer surface
+            // Anchor to top edge, spanning full width
+            layer_surface.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+            // Set size: width 0 means stretch to anchors, height is fixed
+            layer_surface.set_size(0, height);
+            // No exclusive zone - don't push other windows
+            layer_surface.set_exclusive_zone(0);
+            // Get keyboard focus only when interacting
+            layer_surface.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+
+            // Initial commit to get configure event
+            layer_surface.commit();
+
+            // Create buffer pool for overlay rendering
+            let buffer_size = (width * height * 4) as usize;
+            let pool = SlotPool::new(buffer_size, shm)?;
+
+            tracing::debug!(
+                "Created OverlaySurface {}x{} for output {:?}",
+                width,
+                height,
+                output.map(|o| o.id())
+            );
+
+            Ok(Self {
+                layer_surface,
+                surface,
+                pool,
+                buffer: None,
+                width,
+                height,
+                configured: false,
+            })
+        }
+
+        /// Returns whether the surface has been configured by the compositor.
+        pub fn is_configured(&self) -> bool {
+            self.configured
+        }
+
+        /// Marks the surface as configured.
+        pub fn set_configured(&mut self, width: u32, height: u32) {
+            if width > 0 {
+                self.width = width;
+            }
+            if height > 0 {
+                self.height = height;
+            }
+            self.configured = true;
+        }
+
+        /// Renders the overlay with connection status content.
+        ///
+        /// Call this after the surface is configured.
+        ///
+        /// # Story 6.2
+        /// Updated to accept `OverlayContent` for displaying connection status.
+        pub fn render(&mut self, content: &OverlayContent) -> Result<(), Box<dyn std::error::Error>> {
+            if !self.configured {
+                tracing::trace!("OverlaySurface not yet configured, skipping render");
+                return Ok(());
+            }
+
+            let width = self.width;
+            let height = self.height;
+            let stride = width * 4;
+            let size = (stride * height) as usize;
+
+            // Resize pool if needed
+            if self.pool.len() < size {
+                self.pool.resize(size)?;
+            }
+
+            // Create buffer
+            let (buffer, canvas) = self
+                .pool
+                .create_buffer(
+                    width as i32,
+                    height as i32,
+                    stride as i32,
+                    WlShmFormat::Argb8888,
+                )
+                .map_err(|e| format!("Failed to create overlay buffer: {e}"))?;
+
+            // Generate overlay content with connection status (Story 6.2)
+            let overlay_data = generate_overlay_buffer_with_content(width, height, content);
+            canvas[..overlay_data.len()].copy_from_slice(&overlay_data);
+
+            // Attach and commit
+            self.surface
+                .attach(Some(buffer.wl_buffer()), 0, 0);
+            self.surface
+                .damage_buffer(0, 0, width as i32, height as i32);
+            self.surface.commit();
+
+            self.buffer = Some(buffer);
+
+            tracing::trace!("Rendered overlay {}x{} with status {:?}", width, height, content.status);
+            Ok(())
+        }
+
+        /// Destroys the overlay surface (called when hiding).
+        ///
+        /// Note: In Wayland, surfaces are destroyed when dropped.
+        /// This method provides explicit cleanup.
+        pub fn destroy(self) {
+            tracing::trace!("Destroying OverlaySurface");
+            // Drop happens automatically, which destroys the layer surface
+        }
+
+        /// Returns a reference to the layer surface.
+        pub fn layer_surface(&self) -> &LayerSurface {
+            &self.layer_surface
+        }
     }
 
     /// Configuration for creating a Wayland window.
@@ -846,12 +1039,30 @@ mod linux {
         /// When this is set, the window should offer it to the Wayland compositor
         /// so local applications can paste it.
         clipboard_text: Option<String>,
+        /// Story 5.4: Cached clipboard file paths from remote server.
+        /// These are file:// URIs pointing to downloaded files in the staging directory.
+        clipboard_files: Option<Vec<std::path::PathBuf>>,
+        /// Story 5.6: Last local clipboard text sent to server (for deduplication).
+        /// Prevents sending duplicate Format List PDUs when the same content is copied.
+        last_local_clipboard_text: Option<String>,
+        /// Story 5.6: Last local clipboard files sent to server (for deduplication).
+        last_local_clipboard_files: Option<Vec<std::path::PathBuf>>,
         /// Data device manager for clipboard operations (Story 5.2, 5.3).
         data_device_manager: DataDeviceManagerState,
         /// Data device for clipboard operations (per seat).
         data_device: Option<smithay_client_toolkit::data_device_manager::data_device::DataDevice>,
         /// Active clipboard data source (must be kept alive while offering).
         clipboard_source: Option<smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource>,
+        /// Story 6.1: Layer shell protocol binding (optional, wlroots-based compositors only).
+        /// None if the compositor doesn't support wlr-layer-shell.
+        layer_shell: Option<LayerShell>,
+        /// Story 6.1: Overlay controller for managing visibility state and timing.
+        overlay_controller: OverlayController,
+        /// Story 6.1: Active overlay layer surface (one per monitor in multi-monitor mode).
+        /// Maps monitor ID to layer surface for that monitor's overlay.
+        overlay_surfaces: HashMap<u32, OverlaySurface>,
+        /// Story 6.2: Current content to display in the overlay.
+        overlay_content: OverlayContent,
     }
 
     impl WaylandWindow {
@@ -891,6 +1102,18 @@ mod linux {
             let seat_state = SeatState::new(&globals, &qh);
             // Story 5.2/5.3: Data device manager for clipboard operations
             let data_device_manager = DataDeviceManagerState::bind(&globals, &qh)?;
+
+            // Story 6.1: Try to bind layer shell (optional - only available on wlroots-based compositors)
+            let layer_shell = match LayerShell::bind(&globals, &qh) {
+                Ok(shell) => {
+                    tracing::info!("Layer shell available - overlay feature enabled");
+                    Some(shell)
+                }
+                Err(e) => {
+                    tracing::info!("Layer shell not available ({e}) - overlay feature disabled");
+                    None
+                }
+            };
 
             // Create surface and window
             let surface = compositor.create_surface(&qh);
@@ -949,10 +1172,21 @@ mod linux {
                 region_mapper: RegionMapper::new(&HashMap::new()),
                 // Story 5.2: Clipboard text from remote server
                 clipboard_text: None,
+                // Story 5.4: Clipboard files from remote server
+                clipboard_files: None,
+                // Story 5.6: Last local clipboard sent (for deduplication)
+                last_local_clipboard_text: None,
+                last_local_clipboard_files: None,
                 // Story 5.2/5.3: Data device manager for clipboard
                 data_device_manager,
                 data_device: None,
                 clipboard_source: None,
+                // Story 6.1: Layer shell and overlay
+                layer_shell,
+                overlay_controller: OverlayController::new(),
+                overlay_surfaces: HashMap::new(),
+                // Story 6.2: Overlay content
+                overlay_content: OverlayContent::default(),
             };
 
             Ok((event_loop, state, event_rx))
@@ -996,6 +1230,194 @@ mod linux {
                 self.set_fullscreen(None);
             }
         }
+
+        // ===== Story 6.1: Overlay Methods =====
+
+        /// Returns true if layer shell is available (overlay feature can work).
+        pub fn has_layer_shell(&self) -> bool {
+            self.layer_shell.is_some()
+        }
+
+        /// Returns true if the overlay is currently visible.
+        pub fn is_overlay_visible(&self) -> bool {
+            self.overlay_controller.is_visible()
+        }
+
+        /// Returns the current overlay state.
+        pub fn overlay_state(&self) -> OverlayState {
+            self.overlay_controller.state()
+        }
+
+        /// Updates the overlay content and re-renders if visible.
+        ///
+        /// # Story 6.2
+        /// This method allows updating the connection status displayed in the overlay.
+        /// If the overlay is currently visible, it will be re-rendered with the new content.
+        pub fn update_overlay_content(&mut self, content: OverlayContent) {
+            self.overlay_content = content;
+
+            // Re-render all visible overlay surfaces with new content
+            if self.overlay_controller.is_visible() {
+                for (monitor_id, overlay) in &mut self.overlay_surfaces {
+                    if let Err(e) = overlay.render(&self.overlay_content) {
+                        tracing::error!(
+                            "Failed to re-render overlay on monitor {} with new content: {}",
+                            monitor_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Returns a reference to the current overlay content.
+        ///
+        /// # Story 6.2
+        pub fn overlay_content(&self) -> &OverlayContent {
+            &self.overlay_content
+        }
+
+        /// Check pointer position and update overlay visibility.
+        ///
+        /// Call this on every pointer motion event. Returns true if the overlay
+        /// visibility changed and surfaces need to be updated.
+        ///
+        /// # Arguments
+        /// * `y` - Pointer Y position in surface-local coordinates
+        /// * `monitor_id` - ID of the monitor where the pointer is (use 0 for single-monitor mode)
+        /// * `qh` - Queue handle for creating Wayland objects
+        pub fn check_overlay_trigger(
+            &mut self,
+            y: f64,
+            monitor_id: u32,
+            qh: &QueueHandle<Self>,
+        ) -> bool {
+            // Don't show overlay if not in fullscreen mode
+            if !self.is_fullscreen {
+                if self.overlay_controller.is_visible() {
+                    self.hide_overlay();
+                    return true;
+                }
+                return false;
+            }
+
+            // Check if layer shell is available
+            let Some(layer_shell) = &self.layer_shell else {
+                return false;
+            };
+
+            let changed = self.overlay_controller.check_pointer_position(y, monitor_id);
+
+            if changed {
+                match self.overlay_controller.state() {
+                    OverlayState::Visible => {
+                        // Show overlay on this monitor if not already shown
+                        if !self.overlay_surfaces.contains_key(&monitor_id) {
+                            self.show_overlay_on_monitor(monitor_id, qh);
+                        }
+                    }
+                    OverlayState::Hidden => {
+                        // Hide any visible overlay surfaces
+                        self.hide_overlay();
+                    }
+                    OverlayState::Hiding(_) => {
+                        // Overlay is in hiding state, will be hidden after delay
+                    }
+                }
+            }
+
+            changed
+        }
+
+        /// Show the overlay on a specific monitor.
+        fn show_overlay_on_monitor(&mut self, monitor_id: u32, qh: &QueueHandle<Self>) {
+            let Some(layer_shell) = &self.layer_shell else {
+                tracing::warn!("Cannot show overlay: layer shell not available");
+                return;
+            };
+
+            // Get the monitor output if in multi-monitor mode
+            let output = self.outputs.get(&monitor_id);
+
+            // Get monitor width (use window width in single-surface mode)
+            let width = if let Some(monitor) = self.monitors.get(&monitor_id) {
+                monitor.width
+            } else {
+                self.width
+            };
+
+            // Create overlay surface
+            match OverlaySurface::new(
+                layer_shell,
+                &self.compositor,
+                &self.shm,
+                qh,
+                output,
+                width,
+                OVERLAY_HEIGHT,
+            ) {
+                Ok(surface) => {
+                    tracing::debug!("Created overlay surface on monitor {}", monitor_id);
+                    self.overlay_surfaces.insert(monitor_id, surface);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create overlay surface: {}", e);
+                }
+            }
+        }
+
+        /// Hide all overlay surfaces.
+        pub fn hide_overlay(&mut self) {
+            if !self.overlay_surfaces.is_empty() {
+                tracing::debug!("Hiding overlay surfaces");
+                // Remove and drop all overlay surfaces (this destroys them in Wayland)
+                self.overlay_surfaces.clear();
+            }
+            self.overlay_controller.hide();
+        }
+
+        /// Update the overlay hide timer.
+        ///
+        /// Call this periodically (e.g., on every event loop iteration) to check
+        /// if the hide delay has expired. Returns true if the overlay was hidden.
+        pub fn update_overlay_timer(&mut self) -> bool {
+            if self.overlay_controller.update_hide_timer() {
+                self.hide_overlay();
+                true
+            } else {
+                false
+            }
+        }
+
+        /// Handle pointer entering a different monitor (multi-monitor support).
+        ///
+        /// # Arguments
+        /// * `y` - Pointer Y position on the new monitor
+        /// * `monitor_id` - ID of the monitor the pointer entered
+        /// * `qh` - Queue handle for creating Wayland objects
+        pub fn pointer_entered_monitor(
+            &mut self,
+            y: f64,
+            monitor_id: u32,
+            qh: &QueueHandle<Self>,
+        ) {
+            let (old_monitor, should_show) =
+                self.overlay_controller.pointer_entered_monitor(y, monitor_id);
+
+            // Hide overlay on old monitor if it was showing
+            if let Some(old_id) = old_monitor {
+                if old_id != monitor_id {
+                    self.overlay_surfaces.remove(&old_id);
+                }
+            }
+
+            // Show on new monitor if in hover zone
+            if should_show && self.is_fullscreen {
+                self.show_overlay_on_monitor(monitor_id, qh);
+            }
+        }
+
+        // ===== End Story 6.1 =====
 
         /// Sets the remote desktop resolution for coordinate mapping.
         ///
@@ -1102,6 +1524,185 @@ mod linux {
         /// Clears the cached clipboard text.
         pub fn clear_clipboard(&mut self) {
             self.clipboard_text = None;
+            self.clipboard_files = None;
+        }
+
+        /// Story 5.4: Sets the clipboard files from the remote server.
+        ///
+        /// This stores the file paths and offers them to the Wayland compositor
+        /// as `text/uri-list` so local file managers can paste them.
+        pub fn set_clipboard_files(&mut self, files: Vec<std::path::PathBuf>) {
+            tracing::debug!("Clipboard files received from remote: {} files", files.len());
+            self.clipboard_files = Some(files);
+        }
+
+        /// Story 5.4: Sets the clipboard files and offers them to the Wayland compositor.
+        ///
+        /// This is the full implementation that creates a data source offering
+        /// file URIs so local file managers can paste the files.
+        pub fn set_clipboard_files_with_qh(
+            &mut self,
+            files: Vec<std::path::PathBuf>,
+            qh: &QueueHandle<Self>,
+        ) {
+            tracing::debug!("Setting clipboard files: {} files", files.len());
+            self.clipboard_files = Some(files);
+
+            // Create a data source offering file URI format
+            let source = self.data_device_manager.create_copy_paste_source(
+                qh,
+                vec![
+                    "text/uri-list".to_string(),
+                    // Also offer text fallback with file names
+                    "text/plain;charset=utf-8".to_string(),
+                    "text/plain".to_string(),
+                ],
+            );
+
+            // Set the selection on the data device
+            if let Some(ref data_device) = self.data_device {
+                source.set_selection(data_device, None);
+                tracing::debug!("Clipboard file selection set");
+            } else {
+                tracing::warn!("No data device available, cannot set clipboard selection");
+            }
+
+            // Keep the source alive
+            self.clipboard_source = Some(source);
+        }
+
+        /// Story 5.4: Returns the current clipboard files from the remote server.
+        pub fn clipboard_files(&self) -> Option<&[std::path::PathBuf]> {
+            self.clipboard_files.as_deref()
+        }
+
+        /// Story 5.4: Converts file paths to text/uri-list format.
+        ///
+        /// Returns a string with one file:// URI per line, terminated with CRLF.
+        fn files_to_uri_list(files: &[std::path::PathBuf]) -> String {
+            let mut result = String::new();
+            for path in files {
+                if let Some(path_str) = path.to_str() {
+                    // URL-encode the path (basic encoding for file URIs)
+                    let encoded = Self::encode_file_uri(path_str);
+                    result.push_str(&format!("file://{}\r\n", encoded));
+                }
+            }
+            result
+        }
+
+        /// Story 5.4: URL-encodes a file path for use in a file:// URI.
+        ///
+        /// Encodes special characters per RFC 3986. The path is expected to be
+        /// an absolute path (starting with `/`). Characters that are safe in
+        /// file URIs are left as-is; others are percent-encoded.
+        fn encode_file_uri(path: &str) -> String {
+            let mut result = String::with_capacity(path.len() * 3);
+            for ch in path.chars() {
+                match ch {
+                    // Unreserved characters (RFC 3986) - safe to use as-is
+                    'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => {
+                        result.push(ch);
+                    }
+                    // Path separators - keep as-is for file URIs
+                    '/' => result.push('/'),
+                    // All other characters need encoding
+                    _ => {
+                        // Encode each UTF-8 byte
+                        for byte in ch.to_string().as_bytes() {
+                            result.push_str(&format!("%{:02X}", byte));
+                        }
+                    }
+                }
+            }
+            result
+        }
+
+        /// Story 5.5: Decodes a percent-encoded file URI path.
+        ///
+        /// Decodes percent-encoded characters per RFC 3986. The input should be
+        /// the path portion of a file:// URI (after stripping the file:// prefix).
+        /// Properly handles multi-byte UTF-8 sequences.
+        fn decode_file_uri(encoded: &str) -> String {
+            let mut bytes = Vec::with_capacity(encoded.len());
+            let mut chars = encoded.chars().peekable();
+
+            while let Some(ch) = chars.next() {
+                if ch == '%' {
+                    // Try to read two hex digits
+                    let hex: String = chars.by_ref().take(2).collect();
+                    if hex.len() == 2 {
+                        if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                            bytes.push(byte);
+                            continue;
+                        }
+                    }
+                    // Invalid encoding, keep as-is
+                    bytes.push(b'%');
+                    bytes.extend_from_slice(hex.as_bytes());
+                } else {
+                    // Non-encoded character - add its UTF-8 bytes
+                    let mut buf = [0u8; 4];
+                    let encoded_char = ch.encode_utf8(&mut buf);
+                    bytes.extend_from_slice(encoded_char.as_bytes());
+                }
+            }
+
+            // Convert bytes to string, using lossy conversion for invalid UTF-8
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        /// Story 5.5: Parses a text/uri-list into file paths.
+        ///
+        /// The input is expected to be in text/uri-list format (RFC 2483):
+        /// - Lines terminated with CRLF (or just LF)
+        /// - Lines starting with # are comments
+        /// - Each line is a URI (we only handle file:// URIs)
+        fn parse_uri_list(uri_list: &str) -> Vec<std::path::PathBuf> {
+            let mut files = Vec::new();
+
+            for line in uri_list.lines() {
+                let line = line.trim();
+
+                // Skip empty lines and comments
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                // Only handle file:// URIs
+                if let Some(path) = line.strip_prefix("file://") {
+                    // Handle file://localhost/ prefix (some apps use this)
+                    let path = path
+                        .strip_prefix("localhost")
+                        .unwrap_or(path);
+
+                    // Decode percent-encoded characters
+                    let decoded = Self::decode_file_uri(path);
+
+                    // Validate the path exists (optional, but useful)
+                    let path_buf = std::path::PathBuf::from(&decoded);
+                    if path_buf.exists() {
+                        files.push(path_buf);
+                    } else {
+                        tracing::debug!("File from clipboard does not exist: {}", decoded);
+                        // Still include it - the file might be created later or
+                        // we might want to report the error to the user
+                        files.push(path_buf);
+                    }
+                }
+            }
+
+            files
+        }
+
+        /// Story 5.4: Returns file names as plain text (fallback for apps that don't support URIs).
+        fn files_to_text(files: &[std::path::PathBuf]) -> String {
+            files
+                .iter()
+                .filter_map(|p| p.file_name())
+                .filter_map(|n| n.to_str())
+                .collect::<Vec<_>>()
+                .join("\n")
         }
 
         /// Returns the primary monitor (the one at position 0,0).
@@ -2553,7 +3154,7 @@ mod linux {
         fn pointer_frame(
             &mut self,
             _conn: &Connection,
-            _qh: &QueueHandle<Self>,
+            qh: &QueueHandle<Self>,
             _pointer: &WlPointer,
             events: &[PointerEvent],
         ) {
@@ -2587,6 +3188,25 @@ mod linux {
                     PointerEventKind::Motion { .. } => {
                         let (x, y) = event.position;
                         let _ = self.event_tx.send(WindowEvent::MouseMove { x, y });
+
+                        // Story 6.1: Check for overlay trigger on mouse motion
+                        // Use monitor ID 0 for single-surface mode, actual ID for multi-monitor
+                        let monitor_id = if self.multi_monitor_mode {
+                            // TODO: Determine which monitor the pointer is on from surface
+                            // For now, use 0 as default
+                            0
+                        } else {
+                            0
+                        };
+
+                        let changed = self.check_overlay_trigger(y, monitor_id, qh);
+
+                        if changed {
+                            let _ = self.event_tx.send(WindowEvent::OverlayVisibilityChanged {
+                                visible: self.overlay_controller.is_visible(),
+                                monitor_id: self.overlay_controller.active_monitor(),
+                            });
+                        }
                     }
                     PointerEventKind::Press { button, .. } => {
                         let (x, y) = event.position;
@@ -2710,14 +3330,66 @@ mod linux {
             _qh: &QueueHandle<Self>,
             _data_device: &smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice,
         ) {
-            // Story 5.3: Selection changed - another app copied something
+            // Story 5.3/5.5: Selection changed - another app copied something
             tracing::debug!("Clipboard selection changed (local app copied)");
 
             // Get the selection offer from our tracked data device
             if let Some(ref data_device) = self.data_device {
                 if let Some(offer) = data_device.selection_offer() {
-                    // Check if text format is available
                     let mime_types = offer.mime_types();
+
+                    // Story 5.5: Check for file URI list first (higher priority than text)
+                    // Files are indicated by text/uri-list mime type
+                    let has_uri_list = mime_types.iter().any(|m| m.as_str() == "text/uri-list");
+
+                    if has_uri_list {
+                        tracing::debug!("File URI list format available");
+
+                        match offer.receive("text/uri-list".to_string()) {
+                            Ok(mut pipe) => {
+                                let mut uri_list = String::new();
+                                if let Err(e) = pipe.read_to_string(&mut uri_list) {
+                                    tracing::warn!("Failed to read clipboard URI list: {}", e);
+                                    return;
+                                }
+
+                                let files = Self::parse_uri_list(&uri_list);
+                                if !files.is_empty() {
+                                    // Story 5.6: Deduplicate - only send if files changed
+                                    let is_duplicate = self
+                                        .last_local_clipboard_files
+                                        .as_ref()
+                                        .is_some_and(|last| last == &files);
+
+                                    if is_duplicate {
+                                        tracing::trace!(
+                                            "Local clipboard files unchanged, skipping ({} files)",
+                                            files.len()
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "Local clipboard files: {} files",
+                                            files.len()
+                                        );
+                                        // Update last sent content
+                                        self.last_local_clipboard_files = Some(files.clone());
+                                        // Clear text cache since files take precedence
+                                        self.last_local_clipboard_text = None;
+                                        // Notify main thread of file clipboard change
+                                        let _ = self.event_tx.send(WindowEvent::LocalClipboardFilesChanged {
+                                            files,
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to receive clipboard URI list: {}", e);
+                            }
+                        }
+                        return;
+                    }
+
+                    // Story 5.3: Check for text format
                     let text_mime = mime_types.iter().find(|m| {
                         m.as_str() == "text/plain;charset=utf-8"
                             || m.as_str() == "text/plain"
@@ -2739,14 +3411,31 @@ mod linux {
                                 }
 
                                 if !text.is_empty() {
-                                    tracing::debug!(
-                                        "Local clipboard text: {} chars",
-                                        text.len()
-                                    );
-                                    // Notify main thread of clipboard change
-                                    let _ = self.event_tx.send(WindowEvent::LocalClipboardChanged {
-                                        text,
-                                    });
+                                    // Story 5.6: Deduplicate - only send if content changed
+                                    let is_duplicate = self
+                                        .last_local_clipboard_text
+                                        .as_ref()
+                                        .is_some_and(|last| last == &text);
+
+                                    if is_duplicate {
+                                        tracing::trace!(
+                                            "Local clipboard unchanged, skipping ({} chars)",
+                                            text.len()
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "Local clipboard text: {} chars",
+                                            text.len()
+                                        );
+                                        // Update last sent content
+                                        self.last_local_clipboard_text = Some(text.clone());
+                                        // Clear file cache since text takes precedence
+                                        self.last_local_clipboard_files = None;
+                                        // Notify main thread of clipboard change
+                                        let _ = self.event_tx.send(WindowEvent::LocalClipboardChanged {
+                                            text,
+                                        });
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -2754,7 +3443,7 @@ mod linux {
                             }
                         }
                     } else {
-                        tracing::debug!("No text format in clipboard (formats: {:?})", mime_types);
+                        tracing::debug!("No supported format in clipboard (formats: {:?})", mime_types);
                     }
                 } else {
                     tracing::debug!("No selection offer available");
@@ -2794,16 +3483,42 @@ mod linux {
             mime_type: String,
             write_pipe: WritePipe,
         ) {
-            // Story 5.2: Compositor requests clipboard data for paste
+            // Story 5.2/5.4: Compositor requests clipboard data for paste
             // This is called when a local app wants to paste our offered data
             tracing::debug!("Clipboard data requested for mime type: {}", mime_type);
 
-            if mime_type == "text/plain;charset=utf-8" || mime_type == "text/plain" {
+            let mut pipe = write_pipe;
+
+            // Story 5.4: Handle file URI list format
+            if mime_type == "text/uri-list" {
+                if let Some(ref files) = self.clipboard_files {
+                    let uri_list = Self::files_to_uri_list(files);
+                    if let Err(e) = pipe.write_all(uri_list.as_bytes()) {
+                        tracing::warn!("Failed to write file URI list: {}", e);
+                    }
+                    return;
+                }
+            }
+
+            // Handle text formats
+            if mime_type == "text/plain;charset=utf-8"
+                || mime_type == "text/plain"
+                || mime_type == "UTF8_STRING"
+                || mime_type == "STRING"
+            {
+                // First try clipboard text
                 if let Some(ref text) = self.clipboard_text {
-                    // Write the text to the pipe
-                    let mut pipe = write_pipe;
                     if let Err(e) = pipe.write_all(text.as_bytes()) {
                         tracing::warn!("Failed to write clipboard data: {}", e);
+                    }
+                    return;
+                }
+
+                // Story 5.4: Fallback to file names for text format
+                if let Some(ref files) = self.clipboard_files {
+                    let text = Self::files_to_text(files);
+                    if let Err(e) = pipe.write_all(text.as_bytes()) {
+                        tracing::warn!("Failed to write file names: {}", e);
                     }
                 }
             }
@@ -2848,12 +3563,67 @@ mod linux {
         }
     }
 
+    // Story 6.1: LayerShellHandler implementation for overlay surfaces
+    impl LayerShellHandler for WaylandWindow {
+        fn closed(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _layer: &LayerSurface,
+        ) {
+            // Layer surface was closed by the compositor
+            tracing::debug!("Overlay layer surface closed by compositor");
+            // Find and remove the closed surface from our map
+            self.overlay_surfaces
+                .retain(|_, s| !std::ptr::eq(s.layer_surface(), _layer));
+            self.overlay_controller.hide();
+        }
+
+        fn configure(
+            &mut self,
+            _conn: &Connection,
+            qh: &QueueHandle<Self>,
+            layer: &LayerSurface,
+            configure: LayerSurfaceConfigure,
+            _serial: u32,
+        ) {
+            tracing::debug!(
+                "Overlay configure event: {}x{}",
+                configure.new_size.0,
+                configure.new_size.1
+            );
+
+            // Find and update the corresponding overlay surface
+            // Story 6.2: Clone content to avoid borrow issues
+            let content = self.overlay_content.clone();
+            for (monitor_id, overlay) in &mut self.overlay_surfaces {
+                if std::ptr::eq(overlay.layer_surface(), layer) {
+                    overlay.set_configured(configure.new_size.0, configure.new_size.1);
+
+                    // Render the overlay now that it's configured (Story 6.2: with content)
+                    if let Err(e) = overlay.render(&content) {
+                        tracing::error!(
+                            "Failed to render overlay on monitor {}: {}",
+                            monitor_id,
+                            e
+                        );
+                    }
+                    break;
+                }
+            }
+
+            // Acknowledge the configure
+            layer.ack_configure(_serial);
+        }
+    }
+
     delegate_compositor!(WaylandWindow);
     delegate_output!(WaylandWindow);
     delegate_seat!(WaylandWindow);
     delegate_keyboard!(WaylandWindow);
     delegate_pointer!(WaylandWindow);
     delegate_shm!(WaylandWindow);
+    delegate_layer!(WaylandWindow);
     delegate_xdg_shell!(WaylandWindow);
     delegate_xdg_window!(WaylandWindow);
     delegate_registry!(WaylandWindow);
@@ -3183,6 +3953,13 @@ mod stub {
         },
         /// Story 5.3: Local clipboard changed (stub).
         LocalClipboardChanged { text: String },
+        /// Story 5.5: Local clipboard files changed (stub).
+        LocalClipboardFilesChanged { files: Vec<std::path::PathBuf> },
+        /// Story 6.1: Overlay visibility changed (stub).
+        OverlayVisibilityChanged {
+            visible: bool,
+            monitor_id: Option<u32>,
+        },
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -4662,5 +5439,196 @@ mod tests {
         assert_eq!(updated_monitor.x, 100);
         assert_eq!(updated_monitor.y, 200);
         assert_eq!(updated_monitor.id, 1);
+    }
+
+    // Story 5.5: Tests for URI parsing functions (Linux only)
+    #[cfg(target_os = "linux")]
+    mod uri_tests {
+        use super::*;
+
+        #[test]
+        fn test_decode_file_uri_simple() {
+            let decoded = WaylandWindow::decode_file_uri("/home/user/file.txt");
+            assert_eq!(decoded, "/home/user/file.txt");
+        }
+
+        #[test]
+        fn test_decode_file_uri_with_spaces() {
+            let decoded = WaylandWindow::decode_file_uri("/home/user/my%20file.txt");
+            assert_eq!(decoded, "/home/user/my file.txt");
+        }
+
+        #[test]
+        fn test_decode_file_uri_with_unicode() {
+            // UTF-8 encoding of "日本語" is E6 97 A5 E6 9C AC E8 AA 9E
+            let decoded = WaylandWindow::decode_file_uri("/home/%E6%97%A5%E6%9C%AC%E8%AA%9E.txt");
+            assert_eq!(decoded, "/home/日本語.txt");
+        }
+
+        #[test]
+        fn test_decode_file_uri_with_special_chars() {
+            let decoded = WaylandWindow::decode_file_uri("/path/to%23file%26name.txt");
+            assert_eq!(decoded, "/path/to#file&name.txt");
+        }
+
+        #[test]
+        fn test_decode_file_uri_invalid_encoding() {
+            // Invalid percent encoding should be kept as-is
+            let decoded = WaylandWindow::decode_file_uri("/path/%GG");
+            assert_eq!(decoded, "/path/%GG");
+        }
+
+        #[test]
+        fn test_parse_uri_list_single_file() {
+            let uri_list = "file:///home/user/file.txt\r\n";
+            let files = WaylandWindow::parse_uri_list(uri_list);
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0], std::path::PathBuf::from("/home/user/file.txt"));
+        }
+
+        #[test]
+        fn test_parse_uri_list_multiple_files() {
+            let uri_list = "file:///home/user/file1.txt\r\nfile:///home/user/file2.txt\r\n";
+            let files = WaylandWindow::parse_uri_list(uri_list);
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0], std::path::PathBuf::from("/home/user/file1.txt"));
+            assert_eq!(files[1], std::path::PathBuf::from("/home/user/file2.txt"));
+        }
+
+        #[test]
+        fn test_parse_uri_list_with_comments() {
+            let uri_list = "# This is a comment\r\nfile:///home/user/file.txt\r\n";
+            let files = WaylandWindow::parse_uri_list(uri_list);
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0], std::path::PathBuf::from("/home/user/file.txt"));
+        }
+
+        #[test]
+        fn test_parse_uri_list_with_localhost() {
+            let uri_list = "file://localhost/home/user/file.txt\r\n";
+            let files = WaylandWindow::parse_uri_list(uri_list);
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0], std::path::PathBuf::from("/home/user/file.txt"));
+        }
+
+        #[test]
+        fn test_parse_uri_list_with_encoded_path() {
+            let uri_list = "file:///home/user/my%20document.txt\r\n";
+            let files = WaylandWindow::parse_uri_list(uri_list);
+            assert_eq!(files.len(), 1);
+            assert_eq!(
+                files[0],
+                std::path::PathBuf::from("/home/user/my document.txt")
+            );
+        }
+
+        #[test]
+        fn test_parse_uri_list_lf_only() {
+            // Some apps use LF instead of CRLF
+            let uri_list = "file:///home/user/file1.txt\nfile:///home/user/file2.txt\n";
+            let files = WaylandWindow::parse_uri_list(uri_list);
+            assert_eq!(files.len(), 2);
+        }
+
+        #[test]
+        fn test_parse_uri_list_ignores_non_file_uris() {
+            let uri_list = "http://example.com/file.txt\r\nfile:///home/user/file.txt\r\n";
+            let files = WaylandWindow::parse_uri_list(uri_list);
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0], std::path::PathBuf::from("/home/user/file.txt"));
+        }
+
+        #[test]
+        fn test_window_event_local_clipboard_files_changed() {
+            let event = WindowEvent::LocalClipboardFilesChanged {
+                files: vec![
+                    std::path::PathBuf::from("/home/user/file1.txt"),
+                    std::path::PathBuf::from("/home/user/file2.txt"),
+                ],
+            };
+
+            if let WindowEvent::LocalClipboardFilesChanged { files } = event {
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0], std::path::PathBuf::from("/home/user/file1.txt"));
+            } else {
+                panic!("Expected LocalClipboardFilesChanged event");
+            }
+        }
+    }
+
+    // =========================================================================
+    // Story 6.1: Overlay Tests
+    // =========================================================================
+
+    #[test]
+    fn test_overlay_visibility_changed_event() {
+        // Test that OverlayVisibilityChanged event can be created
+        let event = WindowEvent::OverlayVisibilityChanged {
+            visible: true,
+            monitor_id: Some(1),
+        };
+
+        if let WindowEvent::OverlayVisibilityChanged { visible, monitor_id } = event {
+            assert!(visible);
+            assert_eq!(monitor_id, Some(1));
+        } else {
+            panic!("Expected OverlayVisibilityChanged event");
+        }
+    }
+
+    #[test]
+    fn test_overlay_visibility_changed_event_hidden() {
+        let event = WindowEvent::OverlayVisibilityChanged {
+            visible: false,
+            monitor_id: None,
+        };
+
+        if let WindowEvent::OverlayVisibilityChanged { visible, monitor_id } = event {
+            assert!(!visible);
+            assert_eq!(monitor_id, None);
+        } else {
+            panic!("Expected OverlayVisibilityChanged event");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_overlay_controller_integration() {
+        // Test that overlay controller from the overlay module works correctly
+        use crate::overlay::{OverlayController, OverlayState};
+
+        let mut controller = OverlayController::new();
+
+        // Initially hidden
+        assert!(!controller.is_visible());
+        assert_eq!(controller.state(), OverlayState::Hidden);
+
+        // Move into hover zone
+        let changed = controller.check_pointer_position(5.0, 1);
+        assert!(changed);
+        assert!(controller.is_visible());
+        assert_eq!(controller.active_monitor(), Some(1));
+
+        // Force hide
+        controller.hide();
+        assert!(!controller.is_visible());
+        assert!(controller.active_monitor().is_none());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_overlay_controller_stub() {
+        // On non-Linux platforms, overlay controller is a stub
+        use crate::overlay::OverlayController;
+
+        let mut controller = OverlayController::new();
+
+        // Stub always returns not visible
+        assert!(!controller.is_visible());
+
+        // Stub returns false for check_pointer_position
+        let changed = controller.check_pointer_position(5.0, 1);
+        assert!(!changed);
+        assert!(!controller.is_visible());
     }
 }

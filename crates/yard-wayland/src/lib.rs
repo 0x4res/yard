@@ -8,9 +8,14 @@
 #![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
 
 pub mod input;
+pub mod overlay;
 pub mod window;
 
 pub use input::wayland_to_rdp_scancode;
+pub use overlay::{
+    ConnectionStatus, OverlayConfig, OverlayContent, OverlayController, OverlayState,
+    format_duration, generate_overlay_buffer_with_content, rtt_color,
+};
 pub use window::{
     KeyboardShortcut, MonitorInfo, MonitorSurface, Rect, RegionMapper, SurfaceRegion,
     WaylandWindow, WindowConfig, WindowEvent,

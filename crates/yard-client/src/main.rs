@@ -19,8 +19,15 @@ use yard_protocol::{
 #[cfg(target_os = "linux")]
 use yard_protocol::MouseButton;
 
+#[cfg(target_os = "linux")]
+use yard_protocol::cliprdr::file_transfer::FileTransferManager;
+
 use yard_audio::AudioThread;
 use yard_wayland::WindowConfig;
+
+// Story 6.2: Overlay content types (Linux only - requires Wayland)
+#[cfg(target_os = "linux")]
+use yard_wayland::{ConnectionStatus, OverlayContent};
 
 /// Exit codes for YARD.
 mod exit_codes {
@@ -487,8 +494,13 @@ fn run_event_loop(
             }
             Some(FromNetwork::ClipboardTextAvailable { .. })
             | Some(FromNetwork::ClipboardText { .. })
-            | Some(FromNetwork::ClipboardRequestFailed) => {
-                // Story 5.2: Clipboard events during setup phase - ignore
+            | Some(FromNetwork::ClipboardRequestFailed)
+            | Some(FromNetwork::ClipboardFilesAvailable { .. })
+            | Some(FromNetwork::ClipboardFilesReceived { .. })
+            | Some(FromNetwork::ClipboardFileSizeReceived { .. })
+            | Some(FromNetwork::ClipboardFileContentReceived { .. })
+            | Some(FromNetwork::ClipboardFileTransferFailed { .. }) => {
+                // Story 5.2/5.4: Clipboard events during setup phase - ignore
             }
             None => {
                 error!("Network thread terminated unexpectedly");
@@ -577,6 +589,24 @@ fn run_event_loop(
     let mut frame_count: u64 = 0;
     let start_time = std::time::Instant::now();
 
+    // Story 6.2: Track session state for overlay display
+    let session_start = std::time::Instant::now();
+    // Extract server name for overlay (strip port if present)
+    let server_name = window_config.title.split('@').nth(1).unwrap_or("Unknown").to_string();
+
+    // Set initial overlay content (connected state)
+    window.update_overlay_content(OverlayContent {
+        status: ConnectionStatus::Connected,
+        server_name: Some(server_name.clone()),
+        session_duration: Some(session_start.elapsed()),
+        rtt_ms: None,
+        reconnect_attempt: None,
+        disconnect_reason: None,
+    });
+
+    // Story 5.4: File transfer manager for clipboard file downloads
+    let mut file_transfer_manager: Option<FileTransferManager> = None;
+
     // Main event loop
     // NOTE: Network channel is polled manually via try_recv. Future optimization could
     // integrate it as a calloop source for true event-driven dispatch.
@@ -589,10 +619,26 @@ fn run_event_loop(
             match from_network_rx.try_recv() {
                 Ok(FromNetwork::Disconnected) => {
                     info!("Disconnected after {} frames.", frame_count);
+                    // Story 6.2: Update overlay to show disconnected state
+                    window.update_overlay_content(OverlayContent {
+                        status: ConnectionStatus::Disconnected,
+                        server_name: Some(server_name.clone()),
+                        session_duration: Some(session_start.elapsed()),
+                        disconnect_reason: Some("Connection closed".to_string()),
+                        ..Default::default()
+                    });
                     return Ok(exit_codes::SUCCESS);
                 }
                 Ok(FromNetwork::Error(err)) => {
                     error!("{}", err);
+                    // Story 6.2: Update overlay to show error state
+                    window.update_overlay_content(OverlayContent {
+                        status: ConnectionStatus::Disconnected,
+                        server_name: Some(server_name.clone()),
+                        session_duration: Some(session_start.elapsed()),
+                        disconnect_reason: Some(err.to_string()),
+                        ..Default::default()
+                    });
                     return Ok(map_error_to_exit_code(&err));
                 }
                 Ok(FromNetwork::CertificateVerify { server, cert_info }) => {
@@ -654,6 +700,148 @@ fn run_event_loop(
                     // Story 5.2: Clipboard request failed
                     warn!("Clipboard request failed - server could not provide data");
                 }
+                // Story 5.4: File clipboard messages
+                Ok(FromNetwork::ClipboardFilesAvailable { formats }) => {
+                    debug!("Clipboard files available ({} formats)", formats.len());
+                }
+                Ok(FromNetwork::ClipboardFilesReceived { files }) => {
+                    debug!("Clipboard files received: {} files", files.len());
+                    for file in &files {
+                        debug!("  - {} ({} bytes, dir={})", file.name, file.size.unwrap_or(0), file.is_directory);
+                    }
+
+                    // Create file transfer manager and start downloads
+                    match FileTransferManager::with_default_staging_dir() {
+                        Ok(mut manager) => {
+                            // Convert FileInfo to the tuple format expected by add_files
+                            let file_tuples: Vec<(String, Option<u64>, bool)> = files
+                                .iter()
+                                .map(|f| (f.name.clone(), f.size, f.is_directory))
+                                .collect();
+                            manager.add_files(&file_tuples);
+
+                            // Start first file transfer
+                            if let Some((_, file_index)) = manager.start_next_transfer() {
+                                if to_network_tx
+                                    .blocking_send(ToNetwork::RequestFileSize { file_index })
+                                    .is_err()
+                                {
+                                    error!("Failed to send file size request");
+                                }
+                            }
+
+                            file_transfer_manager = Some(manager);
+                        }
+                        Err(e) => {
+                            error!("Failed to create file transfer manager: {}", e);
+                        }
+                    }
+                }
+                Ok(FromNetwork::ClipboardFileSizeReceived { stream_id, size }) => {
+                    debug!("File size received: stream_id={}, size={}", stream_id, size);
+
+                    if let Some(ref mut manager) = file_transfer_manager {
+                        match manager.handle_size_response(stream_id, size) {
+                            Ok(Some((_, file_index, offset, length))) => {
+                                // Request file content
+                                if to_network_tx
+                                    .blocking_send(ToNetwork::RequestFileContent {
+                                        file_index,
+                                        offset,
+                                        length: length,
+                                    })
+                                    .is_err()
+                                {
+                                    error!("Failed to send file content request");
+                                }
+                            }
+                            Ok(None) => {
+                                // Empty file or error - check if we should start next file
+                                if let Some((_, file_index)) = manager.start_next_transfer() {
+                                    if to_network_tx
+                                        .blocking_send(ToNetwork::RequestFileSize { file_index })
+                                        .is_err()
+                                    {
+                                        error!("Failed to send file size request");
+                                    }
+                                } else if manager.pending_count() == 0 && manager.active_count() == 0 {
+                                    // All transfers complete
+                                    let completed = manager.completed_files();
+                                    if !completed.is_empty() {
+                                        info!("All {} files downloaded, setting clipboard", completed.len());
+                                        window.set_clipboard_files(completed);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to handle size response: {}", e);
+                            }
+                        }
+                    }
+                }
+                Ok(FromNetwork::ClipboardFileContentReceived { stream_id, data }) => {
+                    debug!(
+                        "File content received: stream_id={}, {} bytes",
+                        stream_id,
+                        data.len()
+                    );
+
+                    if let Some(ref mut manager) = file_transfer_manager {
+                        match manager.handle_content_response(stream_id, &data) {
+                            Ok(Some((_, file_index, offset, length))) => {
+                                // Request more content
+                                if to_network_tx
+                                    .blocking_send(ToNetwork::RequestFileContent {
+                                        file_index,
+                                        offset,
+                                        length: length,
+                                    })
+                                    .is_err()
+                                {
+                                    error!("Failed to send file content request");
+                                }
+                            }
+                            Ok(None) => {
+                                // Current file complete - check if we should start next file
+                                if let Some((_, file_index)) = manager.start_next_transfer() {
+                                    if to_network_tx
+                                        .blocking_send(ToNetwork::RequestFileSize { file_index })
+                                        .is_err()
+                                    {
+                                        error!("Failed to send file size request");
+                                    }
+                                } else if manager.pending_count() == 0 && manager.active_count() == 0 {
+                                    // All transfers complete
+                                    let completed = manager.completed_files();
+                                    if !completed.is_empty() {
+                                        info!("All {} files downloaded, setting clipboard", completed.len());
+                                        window.set_clipboard_files(completed);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to handle content response: {}", e);
+                            }
+                        }
+                    }
+                }
+                Ok(FromNetwork::ClipboardFileTransferFailed { stream_id }) => {
+                    warn!("File transfer failed: stream_id={}", stream_id);
+
+                    if let Some(ref mut manager) = file_transfer_manager {
+                        manager.handle_failure(stream_id);
+
+                        // Try to start next file transfer
+                        if let Some((_, file_index)) = manager.start_next_transfer() {
+                            if to_network_tx
+                                .blocking_send(ToNetwork::RequestFileSize { file_index })
+                                .is_err()
+                            {
+                                error!("Failed to send file size request");
+                            }
+                        }
+                    }
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     error!("Network thread terminated");
@@ -668,6 +856,10 @@ fn run_event_loop(
             error!("Event loop error: {}", e);
             return Ok(exit_codes::CONNECTION_ERROR);
         }
+
+        // Story 6.1: Update overlay hide timer
+        // This must be called periodically to check if the hide delay has expired
+        window.update_overlay_timer();
 
         // Check window events (includes close request from WindowHandler)
         while let Ok(event) = event_rx.try_recv() {
@@ -924,6 +1116,34 @@ fn run_event_loop(
                         error!("Failed to send local clipboard text to network thread");
                     }
                 }
+                // Story 5.5: Handle local file clipboard changes
+                WindowEvent::LocalClipboardFilesChanged { files } => {
+                    debug!("Local clipboard files changed: {} files", files.len());
+                    if to_network_tx
+                        .blocking_send(ToNetwork::LocalClipboardFiles { files })
+                        .is_err()
+                    {
+                        error!("Failed to send local clipboard files to network thread");
+                    }
+                }
+                // Story 6.1/6.2: Handle overlay visibility changes
+                WindowEvent::OverlayVisibilityChanged { visible, monitor_id } => {
+                    debug!(
+                        "Overlay visibility changed: visible={}, monitor={:?}",
+                        visible, monitor_id
+                    );
+                    // Story 6.2: Update session duration when overlay becomes visible
+                    if visible {
+                        window.update_overlay_content(OverlayContent {
+                            status: ConnectionStatus::Connected,
+                            server_name: Some(server_name.clone()),
+                            session_duration: Some(session_start.elapsed()),
+                            rtt_ms: None,
+                            reconnect_attempt: None,
+                            disconnect_reason: None,
+                        });
+                    }
+                }
             }
         }
     }
@@ -1060,6 +1280,26 @@ fn run_event_loop(
             Some(FromNetwork::ClipboardRequestFailed) => {
                 // Story 5.2: Clipboard request failed
                 warn!("Clipboard request failed - server could not provide data");
+            }
+            // Story 5.4: File clipboard messages (non-Linux fallback - log only)
+            Some(FromNetwork::ClipboardFilesAvailable { formats }) => {
+                debug!("Clipboard files available ({} formats)", formats.len());
+            }
+            Some(FromNetwork::ClipboardFilesReceived { files }) => {
+                debug!("Clipboard files received: {} files", files.len());
+            }
+            Some(FromNetwork::ClipboardFileSizeReceived { stream_id, size }) => {
+                debug!("File size received: stream_id={}, size={}", stream_id, size);
+            }
+            Some(FromNetwork::ClipboardFileContentReceived { stream_id, data }) => {
+                debug!(
+                    "File content received: stream_id={}, {} bytes",
+                    stream_id,
+                    data.len()
+                );
+            }
+            Some(FromNetwork::ClipboardFileTransferFailed { stream_id }) => {
+                warn!("File transfer failed: stream_id={}", stream_id);
             }
             None => {
                 error!("Network thread terminated unexpectedly");
