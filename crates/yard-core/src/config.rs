@@ -3,6 +3,7 @@
 //! This module handles loading and parsing the YARD configuration file
 //! from `~/.config/yard/config.toml` (or `$XDG_CONFIG_HOME/yard/config.toml`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -28,6 +29,12 @@ pub struct Config {
     pub audio: AudioConfig,
     /// Clipboard settings (Story 5.1).
     pub clipboard: ClipboardConfig,
+    /// Named connection profiles (Story 6.5).
+    ///
+    /// Profiles allow users to save connection settings for frequently used servers.
+    /// Each profile is identified by a name (e.g., "work", "home") and contains
+    /// connection parameters like host, port, username, etc.
+    pub profiles: HashMap<String, ConnectionProfile>,
 }
 
 /// Audio configuration settings.
@@ -60,6 +67,89 @@ pub struct ClipboardConfig {
 impl Default for ClipboardConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// A saved connection profile (Story 6.5).
+///
+/// Profiles store connection settings for frequently used servers,
+/// allowing users to connect with just `yard connect profile-name`
+/// instead of specifying all parameters each time.
+///
+/// Only `host` is required; all other fields are optional and will
+/// use global defaults or CLI arguments if not specified.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectionProfile {
+    /// Target hostname or IP address (REQUIRED).
+    ///
+    /// This is the only mandatory field. Examples:
+    /// - `"server.example.com"`
+    /// - `"192.168.1.100"`
+    pub host: String,
+
+    /// Target port (optional, default: 3389).
+    ///
+    /// If not specified, uses the global default port from `[defaults]`
+    /// or the standard RDP port 3389.
+    pub port: Option<u16>,
+
+    /// Username for authentication.
+    ///
+    /// Can include domain in NT format (`DOMAIN\user`) or UPN format (`user@domain.com`).
+    pub username: Option<String>,
+
+    /// Domain for authentication.
+    ///
+    /// If specified separately from username, will be combined during connection.
+    pub domain: Option<String>,
+
+    /// Start in fullscreen mode.
+    ///
+    /// If `true`, the session starts in fullscreen on the current monitor.
+    pub fullscreen: Option<bool>,
+
+    /// Enable multi-monitor fullscreen mode.
+    ///
+    /// If `true`, creates separate windows on all connected monitors.
+    /// Requires `fullscreen` to also be `true` (or implied).
+    pub all_monitors: Option<bool>,
+
+    /// Enable audio output.
+    ///
+    /// If `false`, disables remote audio playback.
+    pub audio: Option<bool>,
+
+    /// Enable microphone input.
+    ///
+    /// If `false`, disables microphone transmission to remote.
+    pub microphone: Option<bool>,
+
+    /// Enable clipboard synchronization.
+    ///
+    /// If `false`, disables bidirectional clipboard sync.
+    pub clipboard: Option<bool>,
+}
+
+impl ConnectionProfile {
+    /// Validates that the profile has all required fields.
+    ///
+    /// Currently, only `host` is required and must be non-empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The profile name, used in error messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Config` if validation fails (e.g., empty host).
+    pub fn validate(&self, name: &str) -> Result<()> {
+        if self.host.is_empty() {
+            return Err(Error::Config(format!(
+                "Profile '{}' is missing required field 'host'",
+                name
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -165,11 +255,14 @@ impl Config {
 
     /// Parses configuration from a TOML string.
     ///
+    /// Also validates all profiles after parsing to ensure required fields are present.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the TOML is invalid or contains incorrect types.
+    /// Returns an error if the TOML is invalid, contains incorrect types,
+    /// or if any profile fails validation (e.g., missing host field).
     pub fn parse(contents: &str) -> Result<Self> {
-        toml::from_str(contents).map_err(|e| {
+        let config: Self = toml::from_str(contents).map_err(|e| {
             let parse_error = ConfigParseError {
                 message: e.message().to_string(),
                 line: e.span().map(|s| {
@@ -186,7 +279,12 @@ impl Config {
                 }),
             };
             Error::Config(parse_error.to_string())
-        })
+        })?;
+
+        // Story 6.5: Validate all profiles have required fields
+        config.validate_profiles()?;
+
+        Ok(config)
     }
 
     /// Returns the path to the configuration file.
@@ -228,6 +326,79 @@ impl Config {
 
         // Last resort fallback
         PathBuf::from(".").join(".config").join(APP_DIR_NAME)
+    }
+
+    /// Retrieves a connection profile by name (Story 6.5).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The profile name as defined in the config file.
+    ///
+    /// # Returns
+    ///
+    /// A reference to the profile if found, or an error if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Config` if the profile does not exist.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [profiles.work]
+    /// host = "work.example.com"
+    /// ```
+    ///
+    /// ```ignore
+    /// let config = Config::load()?;
+    /// let profile = config.get_profile("work")?;
+    /// println!("Connecting to {}", profile.host);
+    /// ```
+    pub fn get_profile(&self, name: &str) -> Result<&ConnectionProfile> {
+        self.profiles.get(name).ok_or_else(|| {
+            Error::Config(format!("Profile '{}' not found in configuration", name))
+        })
+    }
+
+    /// Returns a list of all profile names (Story 6.5).
+    ///
+    /// Useful for listing available profiles or tab completion.
+    ///
+    /// # Returns
+    ///
+    /// A vector of profile names. Empty if no profiles are defined.
+    #[must_use]
+    pub fn profile_names(&self) -> Vec<&str> {
+        self.profiles.keys().map(String::as_str).collect()
+    }
+
+    /// Checks if a profile with the given name exists (Story 6.5).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The profile name to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the profile exists, `false` otherwise.
+    #[must_use]
+    pub fn has_profile(&self, name: &str) -> bool {
+        self.profiles.contains_key(name)
+    }
+
+    /// Validates all profiles in the configuration (Story 6.5).
+    ///
+    /// Called internally after parsing to ensure all profiles
+    /// have the required fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any profile fails validation.
+    pub fn validate_profiles(&self) -> Result<()> {
+        for (name, profile) in &self.profiles {
+            profile.validate(name)?;
+        }
+        Ok(())
     }
 }
 
@@ -592,5 +763,265 @@ enabled = false
         let no_clipboard = false; // CLI flag not set (default)
         let clipboard_enabled = !no_clipboard && config.clipboard.enabled;
         assert!(!clipboard_enabled); // Config wins when CLI is default
+    }
+
+    // Story 6.5: Connection profile tests
+    #[test]
+    fn test_config_default_has_empty_profiles() {
+        let config = Config::default();
+        assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn test_config_parse_without_profiles_backward_compat() {
+        // Existing configs without [profiles.*] should still work
+        let toml = r#"
+[defaults]
+port = 3389
+
+[audio]
+enabled = true
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(config.profiles.is_empty());
+        assert_eq!(config.defaults.port, 3389);
+    }
+
+    #[test]
+    fn test_config_parse_profile_minimal() {
+        // Profile with only required field (host)
+        let toml = r#"
+[profiles.minimal]
+host = "server.example.com"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.profiles.len(), 1);
+        let profile = config.get_profile("minimal").unwrap();
+        assert_eq!(profile.host, "server.example.com");
+        assert!(profile.port.is_none());
+        assert!(profile.username.is_none());
+        assert!(profile.domain.is_none());
+        assert!(profile.fullscreen.is_none());
+        assert!(profile.all_monitors.is_none());
+        assert!(profile.audio.is_none());
+        assert!(profile.microphone.is_none());
+        assert!(profile.clipboard.is_none());
+    }
+
+    #[test]
+    fn test_config_parse_profile_all_fields() {
+        let toml = r#"
+[profiles.work]
+host = "work.example.com"
+port = 13389
+username = "john"
+domain = "CORP"
+fullscreen = true
+all_monitors = true
+audio = true
+microphone = false
+clipboard = true
+"#;
+        let config = Config::parse(toml).unwrap();
+        let profile = config.get_profile("work").unwrap();
+        assert_eq!(profile.host, "work.example.com");
+        assert_eq!(profile.port, Some(13389));
+        assert_eq!(profile.username, Some("john".to_string()));
+        assert_eq!(profile.domain, Some("CORP".to_string()));
+        assert_eq!(profile.fullscreen, Some(true));
+        assert_eq!(profile.all_monitors, Some(true));
+        assert_eq!(profile.audio, Some(true));
+        assert_eq!(profile.microphone, Some(false));
+        assert_eq!(profile.clipboard, Some(true));
+    }
+
+    #[test]
+    fn test_config_parse_multiple_profiles() {
+        let toml = r#"
+[profiles.work]
+host = "work.example.com"
+username = "john"
+
+[profiles.home]
+host = "192.168.1.100"
+username = "admin"
+
+[profiles.test]
+host = "test.example.com"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.profiles.len(), 3);
+
+        let work = config.get_profile("work").unwrap();
+        assert_eq!(work.host, "work.example.com");
+        assert_eq!(work.username, Some("john".to_string()));
+
+        let home = config.get_profile("home").unwrap();
+        assert_eq!(home.host, "192.168.1.100");
+        assert_eq!(home.username, Some("admin".to_string()));
+
+        let test = config.get_profile("test").unwrap();
+        assert_eq!(test.host, "test.example.com");
+        assert!(test.username.is_none());
+    }
+
+    #[test]
+    fn test_config_get_profile_not_found() {
+        let config = Config::default();
+        let result = config.get_profile("nonexistent");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent"));
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn test_config_profile_names() {
+        let toml = r#"
+[profiles.alpha]
+host = "a.example.com"
+
+[profiles.beta]
+host = "b.example.com"
+
+[profiles.gamma]
+host = "c.example.com"
+"#;
+        let config = Config::parse(toml).unwrap();
+        let names = config.profile_names();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+        assert!(names.contains(&"gamma"));
+    }
+
+    #[test]
+    fn test_config_profile_names_empty() {
+        let config = Config::default();
+        let names = config.profile_names();
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_config_has_profile() {
+        let toml = r#"
+[profiles.work]
+host = "work.example.com"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert!(config.has_profile("work"));
+        assert!(!config.has_profile("home"));
+        assert!(!config.has_profile("nonexistent"));
+    }
+
+    #[test]
+    fn test_profile_validate_missing_host() {
+        // This tests the validate method directly
+        let profile = ConnectionProfile {
+            host: String::new(), // Empty host
+            port: None,
+            username: None,
+            domain: None,
+            fullscreen: None,
+            all_monitors: None,
+            audio: None,
+            microphone: None,
+            clipboard: None,
+        };
+        let result = profile.validate("test-profile");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("test-profile"));
+        assert!(err.contains("host"));
+    }
+
+    #[test]
+    fn test_profile_validate_success() {
+        let profile = ConnectionProfile {
+            host: "server.example.com".to_string(),
+            port: None,
+            username: None,
+            domain: None,
+            fullscreen: None,
+            all_monitors: None,
+            audio: None,
+            microphone: None,
+            clipboard: None,
+        };
+        assert!(profile.validate("test-profile").is_ok());
+    }
+
+    #[test]
+    fn test_config_parse_profile_empty_host_fails() {
+        // Profile with empty host string should fail validation
+        let toml = r#"
+[profiles.bad]
+host = ""
+"#;
+        let result = Config::parse(toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("bad"));
+        assert!(err.contains("host"));
+    }
+
+    #[test]
+    fn test_config_profiles_mixed_with_other_sections() {
+        // Profiles should work alongside other config sections
+        let toml = r#"
+[defaults]
+port = 3390
+username = "default-user"
+
+[audio]
+enabled = false
+
+[clipboard]
+enabled = true
+
+[profiles.work]
+host = "work.example.com"
+port = 3389
+"#;
+        let config = Config::parse(toml).unwrap();
+
+        // Check defaults
+        assert_eq!(config.defaults.port, 3390);
+        assert_eq!(config.defaults.username, Some("default-user".to_string()));
+
+        // Check audio
+        assert!(!config.audio.enabled);
+
+        // Check clipboard
+        assert!(config.clipboard.enabled);
+
+        // Check profile
+        let profile = config.get_profile("work").unwrap();
+        assert_eq!(profile.host, "work.example.com");
+        assert_eq!(profile.port, Some(3389));
+    }
+
+    #[test]
+    fn test_config_profile_with_ip_address() {
+        let toml = r#"
+[profiles.local]
+host = "192.168.1.100"
+"#;
+        let config = Config::parse(toml).unwrap();
+        let profile = config.get_profile("local").unwrap();
+        assert_eq!(profile.host, "192.168.1.100");
+    }
+
+    #[test]
+    fn test_config_profile_fullscreen_false() {
+        // Explicitly set fullscreen to false
+        let toml = r#"
+[profiles.windowed]
+host = "server.example.com"
+fullscreen = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        let profile = config.get_profile("windowed").unwrap();
+        assert_eq!(profile.fullscreen, Some(false));
     }
 }
