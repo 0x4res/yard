@@ -1144,6 +1144,32 @@ fn run_event_loop(
                         });
                     }
                 }
+                // Story 6.3: Handle disconnect button click
+                WindowEvent::DisconnectRequested => {
+                    info!("Disconnect requested via overlay button");
+
+                    // Story 6.3 AC3: Clean up any active file transfers
+                    if let Some(ref manager) = file_transfer_manager {
+                        if manager.active_count() > 0 || manager.pending_count() > 0 {
+                            info!(
+                                "Aborting {} active and {} pending file transfers",
+                                manager.active_count(),
+                                manager.pending_count()
+                            );
+                        }
+                        // Clean up staging directory (removes partial files)
+                        if let Err(e) = manager.cleanup_staging_dir() {
+                            warn!("Failed to cleanup staging directory: {}", e);
+                        }
+                    }
+
+                    // Send disconnect to network thread
+                    if let Err(e) = to_network_tx.blocking_send(ToNetwork::Disconnect) {
+                        error!("Failed to send disconnect: {}", e);
+                    }
+                    // Exit the event loop (graceful shutdown will happen in main)
+                    break;
+                }
             }
         }
     }

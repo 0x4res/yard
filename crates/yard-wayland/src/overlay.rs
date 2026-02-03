@@ -59,6 +59,20 @@ mod linux {
     /// Font character height in pixels.
     pub const FONT_HEIGHT: u32 = 10;
 
+    // Story 6.3: Disconnect button constants
+    /// Disconnect button width in pixels.
+    pub const BUTTON_WIDTH: u32 = 80;
+    /// Disconnect button height in pixels.
+    pub const BUTTON_HEIGHT: u32 = 24;
+    /// Margin from the right edge for the button.
+    pub const BUTTON_MARGIN: u32 = 10;
+    /// Disconnect button background color (semi-transparent red, BGRA format).
+    pub const BUTTON_BG_COLOR: [u8; 4] = [0x44, 0x44, 0xFF, 0xCC]; // Red with ~80% opacity
+    /// Disconnect button hover color (brighter red, BGRA format).
+    pub const BUTTON_HOVER_COLOR: [u8; 4] = [0x66, 0x66, 0xFF, 0xDD]; // Brighter red
+    /// Disconnect button text.
+    pub const BUTTON_TEXT: &str = "Disconnect";
+
     /// Connection status for overlay display (Story 6.2).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum ConnectionStatus {
@@ -494,6 +508,122 @@ mod linux {
         }
     }
 
+    // =========================================================================
+    // Story 6.3: Disconnect Button Rendering and Hit Testing
+    // =========================================================================
+
+    /// Renders a filled rectangle to the buffer (Story 6.3).
+    ///
+    /// # Arguments
+    /// * `buffer` - The BGRA buffer to render to
+    /// * `buffer_width` - Width of the buffer in pixels
+    /// * `x` - X position of the top-left corner
+    /// * `y` - Y position of the top-left corner
+    /// * `width` - Width of the rectangle
+    /// * `height` - Height of the rectangle
+    /// * `color` - BGRA color for the rectangle
+    pub fn render_filled_rect(
+        buffer: &mut [u8],
+        buffer_width: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        color: [u8; 4],
+    ) {
+        let buffer_height = buffer.len() as u32 / (buffer_width * 4);
+
+        for dy in 0..height {
+            for dx in 0..width {
+                let px = x + dx;
+                let py = y + dy;
+
+                if px < buffer_width && py < buffer_height {
+                    let offset = ((py * buffer_width + px) * 4) as usize;
+                    if offset + 4 <= buffer.len() {
+                        buffer[offset..offset + 4].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns the bounds of the disconnect button for hit testing (Story 6.3).
+    ///
+    /// # Arguments
+    /// * `overlay_width` - Width of the overlay in pixels
+    /// * `overlay_height` - Height of the overlay in pixels
+    ///
+    /// # Returns
+    /// Tuple of (x, y, width, height) representing the button bounds relative to overlay.
+    pub fn disconnect_button_bounds(overlay_width: u32, overlay_height: u32) -> (u32, u32, u32, u32) {
+        let x = overlay_width.saturating_sub(BUTTON_WIDTH + BUTTON_MARGIN);
+        let y = (overlay_height.saturating_sub(BUTTON_HEIGHT)) / 2;
+        (x, y, BUTTON_WIDTH, BUTTON_HEIGHT)
+    }
+
+    /// Tests if a point is within the disconnect button bounds (Story 6.3).
+    ///
+    /// # Arguments
+    /// * `overlay_width` - Width of the overlay in pixels
+    /// * `overlay_height` - Height of the overlay in pixels
+    /// * `pointer_x` - X coordinate of the pointer
+    /// * `pointer_y` - Y coordinate of the pointer
+    ///
+    /// # Returns
+    /// `true` if the pointer is within the button bounds, `false` otherwise.
+    pub fn hit_test_disconnect_button(
+        overlay_width: u32,
+        overlay_height: u32,
+        pointer_x: f64,
+        pointer_y: f64,
+    ) -> bool {
+        // Guard against negative coordinates (would overflow when cast to u32)
+        if pointer_x < 0.0 || pointer_y < 0.0 {
+            return false;
+        }
+        let (bx, by, bw, bh) = disconnect_button_bounds(overlay_width, overlay_height);
+        let px = pointer_x as u32;
+        let py = pointer_y as u32;
+        px >= bx && px < bx + bw && py >= by && py < by + bh
+    }
+
+    /// Renders the disconnect button to the buffer (Story 6.3).
+    ///
+    /// Draws a filled rectangle with centered "Disconnect" text.
+    ///
+    /// # Arguments
+    /// * `buffer` - The BGRA buffer to render to
+    /// * `buffer_width` - Width of the buffer in pixels
+    /// * `overlay_height` - Height of the overlay in pixels
+    /// * `hovered` - Whether the button is currently hovered
+    pub fn render_disconnect_button(
+        buffer: &mut [u8],
+        buffer_width: u32,
+        overlay_height: u32,
+        hovered: bool,
+    ) {
+        let (bx, by, bw, bh) = disconnect_button_bounds(buffer_width, overlay_height);
+
+        // Choose color based on hover state
+        let bg_color = if hovered {
+            BUTTON_HOVER_COLOR
+        } else {
+            BUTTON_BG_COLOR
+        };
+
+        // Render button background
+        render_filled_rect(buffer, buffer_width, bx, by, bw, bh, bg_color);
+
+        // Center the text within the button
+        let text_width = BUTTON_TEXT.len() as u32 * FONT_WIDTH;
+        let text_x = bx + (bw.saturating_sub(text_width)) / 2;
+        let text_y = by + (bh.saturating_sub(FONT_HEIGHT)) / 2;
+
+        // Render button text
+        render_text(buffer, buffer_width, text_x, text_y, BUTTON_TEXT, COLOR_WHITE);
+    }
+
     /// State of the overlay visibility.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum OverlayState {
@@ -767,6 +897,9 @@ mod linux {
         let text = content.format_status_text();
         let text_x = left_margin + (indicator_radius * 2) + 10;
         render_text(&mut buffer, width, text_x, text_y, &text, COLOR_WHITE);
+
+        // Story 6.3: Render disconnect button
+        render_disconnect_button(&mut buffer, width, height, false);
 
         buffer
     }
@@ -1149,6 +1282,175 @@ mod linux {
             let expected_chars = 95;
             let expected_size = expected_chars * (FONT_HEIGHT as usize);
             assert_eq!(FONT_DATA.len(), expected_size, "Font data should cover ASCII 32-126");
+        }
+
+        // Story 6.3: Disconnect button tests
+
+        #[test]
+        fn test_disconnect_button_bounds() {
+            let overlay_width = 800u32;
+            let overlay_height = 40u32;
+
+            let (x, y, w, h) = disconnect_button_bounds(overlay_width, overlay_height);
+
+            // Button should be positioned on the right side
+            assert_eq!(x, overlay_width - BUTTON_WIDTH - BUTTON_MARGIN);
+            // Button should be vertically centered
+            assert_eq!(y, (overlay_height - BUTTON_HEIGHT) / 2);
+            assert_eq!(w, BUTTON_WIDTH);
+            assert_eq!(h, BUTTON_HEIGHT);
+        }
+
+        #[test]
+        fn test_disconnect_button_bounds_different_widths() {
+            // Test with different overlay widths
+            for width in [400u32, 800, 1200, 1920] {
+                let (x, _y, w, _h) = disconnect_button_bounds(width, 40);
+                assert_eq!(x, width - BUTTON_WIDTH - BUTTON_MARGIN);
+                assert_eq!(w, BUTTON_WIDTH);
+            }
+        }
+
+        #[test]
+        fn test_hit_test_disconnect_button_inside() {
+            let overlay_width = 800u32;
+            let overlay_height = 40u32;
+
+            let (bx, by, bw, bh) = disconnect_button_bounds(overlay_width, overlay_height);
+
+            // Center of button should hit
+            let center_x = bx as f64 + (bw as f64 / 2.0);
+            let center_y = by as f64 + (bh as f64 / 2.0);
+            assert!(hit_test_disconnect_button(overlay_width, overlay_height, center_x, center_y));
+
+            // Top-left corner (just inside)
+            assert!(hit_test_disconnect_button(overlay_width, overlay_height, bx as f64, by as f64));
+
+            // Bottom-right corner (just inside)
+            assert!(hit_test_disconnect_button(
+                overlay_width, overlay_height,
+                (bx + bw - 1) as f64, (by + bh - 1) as f64
+            ));
+        }
+
+        #[test]
+        fn test_hit_test_disconnect_button_outside() {
+            let overlay_width = 800u32;
+            let overlay_height = 40u32;
+
+            let (bx, by, _bw, bh) = disconnect_button_bounds(overlay_width, overlay_height);
+
+            // Left of button
+            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, (bx - 1) as f64, (by + bh / 2) as f64));
+
+            // Above button
+            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, (bx + 10) as f64, (by - 1) as f64));
+
+            // Below button
+            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, (bx + 10) as f64, (by + bh) as f64));
+
+            // Far left (in status text area)
+            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, 50.0, 20.0));
+        }
+
+        #[test]
+        fn test_hit_test_disconnect_button_edge_cases() {
+            let overlay_width = 800u32;
+            let overlay_height = 40u32;
+
+            // Negative coordinates
+            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, -10.0, 20.0));
+
+            // Beyond overlay width
+            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, 900.0, 20.0));
+
+            // Beyond overlay height
+            assert!(!hit_test_disconnect_button(overlay_width, overlay_height, 750.0, 50.0));
+        }
+
+        #[test]
+        fn test_render_filled_rect() {
+            let width = 100u32;
+            let height = 50u32;
+            let mut buffer = vec![0u8; (width * height * 4) as usize];
+
+            let rect_color = [0xFF, 0x00, 0x00, 0xCC]; // Blue with alpha
+            render_filled_rect(&mut buffer, width, 10, 10, 20, 15, rect_color);
+
+            // Check a pixel inside the rectangle
+            let idx = ((15 * width + 15) * 4) as usize;
+            assert_eq!(&buffer[idx..idx + 4], &rect_color);
+
+            // Check a pixel outside the rectangle is still zero
+            let outside_idx = ((5 * width + 5) * 4) as usize;
+            assert_eq!(&buffer[outside_idx..outside_idx + 4], &[0, 0, 0, 0]);
+        }
+
+        #[test]
+        fn test_render_filled_rect_bounds_check() {
+            let width = 50u32;
+            let height = 50u32;
+            let mut buffer = vec![0u8; (width * height * 4) as usize];
+
+            // Rectangle that extends beyond buffer bounds should not panic
+            render_filled_rect(&mut buffer, width, 40, 40, 20, 20, [0xFF, 0xFF, 0xFF, 0xFF]);
+
+            // Should have filled what's possible within bounds
+            let idx = ((45 * width + 45) * 4) as usize;
+            assert_eq!(&buffer[idx..idx + 4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+
+        #[test]
+        fn test_render_disconnect_button() {
+            let width = 800u32;
+            let height = 40u32;
+            let mut buffer = vec![0u8; (width * height * 4) as usize];
+
+            render_disconnect_button(&mut buffer, width, height, false);
+
+            // Button area should have non-zero pixels (button background)
+            let (bx, by, _, _) = disconnect_button_bounds(width, height);
+            let idx = ((by + 5) * width + bx + 5) as usize * 4;
+            assert_ne!(&buffer[idx..idx + 4], &[0, 0, 0, 0], "Button area should be rendered");
+
+            // Check that button background color is present
+            let has_button_color = buffer.chunks(4).any(|p| p == BUTTON_BG_COLOR);
+            assert!(has_button_color, "Should have button background color");
+
+            // Check that white text pixels are present
+            let has_white = buffer.chunks(4).any(|p| p == COLOR_WHITE);
+            assert!(has_white, "Should have white text pixels from 'Disconnect' label");
+        }
+
+        #[test]
+        fn test_render_disconnect_button_hover_state() {
+            let width = 800u32;
+            let height = 40u32;
+            let mut buffer_normal = vec![0u8; (width * height * 4) as usize];
+            let mut buffer_hover = vec![0u8; (width * height * 4) as usize];
+
+            render_disconnect_button(&mut buffer_normal, width, height, false);
+            render_disconnect_button(&mut buffer_hover, width, height, true);
+
+            // Hover state should use different color
+            let has_hover_color = buffer_hover.chunks(4).any(|p| p == BUTTON_HOVER_COLOR);
+            assert!(has_hover_color, "Hover state should have hover background color");
+
+            let has_normal_color = buffer_normal.chunks(4).any(|p| p == BUTTON_BG_COLOR);
+            assert!(has_normal_color, "Normal state should have normal background color");
+        }
+
+        #[test]
+        fn test_overlay_with_disconnect_button() {
+            let width = 800u32;
+            let height = 40u32;
+
+            let content = OverlayContent::connected("test.server.com");
+            let buffer = generate_overlay_buffer_with_content(width, height, OVERLAY_BG_COLOR, Some(&content));
+
+            // Should have button background color
+            let has_button_color = buffer.chunks(4).any(|p| p == BUTTON_BG_COLOR);
+            assert!(has_button_color, "Overlay with content should include disconnect button");
         }
     }
 }

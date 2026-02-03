@@ -54,9 +54,12 @@ mod linux {
     use std::io::{Read, Write};
 
     use crate::overlay::{
-        generate_overlay_buffer_with_content, ConnectionStatus, OverlayContent,
-        OverlayController, OverlayState, OVERLAY_BG_COLOR, OVERLAY_HEIGHT,
+        generate_overlay_buffer_with_content, hit_test_disconnect_button, ConnectionStatus,
+        OverlayContent, OverlayController, OverlayState, OVERLAY_BG_COLOR, OVERLAY_HEIGHT,
     };
+
+    /// Linux evdev button code for left mouse button (BTN_LEFT = 0x110 = 272).
+    const BTN_LEFT: u32 = 272;
 
     /// Information about a connected monitor (Story 3.1).
     ///
@@ -740,6 +743,9 @@ mod linux {
             /// The monitor ID where the overlay is shown (if visible).
             monitor_id: Option<u32>,
         },
+        /// Story 6.3: User clicked disconnect button in overlay.
+        /// Emitted when the disconnect button is clicked.
+        DisconnectRequested,
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -919,6 +925,24 @@ mod linux {
         pub fn layer_surface(&self) -> &LayerSurface {
             &self.layer_surface
         }
+
+        /// Returns a reference to the underlying Wayland surface.
+        ///
+        /// # Story 6.3
+        /// Used to identify if pointer events occurred on this overlay surface.
+        pub fn wl_surface(&self) -> &WlSurface {
+            &self.surface
+        }
+
+        /// Returns the width of the overlay surface.
+        pub fn width(&self) -> u32 {
+            self.width
+        }
+
+        /// Returns the height of the overlay surface.
+        pub fn height(&self) -> u32 {
+            self.height
+        }
     }
 
     /// Configuration for creating a Wayland window.
@@ -1063,6 +1087,10 @@ mod linux {
         overlay_surfaces: HashMap<u32, OverlaySurface>,
         /// Story 6.2: Current content to display in the overlay.
         overlay_content: OverlayContent,
+        /// Story 6.3: Tracks if a button press started on the disconnect button.
+        /// Stores (overlay_width, overlay_height) when press started on disconnect button.
+        /// Used to verify that release happens on the same button.
+        disconnect_button_press: Option<(u32, u32)>,
     }
 
     impl WaylandWindow {
@@ -1187,6 +1215,8 @@ mod linux {
                 overlay_surfaces: HashMap::new(),
                 // Story 6.2: Overlay content
                 overlay_content: OverlayContent::default(),
+                // Story 6.3: Disconnect button press tracking
+                disconnect_button_press: None,
             };
 
             Ok((event_loop, state, event_rx))
@@ -1275,6 +1305,20 @@ mod linux {
         /// # Story 6.2
         pub fn overlay_content(&self) -> &OverlayContent {
             &self.overlay_content
+        }
+
+        /// Finds an overlay surface by its underlying Wayland surface.
+        ///
+        /// # Story 6.3
+        /// Used to identify if a pointer event occurred on an overlay surface.
+        /// Returns the overlay surface dimensions (width, height) if found.
+        fn find_overlay_by_surface(&self, surface: &WlSurface) -> Option<(u32, u32)> {
+            for (_monitor_id, overlay) in &self.overlay_surfaces {
+                if overlay.wl_surface() == surface {
+                    return Some((overlay.width(), overlay.height()));
+                }
+            }
+            None
         }
 
         /// Check pointer position and update overlay visibility.
@@ -3211,6 +3255,26 @@ mod linux {
                     PointerEventKind::Press { button, .. } => {
                         let (x, y) = event.position;
                         tracing::trace!("Mouse button {} pressed at ({:.1}, {:.1})", button, x, y);
+
+                        // Story 6.3: Check if press is on overlay disconnect button
+                        // Only left mouse button (BTN_LEFT = 0x110 = 272)
+                        if button == BTN_LEFT {
+                            if let Some((overlay_w, overlay_h)) =
+                                self.find_overlay_by_surface(&event.surface)
+                            {
+                                if hit_test_disconnect_button(overlay_w, overlay_h, x, y) {
+                                    tracing::debug!(
+                                        "Disconnect button press at ({:.1}, {:.1})",
+                                        x,
+                                        y
+                                    );
+                                    self.disconnect_button_press = Some((overlay_w, overlay_h));
+                                    // Don't send mouse event to remote for overlay clicks
+                                    continue;
+                                }
+                            }
+                        }
+
                         // Track pressed button for release on Leave
                         if !self.pressed_buttons.contains(&button) {
                             self.pressed_buttons.push(button);
@@ -3225,6 +3289,22 @@ mod linux {
                     PointerEventKind::Release { button, .. } => {
                         let (x, y) = event.position;
                         tracing::trace!("Mouse button {} released at ({:.1}, {:.1})", button, x, y);
+
+                        // Story 6.3: Check if this completes a disconnect button click
+                        // Only left mouse button (BTN_LEFT = 0x110 = 272)
+                        if button == BTN_LEFT {
+                            if let Some((overlay_w, overlay_h)) = self.disconnect_button_press.take()
+                            {
+                                // Verify release is also on the disconnect button
+                                if hit_test_disconnect_button(overlay_w, overlay_h, x, y) {
+                                    tracing::info!("Disconnect button clicked");
+                                    let _ = self.event_tx.send(WindowEvent::DisconnectRequested);
+                                    // Don't send mouse event to remote for overlay clicks
+                                    continue;
+                                }
+                            }
+                        }
+
                         // Remove from tracked pressed buttons
                         self.pressed_buttons.retain(|&b| b != button);
                         let _ = self.event_tx.send(WindowEvent::MouseButton {
@@ -3960,6 +4040,8 @@ mod stub {
             visible: bool,
             monitor_id: Option<u32>,
         },
+        /// Story 6.3: User clicked disconnect button in overlay (stub).
+        DisconnectRequested,
     }
 
     /// Keyboard shortcuts that the window can detect.
@@ -5630,5 +5712,23 @@ mod tests {
         let changed = controller.check_pointer_position(5.0, 1);
         assert!(!changed);
         assert!(!controller.is_visible());
+    }
+
+    // ============================================================
+    // Story 6.3: Disconnect Button Tests
+    // ============================================================
+
+    #[test]
+    fn test_window_event_disconnect_requested() {
+        // Story 6.3: Test that DisconnectRequested event exists and can be matched
+        let event = WindowEvent::DisconnectRequested;
+
+        // Verify the event can be matched
+        match event {
+            WindowEvent::DisconnectRequested => {
+                // Expected - disconnect button was clicked
+            }
+            _ => panic!("Expected DisconnectRequested event"),
+        }
     }
 }
