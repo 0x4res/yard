@@ -79,6 +79,7 @@ impl Default for ClipboardConfig {
 /// Only `host` is required; all other fields are optional and will
 /// use global defaults or CLI arguments if not specified.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionProfile {
     /// Target hostname or IP address (REQUIRED).
     ///
@@ -133,7 +134,7 @@ pub struct ConnectionProfile {
 impl ConnectionProfile {
     /// Validates that the profile has all required fields.
     ///
-    /// Currently, only `host` is required and must be non-empty.
+    /// Currently, only `host` is required and must be non-empty (not just whitespace).
     ///
     /// # Arguments
     ///
@@ -141,9 +142,10 @@ impl ConnectionProfile {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Config` if validation fails (e.g., empty host).
+    /// Returns `Error::Config` if validation fails (e.g., empty or whitespace-only host).
+    #[must_use = "validation result should be checked"]
     pub fn validate(&self, name: &str) -> Result<()> {
-        if self.host.is_empty() {
+        if self.host.trim().is_empty() {
             return Err(Error::Config(format!(
                 "Profile '{}' is missing required field 'host'",
                 name
@@ -349,27 +351,33 @@ impl Config {
     /// host = "work.example.com"
     /// ```
     ///
-    /// ```ignore
-    /// let config = Config::load()?;
-    /// let profile = config.get_profile("work")?;
-    /// println!("Connecting to {}", profile.host);
+    /// ```no_run
+    /// use yard_core::Config;
+    ///
+    /// let config = Config::load().expect("failed to load config");
+    /// if let Ok(profile) = config.get_profile("work") {
+    ///     println!("Connecting to {}", profile.host);
+    /// }
     /// ```
     pub fn get_profile(&self, name: &str) -> Result<&ConnectionProfile> {
-        self.profiles.get(name).ok_or_else(|| {
-            Error::Config(format!("Profile '{}' not found in configuration", name))
-        })
+        self.profiles
+            .get(name)
+            .ok_or_else(|| Error::Config(format!("Profile '{}' not found in configuration", name)))
     }
 
-    /// Returns a list of all profile names (Story 6.5).
+    /// Returns a sorted list of all profile names (Story 6.5).
     ///
     /// Useful for listing available profiles or tab completion.
+    /// Names are sorted alphabetically for consistent output.
     ///
     /// # Returns
     ///
-    /// A vector of profile names. Empty if no profiles are defined.
+    /// A vector of profile names, sorted alphabetically. Empty if no profiles are defined.
     #[must_use]
     pub fn profile_names(&self) -> Vec<&str> {
-        self.profiles.keys().map(String::as_str).collect()
+        let mut names: Vec<&str> = self.profiles.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     /// Checks if a profile with the given name exists (Story 6.5).
@@ -1023,5 +1031,93 @@ fullscreen = false
         let config = Config::parse(toml).unwrap();
         let profile = config.get_profile("windowed").unwrap();
         assert_eq!(profile.fullscreen, Some(false));
+    }
+
+    #[test]
+    fn test_config_parse_profile_whitespace_host_fails() {
+        // Profile with whitespace-only host should fail validation
+        let toml = r#"
+[profiles.bad]
+host = "   "
+"#;
+        let result = Config::parse(toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("bad"));
+        assert!(err.contains("host"));
+    }
+
+    #[test]
+    fn test_profile_validate_whitespace_only_host() {
+        // Whitespace-only host should fail validation
+        let profile = ConnectionProfile {
+            host: "   \t\n  ".to_string(),
+            port: None,
+            username: None,
+            domain: None,
+            fullscreen: None,
+            all_monitors: None,
+            audio: None,
+            microphone: None,
+            clipboard: None,
+        };
+        let result = profile.validate("whitespace-profile");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("whitespace-profile"));
+        assert!(err.contains("host"));
+    }
+
+    #[test]
+    fn test_validate_profiles_stops_at_first_error() {
+        // Validation stops at first invalid profile (order is non-deterministic due to HashMap)
+        let toml = r#"
+[profiles.valid]
+host = "valid.example.com"
+
+[profiles.invalid1]
+host = ""
+
+[profiles.invalid2]
+host = ""
+"#;
+        let result = Config::parse(toml);
+        assert!(result.is_err());
+        // Should contain one of the invalid profile names
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("host"));
+        assert!(err.contains("invalid")); // Either invalid1 or invalid2
+    }
+
+    #[test]
+    fn test_config_profile_names_sorted() {
+        // Profile names should be returned in sorted order
+        let toml = r#"
+[profiles.zebra]
+host = "z.example.com"
+
+[profiles.alpha]
+host = "a.example.com"
+
+[profiles.middle]
+host = "m.example.com"
+"#;
+        let config = Config::parse(toml).unwrap();
+        let names = config.profile_names();
+        assert_eq!(names, vec!["alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn test_config_profile_unknown_field_rejected() {
+        // Unknown fields in profiles should be rejected (serde deny_unknown_fields)
+        let toml = r#"
+[profiles.typo]
+host = "server.example.com"
+fulscreen = true
+"#;
+        let result = Config::parse(toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("fulscreen") || err.contains("unknown"));
     }
 }
