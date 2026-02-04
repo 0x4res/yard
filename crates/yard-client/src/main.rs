@@ -69,8 +69,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Connect to an RDP server.
+    ///
+    /// The HOST argument can be either:
+    /// - A profile name defined in config.toml (e.g., `yard connect work`)
+    /// - A hostname or IP address (e.g., `yard connect server.example.com`)
+    ///
+    /// If a profile name matches, it takes precedence over treating the argument as a hostname.
+    /// When using a profile, its settings are applied but CLI arguments take precedence.
     Connect {
-        /// Target hostname or IP address.
+        /// Target hostname, IP address, or profile name from config.toml.
+        /// Profile names take precedence: if "work" is both a profile and a valid hostname,
+        /// the profile settings are used.
         host: String,
 
         /// Target port (default: 3389, or from config file).
@@ -166,44 +175,111 @@ fn run(cli: Cli) -> Result<u8> {
             // User feedback (always visible, not affected by log level)
             eprintln!("YARD v{}", env!("CARGO_PKG_VERSION"));
 
-            // Apply config defaults: CLI args take precedence over config file
-            let effective_port = port.unwrap_or_else(|| app_config.defaults.effective_port());
-            let effective_username = username.or(app_config.defaults.username.clone());
-            let effective_domain = domain.or(app_config.defaults.domain.clone());
+            // Story 6.6: Check if 'host' is a profile name
+            // If it matches a profile, use profile settings (with CLI overrides)
+            // If not, treat it as a hostname (existing behavior)
+            let profile = if app_config.has_profile(&host) {
+                let p = app_config
+                    .get_profile(&host)
+                    .expect("profile exists after has_profile check");
+                info!("Using profile '{}' to connect to '{}'", host, p.host);
+                Some(p)
+            } else {
+                None
+            };
+
+            // Determine effective host: from profile or CLI argument
+            let effective_host = profile
+                .as_ref()
+                .map(|p| p.host.clone())
+                .unwrap_or_else(|| host.clone());
+
+            // Apply settings with precedence: CLI > profile > global defaults
+            // Port: CLI --port > profile.port > defaults.port
+            let effective_port = port
+                .or_else(|| profile.as_ref().and_then(|p| p.port))
+                .unwrap_or_else(|| app_config.defaults.effective_port());
+
+            // Username: CLI -u > profile.username > defaults.username
+            let effective_username = username
+                .or_else(|| profile.as_ref().and_then(|p| p.username.clone()))
+                .or_else(|| app_config.defaults.username.clone());
+
+            // Domain: CLI -d > profile.domain > defaults.domain
+            let effective_domain = domain
+                .or_else(|| profile.as_ref().and_then(|p| p.domain.clone()))
+                .or_else(|| app_config.defaults.domain.clone());
+
+            // Fullscreen: CLI -f OR profile.fullscreen (CLI flag is additive)
+            let effective_fullscreen =
+                fullscreen || profile.as_ref().and_then(|p| p.fullscreen).unwrap_or(false);
+
+            // All monitors: CLI --all-monitors OR profile.all_monitors
+            let effective_all_monitors = all_monitors
+                || profile
+                    .as_ref()
+                    .and_then(|p| p.all_monitors)
+                    .unwrap_or(false);
+
+            // Audio: CLI --no-audio negates; otherwise profile.audio > config.audio.enabled
+            let audio_enabled = if no_audio {
+                false
+            } else {
+                profile
+                    .as_ref()
+                    .and_then(|p| p.audio)
+                    .unwrap_or(app_config.audio.enabled)
+            };
+
+            // Microphone: CLI --no-microphone negates; otherwise profile.microphone > config.audio.microphone
+            let microphone_enabled = if no_microphone {
+                false
+            } else {
+                profile
+                    .as_ref()
+                    .and_then(|p| p.microphone)
+                    .unwrap_or(app_config.audio.microphone)
+            };
+
+            // Clipboard: CLI --no-clipboard negates; otherwise profile.clipboard > config.clipboard.enabled
+            let clipboard_enabled = if no_clipboard {
+                false
+            } else {
+                profile
+                    .as_ref()
+                    .and_then(|p| p.clipboard)
+                    .unwrap_or(app_config.clipboard.enabled)
+            };
 
             // Build connection config, parsing domain from username if present
             // Supports: DOMAIN\user, user@domain.com, or plain username
             let mut config = if let Some(ref user) = effective_username {
-                ConnectionConfig::from_username(&host, effective_port, user)
+                ConnectionConfig::from_username(&effective_host, effective_port, user)
             } else {
-                ConnectionConfig::new(&host, effective_port)
+                ConnectionConfig::new(&effective_host, effective_port)
             };
 
-            // Explicit domain (CLI or config) overrides parsed domain from username
+            // Explicit domain (CLI, profile, or global config) overrides parsed domain from username
             if let Some(dom) = effective_domain {
                 config = config.with_domain(dom);
             }
 
             // Prompt for password if username is provided (secure, no echo)
+            // Note: Profiles don't store passwords for security
             if config.username.is_some() {
                 let password = prompt_password(&config)?;
                 config = config.with_password(password);
             }
 
-            // Determine audio settings: CLI flags override config file
-            let audio_enabled = !no_audio && app_config.audio.enabled;
-            let microphone_enabled = !no_microphone && app_config.audio.microphone;
-
-            // Determine clipboard setting: CLI flag overrides config file (Story 5.1)
-            let clipboard_enabled = !no_clipboard && app_config.clipboard.enabled;
+            // Apply clipboard setting
             if !clipboard_enabled {
                 config = config.without_clipboard();
             }
 
             run_connection(
                 config,
-                fullscreen,
-                all_monitors,
+                effective_fullscreen,
+                effective_all_monitors,
                 audio_enabled,
                 microphone_enabled,
             )
@@ -517,6 +593,15 @@ fn run_event_loop(
         u32::from(desktop_size.height),
     );
 
+    // Extract server name for overlay BEFORE moving window_config
+    // Story 6.2: Parse server name from title (format: "YARD - user@server:port")
+    let server_name = window_config
+        .title
+        .split('@')
+        .nth(1)
+        .unwrap_or("Unknown")
+        .to_string();
+
     // Create Wayland window
     info!("Creating Wayland window...");
     let (mut event_loop, mut window, event_rx) = match WaylandWindow::new(window_config) {
@@ -592,13 +677,6 @@ fn run_event_loop(
 
     // Story 6.2: Track session state for overlay display
     let session_start = std::time::Instant::now();
-    // Extract server name for overlay (strip port if present)
-    let server_name = window_config
-        .title
-        .split('@')
-        .nth(1)
-        .unwrap_or("Unknown")
-        .to_string();
 
     // Set initial overlay content (connected state)
     window.update_overlay_content(build_connected_overlay(&server_name, session_start, None));
@@ -1537,6 +1615,348 @@ mod tests {
         assert_eq!(truncate_string("héllo", 4), "h...");
         assert_eq!(truncate_string("日本語テスト", 5), "日本...");
         assert_eq!(truncate_string("émoji🎉test", 6), "émo...");
+    }
+
+    // Story 6.6: Profile connection tests
+    mod profile_tests {
+        use yard_core::Config;
+
+        /// Helper to create a test config with profiles
+        fn config_with_profile(name: &str, host: &str) -> Config {
+            let toml = format!(
+                r#"
+[profiles.{}]
+host = "{}"
+"#,
+                name, host
+            );
+            Config::parse(&toml).unwrap()
+        }
+
+        /// Helper to create a config with a fully-populated profile
+        fn config_with_full_profile() -> Config {
+            let toml = r#"
+[profiles.work]
+host = "work.example.com"
+port = 13389
+username = "john"
+domain = "CORP"
+fullscreen = true
+all_monitors = true
+audio = true
+microphone = false
+clipboard = true
+"#;
+            Config::parse(toml).unwrap()
+        }
+
+        #[test]
+        fn test_profile_detection_exists() {
+            let config = config_with_profile("work", "work.example.com");
+            assert!(config.has_profile("work"));
+            assert!(!config.has_profile("nonexistent"));
+        }
+
+        #[test]
+        fn test_profile_detection_hostname_fallback() {
+            // When no profile matches, the argument should be treated as hostname
+            let config = Config::default();
+            assert!(!config.has_profile("server.example.com"));
+            assert!(!config.has_profile("192.168.1.100"));
+        }
+
+        #[test]
+        fn test_profile_get_host() {
+            let config = config_with_profile("myserver", "actual-host.example.com");
+            let profile = config.get_profile("myserver").unwrap();
+            assert_eq!(profile.host, "actual-host.example.com");
+        }
+
+        #[test]
+        fn test_profile_all_fields_parsed() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            assert_eq!(profile.host, "work.example.com");
+            assert_eq!(profile.port, Some(13389));
+            assert_eq!(profile.username, Some("john".to_string()));
+            assert_eq!(profile.domain, Some("CORP".to_string()));
+            assert_eq!(profile.fullscreen, Some(true));
+            assert_eq!(profile.all_monitors, Some(true));
+            assert_eq!(profile.audio, Some(true));
+            assert_eq!(profile.microphone, Some(false));
+            assert_eq!(profile.clipboard, Some(true));
+        }
+
+        #[test]
+        fn test_profile_minimal_only_host() {
+            let config = config_with_profile("minimal", "server.test.com");
+            let profile = config.get_profile("minimal").unwrap();
+
+            assert_eq!(profile.host, "server.test.com");
+            assert!(profile.port.is_none());
+            assert!(profile.username.is_none());
+            assert!(profile.domain.is_none());
+            assert!(profile.fullscreen.is_none());
+            assert!(profile.all_monitors.is_none());
+            assert!(profile.audio.is_none());
+            assert!(profile.microphone.is_none());
+            assert!(profile.clipboard.is_none());
+        }
+
+        // Test the merging logic (simulating what run() does)
+        #[test]
+        fn test_merge_cli_overrides_profile_port() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI provides port, should override profile
+            let cli_port: Option<u16> = Some(3390);
+            let effective_port = cli_port
+                .or(profile.port)
+                .unwrap_or(config.defaults.effective_port());
+
+            assert_eq!(effective_port, 3390); // CLI wins
+        }
+
+        #[test]
+        fn test_merge_profile_provides_port_when_cli_none() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI doesn't provide port, profile should be used
+            let cli_port: Option<u16> = None;
+            let effective_port = cli_port
+                .or(profile.port)
+                .unwrap_or(config.defaults.effective_port());
+
+            assert_eq!(effective_port, 13389); // Profile wins
+        }
+
+        #[test]
+        fn test_merge_default_port_when_neither_provides() {
+            let config = config_with_profile("minimal", "server.test.com");
+            let profile = config.get_profile("minimal").unwrap();
+
+            let cli_port: Option<u16> = None;
+            let effective_port = cli_port
+                .or(profile.port)
+                .unwrap_or(config.defaults.effective_port());
+
+            assert_eq!(effective_port, 3389); // Default wins
+        }
+
+        #[test]
+        fn test_merge_cli_overrides_profile_username() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            let cli_username: Option<String> = Some("override-user".to_string());
+            let effective_username = cli_username
+                .or_else(|| profile.username.clone())
+                .or_else(|| config.defaults.username.clone());
+
+            assert_eq!(effective_username, Some("override-user".to_string()));
+        }
+
+        #[test]
+        fn test_merge_fullscreen_cli_flag_additive() {
+            let config = config_with_profile("no-fullscreen", "server.test.com");
+            let profile = config.get_profile("no-fullscreen").unwrap();
+
+            // CLI --fullscreen is set, profile has no fullscreen
+            let cli_fullscreen = true;
+            let effective_fullscreen = cli_fullscreen || profile.fullscreen.unwrap_or(false);
+
+            assert!(effective_fullscreen); // CLI flag enables it
+        }
+
+        #[test]
+        fn test_merge_fullscreen_from_profile() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI --fullscreen is NOT set, but profile has fullscreen=true
+            let cli_fullscreen = false;
+            let effective_fullscreen = cli_fullscreen || profile.fullscreen.unwrap_or(false);
+
+            assert!(effective_fullscreen); // Profile enables it
+        }
+
+        #[test]
+        fn test_merge_no_audio_flag_overrides_profile() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI --no-audio is set, profile has audio=true
+            let no_audio = true;
+            let audio_enabled = if no_audio {
+                false
+            } else {
+                profile.audio.unwrap_or(config.audio.enabled)
+            };
+
+            assert!(!audio_enabled); // CLI --no-audio wins
+        }
+
+        #[test]
+        fn test_merge_audio_from_profile_when_no_flag() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI --no-audio is NOT set, profile has audio=true
+            let no_audio = false;
+            let audio_enabled = if no_audio {
+                false
+            } else {
+                profile.audio.unwrap_or(config.audio.enabled)
+            };
+
+            assert!(audio_enabled); // Profile enables it
+        }
+
+        #[test]
+        fn test_merge_microphone_disabled_by_profile() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // Profile has microphone=false
+            let no_microphone = false;
+            let microphone_enabled = if no_microphone {
+                false
+            } else {
+                profile.microphone.unwrap_or(config.audio.microphone)
+            };
+
+            assert!(!microphone_enabled); // Profile disables it
+        }
+
+        #[test]
+        fn test_empty_string_not_profile() {
+            // Empty string should never match a profile
+            let config = Config::default();
+            // Empty profile name can't exist
+            assert!(!config.has_profile(""));
+        }
+
+        #[test]
+        fn test_profile_name_looks_like_hostname() {
+            // Profile name that looks like a hostname (using quoted key in TOML)
+            // TOML requires quoting keys with dots
+            let toml = r#"
+[profiles."server.local"]
+host = "real-server.example.com"
+"#;
+            let config = Config::parse(toml).unwrap();
+            assert!(config.has_profile("server.local"));
+
+            let profile = config.get_profile("server.local").unwrap();
+            assert_eq!(profile.host, "real-server.example.com");
+        }
+
+        #[test]
+        fn test_merge_no_clipboard_flag_overrides_profile() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI --no-clipboard is set, profile has clipboard=true
+            let no_clipboard = true;
+            let clipboard_enabled = if no_clipboard {
+                false
+            } else {
+                profile.clipboard.unwrap_or(config.clipboard.enabled)
+            };
+
+            assert!(!clipboard_enabled); // CLI --no-clipboard wins
+        }
+
+        #[test]
+        fn test_merge_clipboard_from_profile_when_no_flag() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI --no-clipboard is NOT set, profile has clipboard=true
+            let no_clipboard = false;
+            let clipboard_enabled = if no_clipboard {
+                false
+            } else {
+                profile.clipboard.unwrap_or(config.clipboard.enabled)
+            };
+
+            assert!(clipboard_enabled); // Profile enables it
+        }
+
+        #[test]
+        fn test_merge_cli_overrides_profile_domain() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI provides domain, should override profile
+            let cli_domain: Option<String> = Some("OVERRIDE-DOMAIN".to_string());
+            let effective_domain = cli_domain
+                .or_else(|| profile.domain.clone())
+                .or_else(|| config.defaults.domain.clone());
+
+            assert_eq!(effective_domain, Some("OVERRIDE-DOMAIN".to_string()));
+        }
+
+        #[test]
+        fn test_merge_domain_from_profile_when_cli_none() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI doesn't provide domain, profile should be used
+            let cli_domain: Option<String> = None;
+            let effective_domain = cli_domain
+                .or_else(|| profile.domain.clone())
+                .or_else(|| config.defaults.domain.clone());
+
+            assert_eq!(effective_domain, Some("CORP".to_string())); // Profile wins
+        }
+
+        #[test]
+        fn test_merge_all_monitors_from_profile() {
+            let config = config_with_full_profile();
+            let profile = config.get_profile("work").unwrap();
+
+            // CLI --all-monitors is NOT set, but profile has all_monitors=true
+            let cli_all_monitors = false;
+            let effective_all_monitors = cli_all_monitors || profile.all_monitors.unwrap_or(false);
+
+            assert!(effective_all_monitors); // Profile enables it
+        }
+
+        #[test]
+        fn test_merge_all_monitors_cli_flag_additive() {
+            let config = config_with_profile("no-monitors", "server.test.com");
+            let profile = config.get_profile("no-monitors").unwrap();
+
+            // CLI --all-monitors is set, profile has no all_monitors
+            let cli_all_monitors = true;
+            let effective_all_monitors = cli_all_monitors || profile.all_monitors.unwrap_or(false);
+
+            assert!(effective_all_monitors); // CLI flag enables it
+        }
+
+        #[test]
+        fn test_hostname_fallback_preserves_cli_settings() {
+            // When host is NOT a profile name, CLI settings should still work
+            let config = Config::default();
+
+            // Simulate: yard connect server.example.com -p 3390 -u testuser
+            let host = "server.example.com";
+            assert!(!config.has_profile(host)); // Not a profile
+
+            // Without profile, CLI values should be used directly
+            let cli_port: Option<u16> = Some(3390);
+            let cli_username: Option<String> = Some("testuser".to_string());
+
+            let effective_port = cli_port.unwrap_or(config.defaults.effective_port());
+            let effective_username = cli_username.or(config.defaults.username.clone());
+
+            assert_eq!(effective_port, 3390);
+            assert_eq!(effective_username, Some("testuser".to_string()));
+        }
     }
 
     #[cfg(target_os = "linux")]
