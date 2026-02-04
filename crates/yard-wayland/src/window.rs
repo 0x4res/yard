@@ -14,9 +14,8 @@ mod linux {
     use smithay_client_toolkit::data_device_manager::data_device::DataDeviceHandler;
     use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
     use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
-    use smithay_client_toolkit::data_device_manager::{
-        DataDeviceManagerState, ReadPipe, WritePipe,
-    };
+    use smithay_client_toolkit::data_device_manager::{DataDeviceManagerState, WritePipe};
+    use smithay_client_toolkit::reexports::client::protocol::wl_data_source::WlDataSource;
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
     use smithay_client_toolkit::reexports::client::Proxy;
     use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
@@ -54,8 +53,8 @@ mod linux {
     use std::io::{Read, Write};
 
     use crate::overlay::{
-        ConnectionStatus, OVERLAY_BG_COLOR, OVERLAY_HEIGHT, OverlayContent, OverlayController,
-        OverlayState, generate_overlay_buffer_with_content, hit_test_disconnect_button,
+        OVERLAY_BG_COLOR, OVERLAY_HEIGHT, OverlayContent, OverlayController, OverlayState,
+        generate_overlay_buffer_with_content, hit_test_disconnect_button,
     };
 
     /// Linux evdev button code for left mouse button (BTN_LEFT = 0x110 = 272).
@@ -899,7 +898,8 @@ mod linux {
                 .map_err(|e| format!("Failed to create overlay buffer: {e}"))?;
 
             // Generate overlay content with connection status (Story 6.2)
-            let overlay_data = generate_overlay_buffer_with_content(width, height, content);
+            let overlay_data =
+                generate_overlay_buffer_with_content(width, height, OVERLAY_BG_COLOR, Some(content));
             canvas[..overlay_data.len()].copy_from_slice(&overlay_data);
 
             // Attach and commit
@@ -1099,6 +1099,9 @@ mod linux {
         /// Stores (overlay_width, overlay_height) when press started on disconnect button.
         /// Used to verify that release happens on the same button.
         disconnect_button_press: Option<(u32, u32)>,
+        /// Last keyboard event serial (for clipboard set_selection).
+        /// Updated on keyboard enter/press events.
+        last_serial: u32,
     }
 
     impl WaylandWindow {
@@ -1225,6 +1228,8 @@ mod linux {
                 overlay_content: OverlayContent::default(),
                 // Story 6.3: Disconnect button press tracking
                 disconnect_button_press: None,
+                // Last serial for clipboard operations
+                last_serial: 0,
             };
 
             Ok((event_loop, state, event_rx))
@@ -1550,7 +1555,7 @@ mod linux {
 
             // Set the selection on the data device
             if let Some(ref data_device) = self.data_device {
-                source.set_selection(data_device, None);
+                source.set_selection(data_device, self.last_serial);
                 tracing::debug!("Clipboard selection set");
             } else {
                 tracing::warn!("No data device available, cannot set clipboard selection");
@@ -1610,7 +1615,7 @@ mod linux {
 
             // Set the selection on the data device
             if let Some(ref data_device) = self.data_device {
-                source.set_selection(data_device, None);
+                source.set_selection(data_device, self.last_serial);
                 tracing::debug!("Clipboard file selection set");
             } else {
                 tracing::warn!("No data device available, cannot set clipboard selection");
@@ -3000,11 +3005,12 @@ mod linux {
             _qh: &QueueHandle<Self>,
             _keyboard: &WlKeyboard,
             _surface: &WlSurface,
-            _serial: u32,
+            serial: u32,
             _raw: &[u32],
             _keysyms: &[Keysym],
         ) {
-            // Keyboard focus gained
+            // Keyboard focus gained - track serial for clipboard operations
+            self.last_serial = serial;
             tracing::trace!("Keyboard focus entered");
         }
 
@@ -3026,9 +3032,11 @@ mod linux {
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
             _keyboard: &WlKeyboard,
-            _serial: u32,
+            serial: u32,
             event: KeyEvent,
         ) {
+            // Track serial for clipboard operations
+            self.last_serial = serial;
             // Check for client shortcuts BEFORE forwarding to remote
             // Ctrl+Alt+Enter toggles fullscreen (Story 2.5, updated in Story 3.4 Task 6)
             if self.modifiers.ctrl && self.modifiers.alt && event.keysym == Keysym::Return {
@@ -3366,15 +3374,14 @@ mod linux {
 
     // Story 5.2/5.3: Data device handler for clipboard operations
     impl DataDeviceHandler for WaylandWindow {
-        fn data_device_state(&self) -> &DataDeviceManagerState {
-            &self.data_device_manager
-        }
-
         fn enter(
             &mut self,
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
             _data_device: &smithay_client_toolkit::reexports::client::protocol::wl_data_device::WlDataDevice,
+            _x: f64,
+            _y: f64,
+            _wl_surface: &WlSurface,
         ) {
             // Drag-and-drop enter - not implemented
         }
@@ -3419,118 +3426,125 @@ mod linux {
 
             // Get the selection offer from our tracked data device
             if let Some(ref data_device) = self.data_device {
-                if let Some(offer) = data_device.selection_offer() {
-                    let mime_types = offer.mime_types();
-
-                    // Story 5.5: Check for file URI list first (higher priority than text)
-                    // Files are indicated by text/uri-list mime type
-                    let has_uri_list = mime_types.iter().any(|m| m.as_str() == "text/uri-list");
-
-                    if has_uri_list {
-                        tracing::debug!("File URI list format available");
-
-                        match offer.receive("text/uri-list".to_string()) {
-                            Ok(mut pipe) => {
-                                let mut uri_list = String::new();
-                                if let Err(e) = pipe.read_to_string(&mut uri_list) {
-                                    tracing::warn!("Failed to read clipboard URI list: {}", e);
-                                    return;
-                                }
-
-                                let files = Self::parse_uri_list(&uri_list);
-                                if !files.is_empty() {
-                                    // Story 5.6: Deduplicate - only send if files changed
-                                    let is_duplicate = self
-                                        .last_local_clipboard_files
-                                        .as_ref()
-                                        .is_some_and(|last| last == &files);
-
-                                    if is_duplicate {
-                                        tracing::trace!(
-                                            "Local clipboard files unchanged, skipping ({} files)",
-                                            files.len()
-                                        );
-                                    } else {
-                                        tracing::debug!(
-                                            "Local clipboard files: {} files",
-                                            files.len()
-                                        );
-                                        // Update last sent content
-                                        self.last_local_clipboard_files = Some(files.clone());
-                                        // Clear text cache since files take precedence
-                                        self.last_local_clipboard_text = None;
-                                        // Notify main thread of file clipboard change
-                                        let _ = self.event_tx.send(
-                                            WindowEvent::LocalClipboardFilesChanged { files },
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to receive clipboard URI list: {}", e);
-                            }
-                        }
-                        return;
+                if let Some(offer) = data_device.data().selection_offer() {
+                    // Use with_mime_types callback to check available formats
+                    #[derive(Clone)]
+                    enum ClipboardFormat {
+                        UriList,
+                        Text(String),
+                        None,
                     }
 
-                    // Story 5.3: Check for text format
-                    let text_mime = mime_types.iter().find(|m| {
-                        m.as_str() == "text/plain;charset=utf-8"
-                            || m.as_str() == "text/plain"
-                            || m.as_str() == "UTF8_STRING"
-                            || m.as_str() == "STRING"
-                    });
+                    let format = offer.with_mime_types(|mime_types| {
+                        // Story 5.5: Check for file URI list first (higher priority than text)
+                        if mime_types.iter().any(|m| m == "text/uri-list") {
+                            return ClipboardFormat::UriList;
+                        }
 
-                    if let Some(mime) = text_mime {
-                        tracing::debug!("Text format available: {}", mime);
-
-                        // Request the data - this gives us a ReadPipe
-                        match offer.receive(mime.clone()) {
-                            Ok(mut pipe) => {
-                                // Read the text (may block briefly for small content)
-                                let mut text = String::new();
-                                if let Err(e) = pipe.read_to_string(&mut text) {
-                                    tracing::warn!("Failed to read clipboard data: {}", e);
-                                    return;
-                                }
-
-                                if !text.is_empty() {
-                                    // Story 5.6: Deduplicate - only send if content changed
-                                    let is_duplicate = self
-                                        .last_local_clipboard_text
-                                        .as_ref()
-                                        .is_some_and(|last| last == &text);
-
-                                    if is_duplicate {
-                                        tracing::trace!(
-                                            "Local clipboard unchanged, skipping ({} chars)",
-                                            text.len()
-                                        );
-                                    } else {
-                                        tracing::debug!(
-                                            "Local clipboard text: {} chars",
-                                            text.len()
-                                        );
-                                        // Update last sent content
-                                        self.last_local_clipboard_text = Some(text.clone());
-                                        // Clear file cache since text takes precedence
-                                        self.last_local_clipboard_files = None;
-                                        // Notify main thread of clipboard change
-                                        let _ = self
-                                            .event_tx
-                                            .send(WindowEvent::LocalClipboardChanged { text });
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to receive clipboard data: {}", e);
+                        // Story 5.3: Check for text format
+                        for mime in mime_types {
+                            if mime == "text/plain;charset=utf-8"
+                                || mime == "text/plain"
+                                || mime == "UTF8_STRING"
+                                || mime == "STRING"
+                            {
+                                return ClipboardFormat::Text(mime.clone());
                             }
                         }
-                    } else {
+
                         tracing::debug!(
                             "No supported format in clipboard (formats: {:?})",
                             mime_types
                         );
+                        ClipboardFormat::None
+                    });
+
+                    match format {
+                        ClipboardFormat::UriList => {
+                            tracing::debug!("File URI list format available");
+                            match offer.receive("text/uri-list".to_string()) {
+                                Ok(mut pipe) => {
+                                    let mut uri_list = String::new();
+                                    if let Err(e) = pipe.read_to_string(&mut uri_list) {
+                                        tracing::warn!(
+                                            "Failed to read clipboard URI list: {}",
+                                            e
+                                        );
+                                        return;
+                                    }
+
+                                    let files = Self::parse_uri_list(&uri_list);
+                                    if !files.is_empty() {
+                                        // Story 5.6: Deduplicate - only send if files changed
+                                        let is_duplicate = self
+                                            .last_local_clipboard_files
+                                            .as_ref()
+                                            .is_some_and(|last| last == &files);
+
+                                        if is_duplicate {
+                                            tracing::trace!(
+                                                "Local clipboard files unchanged, skipping ({} files)",
+                                                files.len()
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                "Local clipboard files: {} files",
+                                                files.len()
+                                            );
+                                            self.last_local_clipboard_files = Some(files.clone());
+                                            self.last_local_clipboard_text = None;
+                                            let _ = self.event_tx.send(
+                                                WindowEvent::LocalClipboardFilesChanged { files },
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to receive clipboard URI list: {}", e);
+                                }
+                            }
+                        }
+                        ClipboardFormat::Text(mime) => {
+                            tracing::debug!("Text format available: {}", mime);
+                            match offer.receive(mime) {
+                                Ok(mut pipe) => {
+                                    let mut text = String::new();
+                                    if let Err(e) = pipe.read_to_string(&mut text) {
+                                        tracing::warn!("Failed to read clipboard data: {}", e);
+                                        return;
+                                    }
+
+                                    if !text.is_empty() {
+                                        // Story 5.6: Deduplicate - only send if content changed
+                                        let is_duplicate = self
+                                            .last_local_clipboard_text
+                                            .as_ref()
+                                            .is_some_and(|last| last == &text);
+
+                                        if is_duplicate {
+                                            tracing::trace!(
+                                                "Local clipboard unchanged, skipping ({} chars)",
+                                                text.len()
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                "Local clipboard text: {} chars",
+                                                text.len()
+                                            );
+                                            self.last_local_clipboard_text = Some(text.clone());
+                                            self.last_local_clipboard_files = None;
+                                            let _ = self
+                                                .event_tx
+                                                .send(WindowEvent::LocalClipboardChanged { text });
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to receive clipboard data: {}", e);
+                                }
+                            }
+                        }
+                        ClipboardFormat::None => {}
                     }
                 } else {
                     tracing::debug!("No selection offer available");
@@ -3562,11 +3576,21 @@ mod linux {
     }
 
     impl DataSourceHandler for WaylandWindow {
+        fn accept_mime(
+            &mut self,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+            _source: &WlDataSource,
+            _mime: Option<String>,
+        ) {
+            // Mime type accepted by destination - not implemented
+        }
+
         fn send_request(
             &mut self,
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
-            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+            _source: &WlDataSource,
             mime_type: String,
             write_pipe: WritePipe,
         ) {
@@ -3615,7 +3639,7 @@ mod linux {
             &mut self,
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
-            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+            _source: &WlDataSource,
         ) {
             // Our data source was cancelled (another app took ownership)
             tracing::debug!("Clipboard data source cancelled");
@@ -3625,7 +3649,7 @@ mod linux {
             &mut self,
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
-            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+            _source: &WlDataSource,
         ) {
             // Drag-and-drop completed - not implemented
         }
@@ -3634,7 +3658,7 @@ mod linux {
             &mut self,
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
-            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+            _source: &WlDataSource,
         ) {
             // Drag-and-drop finished - not implemented
         }
@@ -3643,7 +3667,7 @@ mod linux {
             &mut self,
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
-            _source: &smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource,
+            _source: &WlDataSource,
             _action: smithay_client_toolkit::reexports::client::protocol::wl_data_device_manager::DndAction,
         ) {
             // Drag-and-drop action - not implemented
@@ -3693,9 +3717,7 @@ mod linux {
                     break;
                 }
             }
-
-            // Acknowledge the configure
-            layer.ack_configure(_serial);
+            // Note: smithay-client-toolkit 0.20 automatically acknowledges layer configure
         }
     }
 
