@@ -95,11 +95,20 @@ enum Commands {
         domain: Option<String>,
 
         /// Start in fullscreen mode.
-        #[arg(short = 'f', long)]
+        /// Overrides config defaults and profile settings.
+        /// Can also be set in config.toml [defaults] or per-profile.
+        #[arg(short = 'f', long, conflicts_with = "no_fullscreen")]
         fullscreen: bool,
+
+        /// Explicitly disable fullscreen mode (Story 6.7).
+        /// Overrides config defaults and profile settings.
+        #[arg(long, conflicts_with = "fullscreen")]
+        no_fullscreen: bool,
 
         /// Enable multi-monitor fullscreen mode (Story 3.4).
         /// Creates a separate window on each connected monitor.
+        /// Only effective when fullscreen is enabled (-f or via config).
+        /// Can also be set in config.toml [defaults] or per-profile.
         #[arg(long)]
         all_monitors: bool,
 
@@ -167,6 +176,7 @@ fn run(cli: Cli) -> Result<u8> {
             username,
             domain,
             fullscreen,
+            no_fullscreen,
             all_monitors,
             no_audio,
             no_microphone,
@@ -210,15 +220,27 @@ fn run(cli: Cli) -> Result<u8> {
                 .or_else(|| profile.as_ref().and_then(|p| p.domain.clone()))
                 .or_else(|| app_config.defaults.domain.clone());
 
-            // Fullscreen: CLI -f OR profile.fullscreen (CLI flag is additive)
-            let effective_fullscreen =
-                fullscreen || profile.as_ref().and_then(|p| p.fullscreen).unwrap_or(false);
+            // Fullscreen: CLI --no-fullscreen negates; CLI -f enables; otherwise profile > defaults
+            // Story 6.7: Added defaults.fullscreen support
+            let effective_fullscreen = if no_fullscreen {
+                false // CLI --no-fullscreen wins
+            } else if fullscreen {
+                true // CLI -f wins
+            } else {
+                profile
+                    .as_ref()
+                    .and_then(|p| p.fullscreen)
+                    .or(app_config.defaults.fullscreen)
+                    .unwrap_or(false)
+            };
 
-            // All monitors: CLI --all-monitors OR profile.all_monitors
+            // All monitors: CLI --all-monitors OR profile.all_monitors OR defaults.all_monitors
+            // Story 6.7: Added defaults.all_monitors support
             let effective_all_monitors = all_monitors
                 || profile
                     .as_ref()
                     .and_then(|p| p.all_monitors)
+                    .or(app_config.defaults.all_monitors)
                     .unwrap_or(false);
 
             // Audio: CLI --no-audio negates; otherwise profile.audio > config.audio.enabled
@@ -1956,6 +1978,284 @@ host = "real-server.example.com"
 
             assert_eq!(effective_port, 3390);
             assert_eq!(effective_username, Some("testuser".to_string()));
+        }
+
+        // Story 6.7: Default connection options tests
+        #[test]
+        fn test_defaults_fullscreen_applied_when_no_cli_or_profile() {
+            // Config has defaults.fullscreen = true, no CLI flag, no profile
+            let toml = r#"
+[defaults]
+fullscreen = true
+"#;
+            let config = Config::parse(toml).unwrap();
+
+            // Simulate: no profile, no CLI flags
+            let profile: Option<&yard_core::ConnectionProfile> = None;
+            let cli_fullscreen = false;
+            let cli_no_fullscreen = false;
+
+            let effective_fullscreen = if cli_no_fullscreen {
+                false
+            } else if cli_fullscreen {
+                true
+            } else {
+                profile
+                    .and_then(|p| p.fullscreen)
+                    .or(config.defaults.fullscreen)
+                    .unwrap_or(false)
+            };
+
+            assert!(effective_fullscreen); // Defaults.fullscreen = true applied
+        }
+
+        #[test]
+        fn test_defaults_all_monitors_applied_when_no_cli_or_profile() {
+            // Config has defaults.all_monitors = true, no CLI flag, no profile
+            let toml = r#"
+[defaults]
+all_monitors = true
+"#;
+            let config = Config::parse(toml).unwrap();
+
+            let profile: Option<&yard_core::ConnectionProfile> = None;
+            let cli_all_monitors = false;
+
+            let effective_all_monitors = cli_all_monitors
+                || profile
+                    .and_then(|p| p.all_monitors)
+                    .or(config.defaults.all_monitors)
+                    .unwrap_or(false);
+
+            assert!(effective_all_monitors); // Defaults.all_monitors = true applied
+        }
+
+        #[test]
+        fn test_cli_fullscreen_flag_overrides_defaults_false() {
+            // Config has defaults.fullscreen = false, CLI -f flag set
+            let toml = r#"
+[defaults]
+fullscreen = false
+"#;
+            let config = Config::parse(toml).unwrap();
+
+            let profile: Option<&yard_core::ConnectionProfile> = None;
+            let cli_fullscreen = true; // CLI -f flag
+            let cli_no_fullscreen = false;
+
+            let effective_fullscreen = if cli_no_fullscreen {
+                false
+            } else if cli_fullscreen {
+                true
+            } else {
+                profile
+                    .and_then(|p| p.fullscreen)
+                    .or(config.defaults.fullscreen)
+                    .unwrap_or(false)
+            };
+
+            assert!(effective_fullscreen); // CLI -f wins
+        }
+
+        #[test]
+        fn test_cli_no_fullscreen_overrides_defaults_true() {
+            // Config has defaults.fullscreen = true, CLI --no-fullscreen set
+            let toml = r#"
+[defaults]
+fullscreen = true
+"#;
+            let config = Config::parse(toml).unwrap();
+
+            let profile: Option<&yard_core::ConnectionProfile> = None;
+            let cli_fullscreen = false;
+            let cli_no_fullscreen = true; // CLI --no-fullscreen flag
+
+            let effective_fullscreen = if cli_no_fullscreen {
+                false
+            } else if cli_fullscreen {
+                true
+            } else {
+                profile
+                    .and_then(|p| p.fullscreen)
+                    .or(config.defaults.fullscreen)
+                    .unwrap_or(false)
+            };
+
+            assert!(!effective_fullscreen); // CLI --no-fullscreen wins
+        }
+
+        #[test]
+        fn test_cli_no_fullscreen_overrides_profile_true() {
+            // Profile has fullscreen = true, CLI --no-fullscreen should win
+            let toml = r#"
+[profiles.work]
+host = "work.example.com"
+fullscreen = true
+"#;
+            let config = Config::parse(toml).unwrap();
+            let profile = config.get_profile("work").unwrap();
+
+            let cli_fullscreen = false;
+            let cli_no_fullscreen = true; // CLI --no-fullscreen flag
+
+            let effective_fullscreen = if cli_no_fullscreen {
+                false
+            } else if cli_fullscreen {
+                true
+            } else {
+                Some(profile)
+                    .and_then(|p| p.fullscreen)
+                    .or(config.defaults.fullscreen)
+                    .unwrap_or(false)
+            };
+
+            assert!(!effective_fullscreen); // CLI --no-fullscreen wins over profile
+        }
+
+        #[test]
+        fn test_no_fullscreen_with_defaults_all_monitors() {
+            // Edge case: --no-fullscreen with defaults.all_monitors=true
+            // all_monitors should still be computed but fullscreen=false takes precedence
+            let toml = r#"
+[defaults]
+fullscreen = true
+all_monitors = true
+"#;
+            let config = Config::parse(toml).unwrap();
+
+            let profile: Option<&yard_core::ConnectionProfile> = None;
+            let cli_fullscreen = false;
+            let cli_no_fullscreen = true; // CLI --no-fullscreen
+            let cli_all_monitors = false;
+
+            let effective_fullscreen = if cli_no_fullscreen {
+                false
+            } else if cli_fullscreen {
+                true
+            } else {
+                profile
+                    .and_then(|p| p.fullscreen)
+                    .or(config.defaults.fullscreen)
+                    .unwrap_or(false)
+            };
+
+            let effective_all_monitors = cli_all_monitors
+                || profile
+                    .and_then(|p| p.all_monitors)
+                    .or(config.defaults.all_monitors)
+                    .unwrap_or(false);
+
+            // --no-fullscreen disables fullscreen
+            assert!(!effective_fullscreen);
+            // all_monitors is computed as true from defaults, but meaningless without fullscreen
+            // This documents the expected behavior: all_monitors is independent of fullscreen flag
+            assert!(effective_all_monitors);
+        }
+
+        #[test]
+        fn test_profile_fullscreen_overrides_defaults() {
+            // Config has defaults.fullscreen = false, profile.fullscreen = true
+            let toml = r#"
+[defaults]
+fullscreen = false
+
+[profiles.work]
+host = "work.example.com"
+fullscreen = true
+"#;
+            let config = Config::parse(toml).unwrap();
+            let profile = config.get_profile("work").unwrap();
+
+            let cli_fullscreen = false;
+            let cli_no_fullscreen = false;
+
+            let effective_fullscreen = if cli_no_fullscreen {
+                false
+            } else if cli_fullscreen {
+                true
+            } else {
+                Some(profile)
+                    .and_then(|p| p.fullscreen)
+                    .or(config.defaults.fullscreen)
+                    .unwrap_or(false)
+            };
+
+            assert!(effective_fullscreen); // Profile wins over defaults
+        }
+
+        #[test]
+        fn test_defaults_overrides_builtin_default() {
+            // Config has no defaults section, built-in default should be false
+            let config = Config::default();
+
+            let profile: Option<&yard_core::ConnectionProfile> = None;
+            let cli_fullscreen = false;
+            let cli_no_fullscreen = false;
+
+            let effective_fullscreen = if cli_no_fullscreen {
+                false
+            } else if cli_fullscreen {
+                true
+            } else {
+                profile
+                    .and_then(|p| p.fullscreen)
+                    .or(config.defaults.fullscreen)
+                    .unwrap_or(false) // Built-in default
+            };
+
+            assert!(!effective_fullscreen); // Built-in default = false
+        }
+
+        #[test]
+        fn test_precedence_chain_cli_profile_defaults_builtin() {
+            // Full precedence chain: CLI > profile > defaults > built-in
+            let toml = r#"
+[defaults]
+fullscreen = true
+all_monitors = true
+
+[profiles.work]
+host = "work.example.com"
+fullscreen = false
+"#;
+            let config = Config::parse(toml).unwrap();
+            let profile = config.get_profile("work").unwrap();
+
+            // Profile says fullscreen = false, defaults says true
+            // Profile should win
+            let cli_fullscreen = false;
+            let cli_no_fullscreen = false;
+
+            let effective_fullscreen = if cli_no_fullscreen {
+                false
+            } else if cli_fullscreen {
+                true
+            } else {
+                Some(profile)
+                    .and_then(|p| p.fullscreen)
+                    .or(config.defaults.fullscreen)
+                    .unwrap_or(false)
+            };
+
+            assert!(!effective_fullscreen); // Profile fullscreen=false wins over defaults=true
+        }
+
+        #[test]
+        fn test_defaults_backward_compat_no_fullscreen_field() {
+            // Old config without fullscreen field should still work
+            let toml = r#"
+[defaults]
+port = 3389
+"#;
+            let config = Config::parse(toml).unwrap();
+
+            // defaults.fullscreen should be None
+            assert!(config.defaults.fullscreen.is_none());
+            assert!(config.defaults.all_monitors.is_none());
+
+            // Should fall back to built-in default (false)
+            let effective_fullscreen = config.defaults.fullscreen.unwrap_or(false);
+            assert!(!effective_fullscreen);
         }
     }
 

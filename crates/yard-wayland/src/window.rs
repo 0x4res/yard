@@ -15,10 +15,10 @@ mod linux {
     use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
     use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
     use smithay_client_toolkit::data_device_manager::{DataDeviceManagerState, WritePipe};
-    use smithay_client_toolkit::reexports::client::protocol::wl_data_source::WlDataSource;
     use smithay_client_toolkit::output::{OutputHandler, OutputState};
     use smithay_client_toolkit::reexports::client::Proxy;
     use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+    use smithay_client_toolkit::reexports::client::protocol::wl_data_source::WlDataSource;
     use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard;
     use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
     use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
@@ -898,8 +898,12 @@ mod linux {
                 .map_err(|e| format!("Failed to create overlay buffer: {e}"))?;
 
             // Generate overlay content with connection status (Story 6.2)
-            let overlay_data =
-                generate_overlay_buffer_with_content(width, height, OVERLAY_BG_COLOR, Some(content));
+            let overlay_data = generate_overlay_buffer_with_content(
+                width,
+                height,
+                OVERLAY_BG_COLOR,
+                Some(content),
+            );
             canvas[..overlay_data.len()].copy_from_slice(&overlay_data);
 
             // Attach and commit
@@ -3466,10 +3470,7 @@ mod linux {
                                 Ok(mut pipe) => {
                                     let mut uri_list = String::new();
                                     if let Err(e) = pipe.read_to_string(&mut uri_list) {
-                                        tracing::warn!(
-                                            "Failed to read clipboard URI list: {}",
-                                            e
-                                        );
+                                        tracing::warn!("Failed to read clipboard URI list: {}", e);
                                         return;
                                     }
 

@@ -167,6 +167,18 @@ pub struct ConnectionDefaults {
 
     /// Default username for authentication.
     pub username: Option<String>,
+
+    /// Start in fullscreen mode by default (Story 6.7).
+    ///
+    /// If `None` or not specified, defaults to windowed mode (false).
+    /// Can be overridden by CLI `-f` flag or `--no-fullscreen` flag.
+    pub fullscreen: Option<bool>,
+
+    /// Enable multi-monitor fullscreen mode by default (Story 6.7).
+    ///
+    /// If `None` or not specified, defaults to single-monitor mode (false).
+    /// Can be overridden by CLI `--all-monitors` flag.
+    pub all_monitors: Option<bool>,
 }
 
 impl Default for ConnectionDefaults {
@@ -175,6 +187,8 @@ impl Default for ConnectionDefaults {
             port: DEFAULT_PORT,
             domain: None,
             username: None,
+            fullscreen: None,
+            all_monitors: None,
         }
     }
 }
@@ -510,6 +524,9 @@ foo = "bar"
         assert_eq!(defaults.port, 3389);
         assert!(defaults.domain.is_none());
         assert!(defaults.username.is_none());
+        // Story 6.7: New fields default to None
+        assert!(defaults.fullscreen.is_none());
+        assert!(defaults.all_monitors.is_none());
     }
 
     #[test]
@@ -1119,5 +1136,69 @@ fulscreen = true
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("fulscreen") || err.contains("unknown"));
+    }
+
+    // Story 6.7: Default connection options tests
+    #[test]
+    fn test_config_parse_defaults_fullscreen() {
+        let toml = r#"
+[defaults]
+fullscreen = true
+all_monitors = true
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.defaults.fullscreen, Some(true));
+        assert_eq!(config.defaults.all_monitors, Some(true));
+    }
+
+    #[test]
+    fn test_config_parse_defaults_fullscreen_false() {
+        let toml = r#"
+[defaults]
+fullscreen = false
+all_monitors = false
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.defaults.fullscreen, Some(false));
+        assert_eq!(config.defaults.all_monitors, Some(false));
+    }
+
+    #[test]
+    fn test_config_defaults_backward_compat_no_fullscreen() {
+        // Old configs without fullscreen fields should still work
+        let toml = r#"
+[defaults]
+port = 3390
+username = "olduser"
+"#;
+        let config = Config::parse(toml).unwrap();
+        assert_eq!(config.defaults.port, 3390);
+        assert_eq!(config.defaults.username, Some("olduser".to_string()));
+        // New fields should be None
+        assert!(config.defaults.fullscreen.is_none());
+        assert!(config.defaults.all_monitors.is_none());
+    }
+
+    #[test]
+    fn test_config_defaults_mixed_with_profiles() {
+        // Defaults and profiles can both have fullscreen settings
+        let toml = r#"
+[defaults]
+fullscreen = true
+all_monitors = true
+
+[profiles.windowed]
+host = "windowed.example.com"
+fullscreen = false
+"#;
+        let config = Config::parse(toml).unwrap();
+
+        // Defaults should have fullscreen enabled
+        assert_eq!(config.defaults.fullscreen, Some(true));
+        assert_eq!(config.defaults.all_monitors, Some(true));
+
+        // Profile should override with fullscreen disabled
+        let profile = config.get_profile("windowed").unwrap();
+        assert_eq!(profile.fullscreen, Some(false));
     }
 }

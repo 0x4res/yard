@@ -437,7 +437,8 @@ where
     // Track timestamps when we send input to measure response latency
     let mut last_input_sent: Option<tokio::time::Instant> = None;
     // Use VecDeque for O(1) push_back/pop_front (rolling window)
-    let mut rtt_samples: std::collections::VecDeque<u32> = std::collections::VecDeque::with_capacity(10);
+    let mut rtt_samples: std::collections::VecDeque<u32> =
+        std::collections::VecDeque::with_capacity(10);
     // Track when last sample was added to detect staleness
     let mut last_sample_time = tokio::time::Instant::now();
 
